@@ -16,7 +16,9 @@
  */
 
 #include "common/cudaUtils.h"
+#include "common/safetensorsUtils.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
+#include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
 #include "testUtils.h"
 
 #include <cuda_bf16.h>
@@ -25,6 +27,8 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <filesystem>
 #include <vector>
 
 using namespace trt_edgellm;
@@ -188,6 +192,88 @@ void runGatherTest(std::vector<int32_t> const& inputIds, int32_t batchSize, int3
         imageTokenId, audioTokenId);
 }
 
+int8_t int8TableValue(int32_t tokenId, int32_t layerIdx, int32_t hiddenIdx)
+{
+    return static_cast<int8_t>((tokenId * 31 + layerIdx * 11 + hiddenIdx) % 127 - 63);
+}
+
+void runInt8GatherTest(std::vector<int32_t> const& inputIds, int32_t batchSize, int32_t seqLen, int32_t maxBatchSize,
+    int32_t maxSeqLen, int32_t vocabSize, int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId,
+    int32_t audioTokenId)
+{
+    rt::Tensor inputIdsDevice({batchSize, seqLen}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor tableDevice({vocabSize, numLayers * pleHiddenSize}, rt::DeviceType::kGPU, DataType::kINT8);
+    rt::Tensor scalesDevice({vocabSize, numLayers}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    rt::Tensor outputDevice({numLayers, maxBatchSize, maxSeqLen, pleHiddenSize}, rt::DeviceType::kGPU, DataType::kHALF);
+
+    std::vector<int8_t> table(static_cast<size_t>(vocabSize) * numLayers * pleHiddenSize);
+    for (int32_t tokenId = 0; tokenId < vocabSize; ++tokenId)
+    {
+        for (int32_t layerIdx = 0; layerIdx < numLayers; ++layerIdx)
+        {
+            for (int32_t hiddenIdx = 0; hiddenIdx < pleHiddenSize; ++hiddenIdx)
+            {
+                size_t const offset = (static_cast<size_t>(tokenId) * numLayers + layerIdx) * pleHiddenSize + hiddenIdx;
+                table[offset] = int8TableValue(tokenId, layerIdx, hiddenIdx);
+            }
+        }
+    }
+    std::vector<float> scales(static_cast<size_t>(vocabSize) * numLayers);
+    for (int32_t tokenId = 0; tokenId < vocabSize; ++tokenId)
+    {
+        for (int32_t layerIdx = 0; layerIdx < numLayers; ++layerIdx)
+        {
+            scales[static_cast<size_t>(tokenId) * numLayers + layerIdx]
+                = 0.01F * static_cast<float>((tokenId + 1) * (layerIdx + 1));
+        }
+    }
+    std::vector<half> const initialOutput = makeFilledOutput<half>(numLayers, maxBatchSize, maxSeqLen, pleHiddenSize);
+
+    copyHostToDevice(inputIdsDevice, inputIds);
+    copyHostToDevice(tableDevice, table);
+    copyHostToDevice(scalesDevice, scales);
+    copyHostToDevice(outputDevice, initialOutput);
+
+    kernel::gemma4PleGather(inputIdsDevice, tableDevice, outputDevice, numLayers, pleHiddenSize, imageTokenId,
+        audioTokenId, nullptr, rt::OptionalInputTensor{scalesDevice});
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<half> const output = copyDeviceToHost<half>(outputDevice);
+    int64_t const layerCapacity = static_cast<int64_t>(maxBatchSize) * maxSeqLen * pleHiddenSize;
+    std::vector<bool> written(output.size(), false);
+    for (int32_t layerIdx = 0; layerIdx < numLayers; ++layerIdx)
+    {
+        for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+        {
+            for (int32_t seqIdx = 0; seqIdx < seqLen; ++seqIdx)
+            {
+                size_t const tokenOffset = static_cast<size_t>(batchIdx) * seqLen + seqIdx;
+                int32_t const tokenId = inputIds[tokenOffset];
+                for (int32_t hiddenIdx = 0; hiddenIdx < pleHiddenSize; ++hiddenIdx)
+                {
+                    size_t const outputOffset
+                        = static_cast<size_t>(layerIdx * layerCapacity) + tokenOffset * pleHiddenSize + hiddenIdx;
+                    written[outputOffset] = true;
+                    float const expected = shouldZeroFill(tokenId, vocabSize, imageTokenId, audioTokenId)
+                        ? 0.0F
+                        : static_cast<float>(int8TableValue(tokenId, layerIdx, hiddenIdx))
+                            * scales[static_cast<size_t>(tokenId) * numLayers + layerIdx];
+                    EXPECT_NEAR(__half2float(output[outputOffset]), expected, 5e-3F)
+                        << "layer=" << layerIdx << " batch=" << batchIdx << " seq=" << seqIdx
+                        << " hidden=" << hiddenIdx;
+                }
+            }
+        }
+    }
+    for (size_t idx = 0; idx < output.size(); ++idx)
+    {
+        if (!written[idx])
+        {
+            EXPECT_NEAR(__half2float(output[idx]), kSentinelValue, kATol) << "unwritten index=" << idx;
+        }
+    }
+}
+
 } // namespace
 
 TEST(Gemma4PleGatherKernelTest, GathersFp16LayerOutputsWithCompactRuntimeShape)
@@ -235,4 +321,65 @@ TEST(Gemma4PleGatherKernelTest, GathersBfloat16LayerOutputs)
 
     runGatherTest<__nv_bfloat16>(inputIds, kBatchSize, kSeqLen, kMaxBatchSize, kMaxSeqLen, kVocabSize, kNumLayers,
         kPleHiddenSize, /* imageTokenId = */ -1, /* audioTokenId = */ -1);
+}
+
+TEST(Gemma4PleGatherKernelTest, DequantizesInt8RowsAndZeroFillsSpecialTokens)
+{
+    constexpr int32_t kBatchSize = 1;
+    constexpr int32_t kSeqLen = 6;
+    constexpr int32_t kMaxBatchSize = 2;
+    constexpr int32_t kMaxSeqLen = 7;
+    constexpr int32_t kVocabSize = 6;
+    constexpr int32_t kNumLayers = 3;
+    constexpr int32_t kPleHiddenSize = 16;
+    constexpr int32_t kImageTokenId = 4;
+    constexpr int32_t kAudioTokenId = 5;
+    std::vector<int32_t> const inputIds{0, 2, -1, kVocabSize, kImageTokenId, kAudioTokenId};
+
+    runInt8GatherTest(inputIds, kBatchSize, kSeqLen, kMaxBatchSize, kMaxSeqLen, kVocabSize, kNumLayers, kPleHiddenSize,
+        kImageTokenId, kAudioTokenId);
+}
+
+TEST(Gemma4PleGatherKernelTest, Int8SidecarLoadsThroughPreprocessor)
+{
+    constexpr int32_t kVocabSize = 3;
+    constexpr int32_t kNumLayers = 2;
+    constexpr int32_t kPleHiddenSize = 8;
+    std::vector<int8_t> table(static_cast<size_t>(kVocabSize) * kNumLayers * kPleHiddenSize, 10);
+    std::vector<float> scales(static_cast<size_t>(kVocabSize) * kNumLayers, 0.1F);
+    rt::Tensor tableTensor({kVocabSize, kNumLayers * kPleHiddenSize}, rt::DeviceType::kCPU, DataType::kINT8, "weight");
+    rt::Tensor scalesTensor({kVocabSize, kNumLayers}, rt::DeviceType::kCPU, DataType::kFLOAT, "weight_scale");
+    std::memcpy(tableTensor.rawPointer(), table.data(), table.size() * sizeof(int8_t));
+    std::memcpy(scalesTensor.rawPointer(), scales.data(), scales.size() * sizeof(float));
+
+    auto const testDir = std::filesystem::temp_directory_path() / "trt_edgellm_int8_ple_loader_test";
+    std::filesystem::remove_all(testDir);
+    std::filesystem::create_directories(testDir);
+    std::vector<rt::Tensor> sidecar;
+    sidecar.emplace_back(std::move(tableTensor));
+    sidecar.emplace_back(std::move(scalesTensor));
+    ASSERT_TRUE(rt::safetensors::saveSafetensors(testDir / "ple_embedding.safetensors", sidecar, nullptr));
+
+    rt::LLMEngineConfig config;
+    config.pleEnabled = true;
+    config.numPleInputs = kNumLayers;
+    config.pleHiddenSize = kPleHiddenSize;
+    rt::TensorMap tensorMap;
+    rt::Gemma4EmbeddingPreprocessor preprocessor(testDir, config, 1, 2, tensorMap, nullptr);
+    rt::Tensor inputIds({1, 2}, rt::DeviceType::kGPU, DataType::kINT32);
+    copyHostToDevice(inputIds, std::vector<int32_t>{0, 1});
+    preprocessor.embed(inputIds, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    for (int32_t layerIdx = 0; layerIdx < kNumLayers; ++layerIdx)
+    {
+        auto* output = tensorMap.get("ple_token_embeds_" + std::to_string(layerIdx));
+        ASSERT_NE(output, nullptr);
+        auto const values = copyDeviceToHost<half>(*output);
+        for (half const value : values)
+        {
+            EXPECT_NEAR(__half2float(value), 1.0F, 1e-3F);
+        }
+    }
+    std::filesystem::remove_all(testDir);
 }
