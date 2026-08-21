@@ -29,6 +29,8 @@ tests:
   - tests/defs/test_checkpoint_export.py::test_checkpoint_mtp_export[Qwen3.5-0.8B-fp16-mtp]
   # Gemma4 E2B FP16 checkpoint export
   - tests/defs/test_checkpoint_export.py::test_checkpoint_export[gemma-4-E2B-it-fp16]
+  # Gemma4 E2B FP16 checkpoint export with INT8 runtime embedding sidecars
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[gemma-4-E2B-it-fp16-int8emb]
   # Gemma4 E2B FP16 paired MTP export (base + assistant draft)
   - tests/defs/test_checkpoint_export.py::test_checkpoint_mtp_export[gemma-4-E2B-it-fp16-mtp]
   # Qwen3 DSpark export (FP16 base + DeepSpec block7 draft checkpoint)

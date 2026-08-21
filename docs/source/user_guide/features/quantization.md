@@ -150,6 +150,13 @@ tensorrt-edgellm-export \
   --fp8-embedding
 ```
 
+For SM87 devices or Gemma 4 models whose PLE table is a major part of runtime
+memory, `--int8-embedding` writes symmetric INT8 input and PLE sidecars with
+row scales sized to each runtime gather. This path does not require FP8
+hardware support. See
+[INT8 Runtime Embedding Sidecars](int8-embedding.md) for the file contract,
+memory calculation, and error bound.
+
 ## Supported Methods
 
 | Component | Methods |

@@ -674,13 +674,16 @@ EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cud
 
     int64_t vocabSize = embeddingPtr->getShape()[0];
     int64_t hiddenSize = embeddingPtr->getShape()[1];
+    ELLM_CHECK(vocabSize > 0 && hiddenSize > 0,
+        format::fmtstr("Embedding tensor dimensions must be positive, got [%ld, %ld]", vocabSize, hiddenSize));
 
     EmbeddingData result;
 
-    // Detect FP8 vs FP16 by checking dtype
     if (embeddingPtr->getDataType() == nvinfer1::DataType::kFP8)
     {
-        // FP8 format - requires scales
+        ELLM_CHECK(tensors.size() == 2,
+            format::fmtstr("FP8 embedding file must contain exactly 'embedding' and 'embedding_scale': %s",
+                embeddingPath.string().c_str()));
         ELLM_CHECK(scalesPtr != nullptr,
             format::fmtstr("FP8 embedding requires 'embedding_scale' tensor: %s", embeddingPath.string().c_str()));
 
@@ -709,9 +712,34 @@ EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cud
         result.table = std::move(*embeddingPtr);
         result.tableScalingFactor = std::move(*scalesPtr);
     }
+    else if (embeddingPtr->getDataType() == nvinfer1::DataType::kINT8)
+    {
+        ELLM_CHECK(tensors.size() == 2,
+            format::fmtstr("INT8 embedding file must contain exactly 'embedding' and 'embedding_scale': %s",
+                embeddingPath.string().c_str()));
+        ELLM_CHECK(scalesPtr != nullptr,
+            format::fmtstr("INT8 embedding requires 'embedding_scale' tensor: %s", embeddingPath.string().c_str()));
+        ELLM_CHECK(scalesPtr->getDataType() == nvinfer1::DataType::kFLOAT,
+            format::fmtstr(
+                "INT8 embedding_scale must have FP32 dtype, got %d", static_cast<int>(scalesPtr->getDataType())));
+        ELLM_CHECK(scalesPtr->getShape().getNumDims() == 1,
+            format::fmtstr("INT8 embedding_scale must be 1D, got %d dimensions", scalesPtr->getShape().getNumDims()));
+        ELLM_CHECK(scalesPtr->getShape()[0] == vocabSize,
+            format::fmtstr(
+                "INT8 embedding scale rows mismatch: expected %ld, got %ld", vocabSize, scalesPtr->getShape()[0]));
+
+        LOG_INFO("Loaded INT8 embedding: [%ld, %ld], scales: [%ld]", vocabSize, hiddenSize, scalesPtr->getShape()[0]);
+        result.table = std::move(*embeddingPtr);
+        result.tableScalingFactor = std::move(*scalesPtr);
+    }
     else
     {
-        // FP16 format
+        ELLM_CHECK(embeddingPtr->getDataType() == nvinfer1::DataType::kHALF,
+            format::fmtstr("Embedding tensor must be FP16, FP8, or INT8, got dtype %d",
+                static_cast<int>(embeddingPtr->getDataType())));
+        ELLM_CHECK(scalesPtr == nullptr && tensors.size() == 1,
+            format::fmtstr("FP16 embedding file must contain exactly one tensor named 'embedding': %s",
+                embeddingPath.string().c_str()));
         LOG_INFO("Loaded FP16 embedding: [%ld, %ld]", vocabSize, hiddenSize);
 
         result.table = std::move(*embeddingPtr);

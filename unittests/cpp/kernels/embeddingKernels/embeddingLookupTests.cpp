@@ -16,9 +16,11 @@
  */
 
 #include "common/checkMacros.h"
+#include "common/safetensorsUtils.h"
 #include "common/tensor.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
 #include "references.h"
+#include "runtime/llmRuntimeUtils.h"
 #include "testUtils.h"
 #include <algorithm>
 #include <chrono>
@@ -27,7 +29,9 @@
 #if SUPPORTS_FP8
 #include <cuda_fp8.h>
 #endif
+#include <cstring>
 #include <cuda_runtime.h>
+#include <filesystem>
 #include <functional>
 #include <gtest/gtest.h>
 #include <iomanip>
@@ -64,6 +68,48 @@ bool compareResults(
     }
 
     return true;
+}
+
+std::vector<half> embeddingLookupMultimodalInt8Ref(std::vector<int32_t> const& inputIds,
+    std::vector<int8_t> const& embeddingTable, std::vector<float> const& scales,
+    std::vector<int32_t> const& multimodalIndices, int32_t imageTokenId, std::vector<half> const& imageEmbeds,
+    int32_t audioTokenId, std::vector<half> const& audioEmbeds, int64_t batchSize, int64_t seqLen, int32_t vocabSize,
+    int64_t hiddenSize)
+{
+    std::vector<half> result(batchSize * seqLen * hiddenSize, __float2half(0.0F));
+    for (int64_t linearIdx = 0; linearIdx < batchSize * seqLen; ++linearIdx)
+    {
+        int32_t const tokenId = inputIds[linearIdx];
+        int64_t const outputBase = linearIdx * hiddenSize;
+        if (tokenId == imageTokenId)
+        {
+            int32_t const imageIdx = multimodalIndices[linearIdx];
+            if (imageIdx >= 0 && static_cast<int64_t>(imageIdx) * hiddenSize < static_cast<int64_t>(imageEmbeds.size()))
+            {
+                std::copy_n(imageEmbeds.begin() + static_cast<int64_t>(imageIdx) * hiddenSize, hiddenSize,
+                    result.begin() + outputBase);
+            }
+        }
+        else if (tokenId == audioTokenId)
+        {
+            int32_t const audioIdx = multimodalIndices[linearIdx];
+            if (audioIdx >= 0 && static_cast<int64_t>(audioIdx) * hiddenSize < static_cast<int64_t>(audioEmbeds.size()))
+            {
+                std::copy_n(audioEmbeds.begin() + static_cast<int64_t>(audioIdx) * hiddenSize, hiddenSize,
+                    result.begin() + outputBase);
+            }
+        }
+        else if (tokenId >= 0 && tokenId < vocabSize)
+        {
+            int64_t const tableBase = static_cast<int64_t>(tokenId) * hiddenSize;
+            for (int64_t hiddenIdx = 0; hiddenIdx < hiddenSize; ++hiddenIdx)
+            {
+                result[outputBase + hiddenIdx]
+                    = __float2half(static_cast<float>(embeddingTable[tableBase + hiddenIdx]) * scales[tokenId]);
+            }
+        }
+    }
+    return result;
 }
 
 #if SUPPORTS_FP8
@@ -278,6 +324,100 @@ TEST_F(EmbeddingLookupTest, StandardEmbeddingLookupAccuracy)
         EXPECT_TRUE(compareResults(cpuResult, gpuResult, "Standard Embedding Lookup Accuracy Test"))
             << "GPU and CPU results don't match for test case: batchSize=" << batchSize << ", seqLen=" << seqLen
             << ", vocabSize=" << vocabSize << ", hiddenSize=" << hiddenSize;
+    }
+}
+
+TEST_F(EmbeddingLookupTest, Int8MultimodalLookupDequantizesRequestedRows)
+{
+    constexpr int64_t kBatchSize = 1;
+    constexpr int64_t kSeqLen = 6;
+    constexpr int32_t kVocabSize = 6;
+    constexpr int64_t kHiddenSize = 16;
+    constexpr int32_t kImageTokenId = 4;
+    constexpr int32_t kAudioTokenId = 5;
+
+    std::vector<int32_t> const inputIds{0, kImageTokenId, kAudioTokenId, -1, kVocabSize, 2};
+    std::vector<int32_t> const multimodalIndices{0, 0, 0, 0, 0, 0};
+    std::vector<int8_t> table(kVocabSize * kHiddenSize);
+    for (size_t idx = 0; idx < table.size(); ++idx)
+    {
+        table[idx] = static_cast<int8_t>(static_cast<int32_t>(idx % 127) - 63);
+    }
+    std::vector<float> const scales{0.01F, 0.02F, 0.03F, 0.04F, 0.05F, 0.06F};
+    std::vector<half> imageEmbeds(kHiddenSize);
+    std::vector<half> audioEmbeds(kHiddenSize);
+    for (int64_t idx = 0; idx < kHiddenSize; ++idx)
+    {
+        imageEmbeds[idx] = __float2half(10.0F + static_cast<float>(idx));
+        audioEmbeds[idx] = __float2half(-10.0F - static_cast<float>(idx));
+    }
+
+    rt::Tensor inputIdsDevice({kBatchSize, kSeqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor tableDevice({kVocabSize, kHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+    rt::Tensor scalesDevice({kVocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor indicesDevice({kBatchSize, kSeqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor imageDevice({1, kHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor audioDevice({1, kHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor outputDevice({kBatchSize, kSeqLen, kHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    copyHostToDevice(inputIdsDevice, inputIds);
+    copyHostToDevice(tableDevice, table);
+    copyHostToDevice(scalesDevice, scales);
+    copyHostToDevice(indicesDevice, multimodalIndices);
+    copyHostToDevice(imageDevice, imageEmbeds);
+    copyHostToDevice(audioDevice, audioEmbeds);
+
+    kernel::embeddingLookup(inputIdsDevice, tableDevice, rt::OptionalInputTensor{scalesDevice}, outputDevice, stream,
+        rt::OptionalInputTensor{indicesDevice}, kImageTokenId, rt::OptionalInputTensor{imageDevice}, kAudioTokenId,
+        rt::OptionalInputTensor{audioDevice});
+
+    auto const output = copyDeviceToHost<half>(outputDevice);
+    auto const expected = embeddingLookupMultimodalInt8Ref(inputIds, table, scales, multimodalIndices, kImageTokenId,
+        imageEmbeds, kAudioTokenId, audioEmbeds, kBatchSize, kSeqLen, kVocabSize, kHiddenSize);
+    EXPECT_TRUE(compareResults(expected, output, "INT8 Multimodal Embedding Lookup"));
+}
+
+TEST_F(EmbeddingLookupTest, Int8LookupRequiresOneScalePerRow)
+{
+    constexpr int32_t kVocabSize = 4;
+    constexpr int64_t kHiddenSize = 16;
+    rt::Tensor inputIds({1, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor table({kVocabSize, kHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+    rt::Tensor output({1, 1, kHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    EXPECT_THROW(kernel::embeddingLookup(inputIds, table, std::nullopt, output, stream), std::runtime_error);
+}
+
+TEST_F(EmbeddingLookupTest, Int8SidecarLoadsAndRunsLookup)
+{
+    constexpr int32_t kVocabSize = 2;
+    constexpr int64_t kHiddenSize = 16;
+    std::vector<int8_t> const tableData(kVocabSize * kHiddenSize, 10);
+    std::vector<float> const scaleData{0.1F, 0.05F};
+    rt::Tensor table({kVocabSize, kHiddenSize}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT8, "embedding");
+    rt::Tensor scales({kVocabSize}, rt::DeviceType::kCPU, nvinfer1::DataType::kFLOAT, "embedding_scale");
+    std::memcpy(table.rawPointer(), tableData.data(), tableData.size() * sizeof(int8_t));
+    std::memcpy(scales.rawPointer(), scaleData.data(), scaleData.size() * sizeof(float));
+
+    auto const path = std::filesystem::temp_directory_path() / "trt_edgellm_int8_embedding_loader_test.safetensors";
+    std::filesystem::remove(path);
+    std::vector<rt::Tensor> sidecar;
+    sidecar.emplace_back(std::move(table));
+    sidecar.emplace_back(std::move(scales));
+    ASSERT_TRUE(rt::safetensors::saveSafetensors(path, sidecar, stream));
+
+    rt::EmbeddingData embedding = rt::loadEmbeddingTable(path, stream);
+    std::filesystem::remove(path);
+    rt::Tensor inputIds({1, 2}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor output({1, 2, kHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    copyHostToDevice(inputIds, std::vector<int32_t>{0, 1});
+    kernel::embeddingLookup(inputIds, embedding.table, embedding.scalesAsOptional(), output, stream);
+    auto const values = copyDeviceToHost<half>(output);
+    ASSERT_EQ(values.size(), 2 * kHiddenSize);
+    for (int64_t idx = 0; idx < kHiddenSize; ++idx)
+    {
+        EXPECT_NEAR(__half2float(values[idx]), 1.0F, 1e-3F);
+        EXPECT_NEAR(__half2float(values[kHiddenSize + idx]), 0.5F, 1e-3F);
     }
 }
 
