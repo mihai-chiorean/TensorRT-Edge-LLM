@@ -24,7 +24,6 @@
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
 #include <algorithm>
-#include <cmath>
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <numeric>
@@ -271,16 +270,6 @@ bool Gemma4ViTRunner::allocateBuffer(cudaStream_t stream)
     mNormalizedImageDevice = rt::Tensor({maxImagePixels * channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF,
         "Gemma4ViTRunner::mNormalizedImageDevice");
 
-    // GPU image-resize scratch.
-    int64_t const kMaxRawPixels = kernel::kGpuResizeMaxRawDim * kernel::kGpuResizeMaxRawDim;
-    // Horizontal-pass scratch holds [rawH, outW, C] floats. gemma4ResizeTarget preserves aspect ratio,
-    // so rawH * outW <= sqrt(maxImagePixels * rawH * rawW) <= sqrt(maxImagePixels * kMaxRawPixels).
-    int64_t const kMaxResizeTmpElems
-        = static_cast<int64_t>(
-              std::sqrt(static_cast<double>(maxImagePixels) * kMaxRawPixels) * kernel::kGpuResizeScratchMargin)
-        * channels;
-    kernel::allocateResizeScratch(channels, kMaxResizeTmpElems, mRawImageDevice, mResizeTmpDevice);
-
     return true;
 }
 
@@ -370,6 +359,11 @@ void Gemma4ViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
             {
                 auto [resizedHeight, resizedWidth] = rt::imageUtils::gemma4ResizeTarget(image.height, image.width,
                     mConfig.maxImageTokensPerImage, mConfig.poolingKernelSize, mConfig.patchSize);
+                if (image.height != resizedHeight || image.width != resizedWidth)
+                {
+                    kernel::ensureResizeScratchCapacity(image.height, image.width, image.channels, resizedWidth,
+                        mRawImageDevice, mResizeTmpDevice, stream);
+                }
                 kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
                     image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, resizedHeight, resizedWidth,
                     stream);

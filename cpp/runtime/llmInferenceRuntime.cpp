@@ -181,19 +181,6 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     mCheckpointDir = checkpointDir;
     mDraftCheckpointDir = draftCheckpointDir;
 
-    // Finish checkpoint reads and weight conversion before any engine can run.
-    ExternalWeightManager preparedWeights;
-    preparedWeights.load(engineDirPath, baseConfigPath, stream, mCheckpointDir);
-    if (auto embedding = preparedWeights.takeEmbedding())
-    {
-        mEmbedding.table = std::move(*embedding);
-    }
-    else
-    {
-        mEmbedding = loadEmbeddingTable(engineDirPath / "embedding.safetensors", stream);
-    }
-    auto pleEmbedding = preparedWeights.takePleEmbedding();
-
     // -----------------------------------------------------------------------
     // 3. Parse engine configurations and attach user drafting (bundle factory
     //    performs cross-engine consistency and drafting-vs-capacity checks).
@@ -254,6 +241,31 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     {
         draftExecutor = decoder_utils::loadDraftEngine(engineDirPath, mDeployment);
     }
+
+    // Reserve execution-context memory before materializing external weights. On integrated GPUs, large weight
+    // allocations can fragment the shared-memory allocator enough that this required contiguous arena cannot be
+    // allocated later even when the aggregate free-memory count is sufficient.
+    int64_t const baseContextMemorySize = mBaseExecutor->getRequiredContextMemorySize();
+    int64_t const draftContextMemorySize = draftExecutor ? draftExecutor->getRequiredContextMemorySize() : 0;
+    int64_t const initialContextMemorySize = std::max(baseContextMemorySize, draftContextMemorySize);
+    mSharedExecContextMemory = rt::Tensor({initialContextMemorySize}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
+        "LLMInferenceRuntime::mSharedExecContextMemory");
+    mBaseExecutor->setContextMemory(mSharedExecContextMemory);
+    LOG_INFO("Reserved execution context memory before weight materialization: %zu bytes",
+        static_cast<size_t>(initialContextMemorySize));
+
+    // Finish checkpoint reads and weight conversion before any engine can run.
+    ExternalWeightManager preparedWeights;
+    preparedWeights.load(engineDirPath, baseConfigPath, stream, mCheckpointDir);
+    if (auto embedding = preparedWeights.takeEmbedding())
+    {
+        mEmbedding.table = std::move(*embedding);
+    }
+    else
+    {
+        mEmbedding = loadEmbeddingTable(engineDirPath / "embedding.safetensors", stream);
+    }
+    auto pleEmbedding = preparedWeights.takePleEmbedding();
     // -----------------------------------------------------------------------
     // 5. Set runtime batch size.
     // -----------------------------------------------------------------------
@@ -553,15 +565,18 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     //     draft, and optional vision/audio). All engines execute serially so
     //     they can share a single buffer sized to the max requirement.
     // -----------------------------------------------------------------------
-    int64_t const baseContextMemorySize = mBaseExecutor->getRequiredContextMemorySize();
     int64_t const strategyContextMemorySize = mDecoderRegistry ? mDecoderRegistry->getRequiredContextMemorySize() : 0;
     int64_t const visionContextMemorySize = mVisionRunner ? mVisionRunner->getRequiredContextMemorySize() : 0;
     int64_t const audioContextMemorySize = mAudioRunner ? mAudioRunner->getRequiredContextMemorySize() : 0;
     int64_t const actionContextMemorySize = mActionRunner ? mActionRunner->getRequiredContextMemorySize() : 0;
     int64_t const sharedContextMemorySize = std::max({baseContextMemorySize, strategyContextMemorySize,
         visionContextMemorySize, audioContextMemorySize, actionContextMemorySize});
-    mSharedExecContextMemory = rt::Tensor({sharedContextMemorySize}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
-        "LLMInferenceRuntime::mSharedExecContextMemory");
+    if (mSharedExecContextMemory.getMemoryCapacity() < sharedContextMemorySize)
+    {
+        mSharedExecContextMemory = rt::Tensor{};
+        mSharedExecContextMemory = rt::Tensor({sharedContextMemorySize}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kUINT8, "LLMInferenceRuntime::mSharedExecContextMemory");
+    }
     mBaseExecutor->setContextMemory(mSharedExecContextMemory);
     if (mDecoderRegistry)
     {
