@@ -27,19 +27,19 @@ namespace trt_edgellm
 namespace kernel
 {
 
-//! \brief Embedding lookup for all modalities (supports FP16 and FP8 tables).
+//! \brief Embedding lookup for all modalities (supports FP16, FP8, and INT8 tables).
 //!
 //! Produces input embeddings for a batch of token ids. Text tokens are looked up from the embedding
 //! table. When image and/or audio embeddings are supplied (prefill), positions whose token id equals
 //! imageTokenId / audioTokenId are filled from imageEmbeds / audioEmbeds, selected by multimodalIndices;
 //! with no image/audio inputs (decode) it performs a pure text lookup. Automatically dispatches to the
-//! FP16 or FP8 implementation based on the embedding table's datatype; FP8 tables require scales for
-//! per-group dequantization.
+//! table implementation based on the embedding table's datatype. FP8 tables use per-group scales; INT8
+//! tables use one scale per vocabulary row.
 //!
 //! \param[in] inputIds Input token IDs with shape [batchSize, seqLen]
-//! \param[in] embeddingTable Text embedding table with shape [vocabSize, hiddenSize] (FP16 or FP8)
-//! \param[in] scales FP32 per-group scales with shape [vocabSize, hiddenSize / blockSize];
-//!                   required when embeddingTable is FP8, std::nullopt for FP16
+//! \param[in] embeddingTable Text embedding table with shape [vocabSize, hiddenSize] (FP16, FP8, or INT8)
+//! \param[in] scales FP32 scales. FP8 uses [vocabSize, hiddenSize / blockSize], INT8 uses [vocabSize],
+//!                   and FP16 requires std::nullopt.
 //! \param[out] output Hidden states with shape [batchSize, seqLen, hiddenSize]
 //! \param[in] stream CUDA stream for execution
 //! \param[in] multimodalIndices Per-position indices into imageEmbeds/audioEmbeds [batchSize, seqLen];
@@ -99,8 +99,11 @@ void generateMultimodalIndices(rt::Tensor const& inputIds, rt::Tensor& multimoda
 //! \param[in] imageTokenId Optional image token ID to zero-fill (-1 = unused)
 //! \param[in] audioTokenId Optional audio token ID to zero-fill (-1 = unused)
 //! \param[in] stream CUDA stream for execution
+//! \param[in] scales FP32 per-layer row scales [vocabSize, numLayers] for an INT8 PLE table;
+//!                   std::nullopt for FP16/BF16
 void gemma4PleGather(rt::Tensor const& inputIds, rt::Tensor const& pleTable, rt::Tensor& outputBuffer,
-    int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, cudaStream_t stream);
+    int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, cudaStream_t stream,
+    rt::OptionalInputTensor scales = std::nullopt);
 
 } // namespace kernel
 } // namespace trt_edgellm

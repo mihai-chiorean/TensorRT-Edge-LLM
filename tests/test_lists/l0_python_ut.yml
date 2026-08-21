@@ -13,6 +13,9 @@ tests:
   # ONNX-less builder checkpoint contracts
   - tests/python-unittests/test_direct_builder_checkpoint_contract.py
 
+  # Quantized runtime embedding sidecar contracts
+  - tests/python-unittests/test_embedding_quantization.py
+
   # AttentionPlugin tests (custom plugin vs PyTorch reference)
   - tests/python-unittests/test_attention_plugin.py::test_cutedsl_lazy_module_failure_propagates_before_attention_mutation
   - tests/python-unittests/test_attention_plugin.py::test_prefill

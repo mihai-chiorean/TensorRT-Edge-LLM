@@ -932,6 +932,7 @@ def _export_llm(model_dir: str,
                 eagle_base: bool = False,
                 eagle_draft_dir: str = "",
                 fp8_embedding: bool = False,
+                int8_embedding: bool = False,
                 reduced_vocab_dir: str = "",
                 mtp_base: bool = False,
                 mtp_tree_base: bool = False,
@@ -1082,6 +1083,7 @@ def _export_llm(model_dir: str,
                         output_path,
                         model_dir=model_dir,
                         fp8_embedding=fp8_embedding,
+                        int8_embedding=int8_embedding,
                         reduced_vocab_dir=reduced_vocab_dir,
                         externalize_weights=externalize_weights,
                         config_filename=config_filename)
@@ -1199,6 +1201,7 @@ def _export_diffusion_gemma_visual(model_dir: str, visual_out_dir: str,
 def _export_diffusion_gemma(model_dir: str,
                             output_dir: str,
                             fp8_embedding: bool = False,
+                            int8_embedding: bool = False,
                             reduced_vocab_dir: str = "",
                             externalize_weights: "list[str] | None" = None,
                             tp_size: int = 1) -> None:
@@ -1253,6 +1256,7 @@ def _export_diffusion_gemma(model_dir: str,
                     backbone_path,
                     model_dir=model_dir,
                     fp8_embedding=fp8_embedding,
+                    int8_embedding=int8_embedding,
                     reduced_vocab_dir=reduced_vocab_dir,
                     externalize_weights=backbone_externalize_weights)
     except (OSError, ValueError, RuntimeError) as exc:
@@ -1468,9 +1472,9 @@ def _patch_dflash_mask_embedding(llm_out_dir: str,
     with safe_open(emb_path, framework="pt", device="cpu") as f:
         if "embedding_scale" in set(f.keys()):
             raise ValueError(
-                "DFlash mask-embedding fold does not support FP8 "
-                "embedding.safetensors; re-export the base without "
-                "--fp8-embedding.")
+                "DFlash mask-embedding fold does not support quantized "
+                "embedding.safetensors; re-export the base without an "
+                "embedding quantization flag.")
         weight = f.get_tensor("embedding")
 
     patched_row = (draft_vec * embedding_scale).to(weight.dtype)
@@ -3679,13 +3683,22 @@ def main() -> None:
             "Gemma4 EAGLE3 base export so target hidden layers match the draft."
         ),
     )
-    p.add_argument(
+    embedding_group = p.add_mutually_exclusive_group()
+    embedding_group.add_argument(
         "--fp8-embedding",
         "--fp8_embedding",
         dest="fp8_embedding",
         action="store_true",
         help=
         "Write embedding.safetensors in FP8 E4M3 format with per-row block scales.",
+    )
+    embedding_group.add_argument(
+        "--int8-embedding",
+        "--int8_embedding",
+        dest="int8_embedding",
+        action="store_true",
+        help=("Write runtime embedding sidecars in grouped symmetric INT8 "
+              "format with FP32 scales."),
     )
     p.add_argument(
         "--reduced-vocab-dir",
@@ -3879,6 +3892,10 @@ def main() -> None:
     model_type: str = config.get("model_type", "unknown")
     dtype = _dtype_from_str(args.dtype)
 
+    if args.int8_embedding and model_type.startswith("qwen3_omni"):
+        p.error("--int8-embedding is not supported by Qwen3-Omni talker "
+                "runtimes")
+
     # Cosmos3-Edge checkpoints carry two model families that run on DIFFERENT
     # runtime paths; ``--task`` selects which artifact set this invocation
     # exports (both by default):
@@ -3981,6 +3998,9 @@ def main() -> None:
         p.error("--dflash-draft cannot be combined with --eagle-base or --mtp")
     if args.dflash_draft and not args.dflash_draft_dir:
         p.error("--dflash-draft requires --dflash-draft-dir")
+    if args.dflash_draft_dir and (args.fp8_embedding or args.int8_embedding):
+        p.error("--dflash-draft-dir cannot be combined with quantized "
+                "embedding sidecars")
     if args.dspark_base and (args.eagle_base or args.mtp or args.dflash_base
                              or args.dflash_draft):
         p.error("--dspark-base cannot be combined with EAGLE/MTP/DFlash modes")
@@ -4093,6 +4113,8 @@ def main() -> None:
         logger.info("  %-15s: %s", "visual", "yes" if wants_visual else "no")
         logger.info("FP8 embedding : %s",
                     "yes" if args.fp8_embedding else "no")
+        logger.info("INT8 embedding: %s",
+                    "yes" if args.int8_embedding else "no")
         logger.info("TP size       : %d", args.tp_size)
         logger.info("=" * 60)
         if wants_diffusion_engines:
@@ -4100,6 +4122,7 @@ def main() -> None:
                 model_dir,
                 args.output_dir,
                 fp8_embedding=args.fp8_embedding,
+                int8_embedding=args.int8_embedding,
                 reduced_vocab_dir=args.reduced_vocab_dir,
                 externalize_weights=externalize_weights,
                 tp_size=args.tp_size,
@@ -4194,30 +4217,32 @@ def main() -> None:
     # Each stage is (enabled, component_name, exporter_callable). Exporter
     # receives the computed output dir; the (enabled, component) columns also
     # drive both the pre-run log and the post-run summary below.
+    thinker_enabled = (_has_llm_component(model_type, "thinker")
+                       and not args.skip_llm and not _draft_only
+                       and _allow("thinker"))
     stages = [
-        (_has_llm_component(model_type, "thinker") and not args.skip_llm
-         and not _draft_only
-         and _allow("thinker"), "thinker", lambda out: _export_llm(
-             model_dir,
-             out,
-             model_type=model_type,
-             eagle_base=args.eagle_base,
-             eagle_draft_dir=args.eagle_draft_dir,
-             mtp_base=args.mtp and not gemma4_mtp_requested,
-             mtp_tree_base=args.mtp_tree_base,
-             dflash_base=args.dflash_base,
-             dflash_tree_base=args.dflash_tree_base,
-             dflash_draft_dir=args.dflash_draft_dir,
-             dspark_base=args.dspark_base,
-             dspark_draft_dir=args.dspark_draft_dir,
-             gemma4_mtp_base=gemma4_mtp_requested,
-             fp8_embedding=args.fp8_embedding,
-             reduced_vocab_dir=args.reduced_vocab_dir,
-             externalize_weights=externalize_weights,
-             tp_size=args.tp_size,
-             num_decoder_layers=args.num_decoder_layer,
-             skip_softmax_scale_factor=args.skip_softmax_scale_factor,
-             quantization_override=getattr(args, 'quantization', None))),
+        (thinker_enabled, "thinker", lambda out: _export_llm(
+            model_dir,
+            out,
+            model_type=model_type,
+            eagle_base=args.eagle_base,
+            eagle_draft_dir=args.eagle_draft_dir,
+            mtp_base=args.mtp and not gemma4_mtp_requested,
+            mtp_tree_base=args.mtp_tree_base,
+            dflash_base=args.dflash_base,
+            dflash_tree_base=args.dflash_tree_base,
+            dflash_draft_dir=args.dflash_draft_dir,
+            dspark_base=args.dspark_base,
+            dspark_draft_dir=args.dspark_draft_dir,
+            gemma4_mtp_base=gemma4_mtp_requested,
+            fp8_embedding=args.fp8_embedding,
+            int8_embedding=args.int8_embedding,
+            reduced_vocab_dir=args.reduced_vocab_dir,
+            externalize_weights=externalize_weights,
+            tp_size=args.tp_size,
+            num_decoder_layers=args.num_decoder_layer,
+            skip_softmax_scale_factor=args.skip_softmax_scale_factor,
+            quantization_override=getattr(args, 'quantization', None))),
         (args.mtp and not gemma4_mtp_requested
          and _allow("mtp_draft"), "mtp_draft", lambda out: _export_mtp_draft(
              model_dir, out, externalize_weights=externalize_weights)),
@@ -4281,6 +4306,7 @@ def main() -> None:
     for enabled, component, _ in stages:
         logger.info("  %-15s: %s", component, "yes" if enabled else "no")
     logger.info("FP8 embedding : %s", "yes" if args.fp8_embedding else "no")
+    logger.info("INT8 embedding: %s", "yes" if args.int8_embedding else "no")
     logger.info("MTP capable   : %s", "yes" if has_mtp_draft else "no")
     logger.info("MTP export    : %s",
                 "yes" if args.mtp or gemma4_mtp_requested else "no")
@@ -4301,13 +4327,15 @@ def main() -> None:
                     args.num_decoder_layer)
     logger.info("=" * 60)
 
-    # ``--fp8-embedding`` only applies to the LLM thinker.  Models without a
-    # thinker (e.g. Qwen3-TTS) silently fall back to FP16 — warn so the user
-    # isn't surprised when the flag has no effect.
-    if args.fp8_embedding and not _has_llm_component(model_type, "thinker"):
+    # Embedding quantization only applies when the LLM thinker is exported.
+    if args.fp8_embedding and not thinker_enabled:
         logger.warning(
-            "--fp8-embedding is not supported for Talker / CodePredictor; "
-            "using FP16 embeddings.")
+            "--fp8-embedding has no effect because the thinker is not being "
+            "exported.")
+    if args.int8_embedding and not thinker_enabled:
+        logger.warning(
+            "--int8-embedding has no effect because the thinker is not being "
+            "exported.")
 
     if (_has_audio(model_type) and not args.skip_audio
             and _checkpoint_audio_config(config) is None):

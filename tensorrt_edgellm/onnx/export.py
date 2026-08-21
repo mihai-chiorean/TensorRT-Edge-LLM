@@ -78,6 +78,7 @@ def export_onnx(
     reduced_vocab_dir: str = "",
     externalize_weights=None,
     config_filename: str = "config.json",
+    int8_embedding: bool = False,
 ) -> None:
     """Export *model* to ONNX using the dynamo exporter.
 
@@ -103,6 +104,8 @@ def export_onnx(
                          Use ``"config.json"`` for single-device exports
                          or ``"config_tp{N}_rank{R}.json"`` for per-rank
                          TP exports so each rank is self-describing.
+        int8_embedding: Quantize embedding.safetensors and Gemma4 PLE, when
+                        present, to grouped symmetric INT8 sidecars.
     """
     out_dir = os.path.dirname(os.path.abspath(output_path))
     os.makedirs(out_dir, exist_ok=True)
@@ -122,6 +125,7 @@ def export_onnx(
                             model_dir,
                             out_dir,
                             fp8_embedding=fp8_embedding,
+                            int8_embedding=int8_embedding,
                             reduced_vocab_dir=reduced_vocab_dir,
                             config_filename=config_filename)
     if external_weight_files:
