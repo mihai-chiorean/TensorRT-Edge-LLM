@@ -133,6 +133,21 @@ def _pre_register_phi4mm_attention_for_kv_quant(
             "attention modules found; KV-cache pre-registration skipped")
 
 
+def _exclude_unaligned_int4_linears(model: torch.nn.Module,
+                                    quant_cfg: dict[str, Any]) -> None:
+    """Keep Linears unsupported by the INT4 GEMM layout in high precision."""
+    rules = quant_cfg["quant_cfg"]
+    for name, module in model.named_modules():
+        if (isinstance(module, torch.nn.Linear) and
+            (module.out_features % 64 != 0 or module.in_features % 64 != 0)):
+            rules.append({
+                "quantizer_name": f"*{name}.weight_quantizer",
+                "enable": False,
+            })
+            print(f"[int4] skipping {name}: weight [{module.out_features}, "
+                  f"{module.in_features}] not 64-aligned (kept fp16)")
+
+
 def _copy_phi4mm_processor_files(model_dir: str, output_dir: str) -> None:
     for name in ("preprocessor_config.json", "processor_config.json",
                  "processing_phi4mm.py"):
@@ -854,17 +869,7 @@ def quantize_and_export(
         # exclude any 64-misaligned Linear from int4 -- it stays fp16 and exports
         # as a plain GEMM.
         if quantization == "int4_awq":
-            for name, module in model.named_modules():
-                if isinstance(
-                        module,
-                        torch.nn.Linear) and (module.out_features % 64 != 0
-                                              or module.in_features % 64 != 0):
-                    quant_cfg["quant_cfg"][f"*{name}.weight_quantizer"] = {
-                        "enable": False
-                    }
-                    print(
-                        f"[int4] skipping {name}: weight [{module.out_features}, "
-                        f"{module.in_features}] not 64-aligned (kept fp16)")
+            _exclude_unaligned_int4_linears(model, quant_cfg)
         if kv_cache_quantization is not None and _is_phi4mm_model(model_dir):
             _pre_register_phi4mm_attention_for_kv_quant(model)
         if cp_quantization is not None and is_qwen3_next_omni(model):

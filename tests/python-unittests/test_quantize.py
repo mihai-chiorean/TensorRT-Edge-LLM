@@ -292,6 +292,28 @@ def test_llm_int4_awq_weight_only():
     assert not model.model.layers[0].self_attn.q_proj.input_quantizer.is_enabled
 
 
+def test_int4_awq_excludes_unaligned_linears():
+    quantize_mod = importlib.import_module(
+        "tensorrt_edgellm.quantization.quantize")
+    model = nn.ModuleDict({
+        "aligned": nn.Linear(64, 64, bias=False),
+        "unaligned_input": nn.Linear(32, 64, bias=False),
+        "unaligned_output": nn.Linear(64, 16, bias=False),
+    })
+    quant_cfg = build_quant_config("int4_awq")
+    original_rule_count = len(quant_cfg["quant_cfg"])
+
+    quantize_mod._exclude_unaligned_int4_linears(model, quant_cfg)
+
+    assert quant_cfg["quant_cfg"][original_rule_count:] == [{
+        "quantizer_name": "*unaligned_input.weight_quantizer",
+        "enable": False,
+    }, {
+        "quantizer_name": "*unaligned_output.weight_quantizer",
+        "enable": False,
+    }]
+
+
 def test_llm_lm_head_override():
     model = _tiny_llama()
     mtq.quantize(model,
