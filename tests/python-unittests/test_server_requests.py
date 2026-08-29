@@ -21,6 +21,7 @@ plus the ``/v1/audio/transcriptions`` endpoint (FastAPI TestClient).
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import tempfile
@@ -85,6 +86,9 @@ class _StubRt:
     def load_image_from_path(self, path):
         return _FakeBuffer("image", path)
 
+    def load_image_from_bytes(self, data):
+        return _FakeBuffer("image_bytes", data)
+
     def load_video_from_array(self, frames, fps, timestamps=()):
         return _FakeBuffer("video_array", fps)
 
@@ -98,6 +102,82 @@ def _engine():
     except ImportError as exc:  # skip only for missing external deps
         _skip_or_raise(exc, "engine import")
     return engine
+
+
+def test_openai_image_url_data_is_converted_and_loaded_from_memory():
+    eng = _engine()
+    encoded = base64.b64encode(b"jpeg bytes").decode("ascii")
+    messages = [{
+        "role":
+        "user",
+        "content": [{
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{encoded}"
+            },
+        }, {
+            "type": "text",
+            "text": "describe",
+        }],
+    }]
+
+    cpp_messages = eng._convert_messages_to_cpp(_StubRt(), messages)
+    assert [content.type
+            for content in cpp_messages[0].contents] == ["image", "text"]
+
+    buffers = eng._load_image_buffers(_StubRt(), messages)
+    assert buffers == [("image_bytes", b"jpeg bytes")]
+
+
+def test_openai_image_url_rejects_remote_fetches():
+    eng = _engine()
+    messages = [{
+        "role":
+        "user",
+        "content": [{
+            "type": "image_url",
+            "image_url": {
+                "url": "https://example.com/image.jpg"
+            },
+        }],
+    }]
+
+    with pytest.raises(ValueError, match="remote image URLs"):
+        eng._load_image_buffers(_StubRt(), messages)
+
+
+def test_openai_image_url_rejects_non_string_source():
+    eng = _engine()
+    messages = [{
+        "role":
+        "user",
+        "content": [{
+            "type": "image_url",
+            "image_url": {
+                "url": 123
+            },
+        }],
+    }]
+
+    with pytest.raises(ValueError, match="image source must be a string"):
+        eng._load_image_buffers(_StubRt(), messages)
+
+
+def test_chat_response_strips_model_terminal_token(tmp_path):
+    from experimental.server.api_server import _build_message_body
+
+    (tmp_path / "tokenizer_config.json").write_text(
+        json.dumps({
+            "eos_token": "<eos>",
+            "eot_token": "<turn|>",
+        }))
+    tool_config = types.SimpleNamespace(parse_output=False)
+
+    body, has_tool_calls = _build_message_body('{"answer":"ok"}<turn|>',
+                                               tool_config, str(tmp_path))
+
+    assert body["content"] == '{"answer":"ok"}'
+    assert not has_tool_calls
 
 
 # ---------------------------------------------------------------------------

@@ -49,6 +49,7 @@ import time
 import uuid
 import wave
 from contextlib import asynccontextmanager
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -396,6 +397,34 @@ def _is_asr_model(llm_instance, audio_dir: str) -> bool:
 THINK_OPEN_TAG = "<think>"
 THINK_CLOSE_TAG = "</think>"
 IM_END_TOKEN = "<|im_end|>"
+
+
+@lru_cache(maxsize=32)
+def _terminal_special_tokens(model_dir: str) -> Tuple[str, ...]:
+    tokens = {IM_END_TOKEN}
+    try:
+        with open(os.path.join(model_dir, "tokenizer_config.json"),
+                  encoding="utf-8") as stream:
+            config = json.load(stream)
+        for key in ("eos_token", "eot_token"):
+            value = config.get(key)
+            if isinstance(value, str) and value:
+                tokens.add(value)
+    except (OSError, ValueError, AttributeError):
+        pass
+    return tuple(sorted(tokens, key=len, reverse=True))
+
+
+def _strip_terminal_special_tokens(text: str, model_dir: str) -> str:
+    while True:
+        stripped = text.rstrip()
+        for token in _terminal_special_tokens(model_dir):
+            if stripped.endswith(token):
+                text = stripped[:-len(token)]
+                break
+        else:
+            return text
+
 
 # Upper bound on requested output length: the runtime narrows to int32 and,
 # with logprobs, allocates from the requested length before KV clamping, so an
@@ -1974,6 +2003,7 @@ def _format_logprobs(response,
 
 def _build_message_body(output_text: str, tool_config: ToolConfig,
                         model_dir: str) -> Tuple[Dict[str, Any], bool]:
+    output_text = _strip_terminal_special_tokens(output_text, model_dir)
     if not tool_config.parse_output:
         reasoning, answer = _split_reasoning_and_content(output_text)
         message_body: Dict[str, Any] = {"role": "assistant"}

@@ -1939,11 +1939,11 @@ def _convert_messages_to_cpp(rt_module, messages: List[Dict[str, Any]]):
                                 "text",
                                 item.get("text", ""),
                             ))
-                    elif ct == "image":
+                    elif ct in ("image", "image_url"):
                         contents_list.append(
                             rt_module.MessageContent(
                                 "image",
-                                item.get("image", ""),
+                                item.get("image", "") if ct == "image" else "",
                             ))
                     elif ct in ("video", "video_url"):
                         # Frames are decoded out-of-band by _load_image_buffers; the chat
@@ -2040,10 +2040,29 @@ def _load_image_buffers(rt_module,
     # matches them positionally against the placeholders).
     for item in items:
         itype = item.get("type")
-        if itype == "image":
-            path = item.get("image", "")
-            if path and os.path.isfile(path):
-                image = rt_module.load_image_from_path(path)
+        if itype in ("image", "image_url"):
+            source = item.get("image", "")
+            if itype == "image_url":
+                source = item.get("image_url", "")
+                source = source.get("url", "") if isinstance(source,
+                                                             dict) else source
+            if not isinstance(source, str):
+                raise ValueError("image source must be a string")
+            if source.startswith("data:"):
+                from .media_source import decode_base64_data_url
+                image = rt_module.load_image_from_bytes(
+                    decode_base64_data_url(source, "image", strict=True))
+            else:
+                if source.startswith("file:"):
+                    from .media_source import resolve_file_url
+                    source = resolve_file_url(source)
+                if source.startswith(("http://", "https://")):
+                    raise ValueError(
+                        "remote image URLs are not supported; use a base64 "
+                        "data URL")
+                image = (rt_module.load_image_from_path(source)
+                         if source and os.path.isfile(source) else None)
+            if image is not None:
                 image.do_resize = bool(item.get("do_resize", True))
                 images.append(image)
         elif itype in ("video", "video_url"):
