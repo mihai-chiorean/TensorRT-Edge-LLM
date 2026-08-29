@@ -425,6 +425,24 @@ def _ensure_plugin_path() -> None:
             return
 
 
+_DEFAULT_CONTEXT_CACHE_MAX_RECORDS = 1024
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Read a boolean environment override; unset or unparseable keeps `default`."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    logger.warning("Ignoring unparseable %s=%r; using default %s", name, raw,
+                   default)
+    return default
+
+
 def _import_runtime():
     """Import the C++ pybind module."""
     _ensure_plugin_path()
@@ -600,6 +618,8 @@ class LLM:
         talker_engine_dir: str = "",
         code_predictor_engine_dir: str = "",
         code2wav_engine_dir: str = "",
+        context_cache: Optional[bool] = None,
+        context_cache_max_records: int = _DEFAULT_CONTEXT_CACHE_MAX_RECORDS,
     ):
         sources = sum(bool(s) for s in (model, onnx_dir, engine_dir))
         if sources != 1:
@@ -636,6 +656,15 @@ class LLM:
         self._max_kv_cache_capacity = max_kv_cache_capacity
         self._tool_template_formatter: Optional[
             ToolChatTemplateFormatter] = None
+
+        # Prompt-prefix reuse. Without it every request re-prefills the whole
+        # prompt, so a long shared system prompt is paid for on every turn.
+        # Explicit argument wins; otherwise EDGELLM_CONTEXT_CACHE decides, and
+        # the built-in default is on.
+        if context_cache is None:
+            context_cache = _env_flag("EDGELLM_CONTEXT_CACHE", True)
+        self._context_cache_enabled = bool(context_cache)
+        self._context_cache_max_records = int(context_cache_max_records)
 
         if engine_dir:
             self._init_from_engine(engine_dir, multimodal_engine_dir)
@@ -869,6 +898,26 @@ class LLM:
             max_kv_cache_capacity=max_kv_cache_capacity,
         )
 
+    def _context_cache_config(self):
+        """Build the runtime's ContextCacheConfig and log the decision."""
+        cfg = self._rt.ContextCacheConfig(
+            enabled=self._context_cache_enabled,
+            max_records=self._context_cache_max_records,
+        )
+        if self._context_cache_enabled:
+            logger.info("Context cache ENABLED (max_records=%d)",
+                        self._context_cache_max_records)
+        else:
+            logger.info(
+                "Context cache DISABLED; every request will re-prefill its "
+                "full prompt")
+        return cfg
+
+    def context_cache_metrics(self):
+        """Context-cache diagnostics, or None when reuse is off/unavailable."""
+        getter = getattr(self._runtime, "get_context_cache_metrics", None)
+        return getter() if getter is not None else None
+
     def _load_runtime(self) -> None:
         """Load the C++ runtime from engine directories."""
         self._rt = _import_runtime()
@@ -877,6 +926,10 @@ class LLM:
             logger.info("Loading visual engine from %s ...",
                         self._multimodal_engine_dir)
         spec_decode_engine_dir = self._eagle_engine_dir
+        if spec_decode_engine_dir and self._context_cache_enabled:
+            logger.warning(
+                "Context cache is not wired through the speculative-decoding "
+                "runtime constructor; continuing without prompt-prefix reuse.")
         if spec_decode_engine_dir:
             logger.info(
                 "Speculative decoding enabled (top_k=%d, step=%d, tree=%d)",
@@ -897,6 +950,7 @@ class LLM:
                 self._engine_dir,
                 self._multimodal_engine_dir,
                 {},
+                self._context_cache_config(),
             )
         self._runtime.capture_decoding_cuda_graph()
         self._load_omni_runtime()

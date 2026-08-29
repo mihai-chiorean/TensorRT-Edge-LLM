@@ -54,6 +54,7 @@ namespace py = pybind11;
 
 using namespace trt_edgellm;
 using namespace trt_edgellm::rt;
+using namespace pybind11::literals;
 
 namespace
 {
@@ -238,11 +239,16 @@ class PyLLMRuntime
 {
 public:
     //! Vanilla constructor (no speculative decoding).
+    //! An enabled \p contextCacheConfig turns on process-local content-addressed context reuse, so a shared
+    //! prompt prefix (e.g. a system prompt) is prefilled once and rebound on later requests instead of
+    //! being recomputed. Defaults to the disabled config, preserving the identity-page runtime path.
     PyLLMRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
-        std::unordered_map<std::string, std::string> const& loraWeightsMap)
+        std::unordered_map<std::string, std::string> const& loraWeightsMap,
+        ContextCacheConfig const& contextCacheConfig)
     {
         mPluginHandle = loadEdgellmPluginLib();
-        mRuntime = std::make_unique<LLMInferenceRuntime>(engineDir, multimodalEngineDir, loraWeightsMap, mStream.get());
+        mRuntime = std::make_unique<LLMInferenceRuntime>(
+            engineDir, multimodalEngineDir, loraWeightsMap, mStream.get(), contextCacheConfig);
     }
 
     //! Eagle speculative decoding constructor.
@@ -254,6 +260,33 @@ public:
         SpecDecodeDraftingConfig draftingConfig{draftTopK, draftStep, verifyTreeSize};
         mRuntime = std::make_unique<LLMInferenceRuntime>(
             engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig, mStream.get());
+    }
+
+    //! Coordinator-local context-cache diagnostics, or None when reuse is disabled.
+    py::object getContextCacheMetrics() const
+    {
+        auto const metrics = mRuntime->getContextCacheMetrics();
+        if (!metrics.has_value())
+        {
+            return py::none();
+        }
+        auto pool = [](ContextCachePoolMetrics const& m) {
+            return py::dict("free"_a = m.free, "capacity"_a = m.capacity);
+        };
+        return py::dict("admitted_sequences"_a = metrics->admittedSequences,
+            "hit_sequences"_a = metrics->hitSequences, "media_aware_sequences"_a = metrics->mediaAwareSequences,
+            "lookup_bypass_sequences"_a = metrics->lookupBypassSequences,
+            "forced_cold_sequences"_a = metrics->forcedColdSequences, "standard_plans"_a = metrics->standardPlans,
+            "no_reusable_prefix_plans"_a = metrics->noReusablePrefixPlans,
+            "full_input_rewind_plans"_a = metrics->fullInputRewindPlans, "matched_tokens"_a = metrics->matchedTokens,
+            "reused_tokens"_a = metrics->reusedTokens, "publication_attempts"_a = metrics->publicationAttempts,
+            "committed_publications"_a = metrics->committedPublications,
+            "existing_publications"_a = metrics->existingPublications, "current_records"_a = metrics->currentRecords,
+            "evicted_records"_a = metrics->evictedRecords, "base_kv_pages"_a = pool(metrics->baseKvPages),
+            "draft_kv_pages"_a = pool(metrics->draftKvPages),
+            "recurrent_snapshots"_a = pool(metrics->recurrentSnapshots),
+            "partial_kv_snapshots"_a = pool(metrics->partialKvSnapshots),
+            "planning_nanoseconds"_a = metrics->planningNanoseconds);
     }
 
     LLMGenerationResponse handleRequest(LLMGenerationRequest const& request)
@@ -800,14 +833,41 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readonly("prompt_token_counts", &LLMGenerationResponse::inputTokenCounts);
 
     // ========================================================================
+    // Context cache (prompt-prefix reuse)
+    // ========================================================================
+    py::class_<ContextCacheConfig>(m, "ContextCacheConfig",
+        "Runtime configuration for process-local content-addressed context reuse. When enabled, a shared "
+        "prompt prefix is prefilled once and rebound on subsequent requests instead of being recomputed.")
+        .def(py::init<>())
+        .def(py::init(
+                 [](bool enabled, int32_t maxRecords, int64_t recurrentSnapshotPoolBytes,
+                     int64_t partialKvSnapshotPoolBytes) {
+                     return ContextCacheConfig{
+                         enabled, maxRecords, recurrentSnapshotPoolBytes, partialKvSnapshotPoolBytes};
+                 }),
+            py::arg("enabled") = false, py::arg("max_records") = 1024,
+            py::arg("recurrent_snapshot_pool_bytes") = 0, py::arg("partial_kv_snapshot_pool_bytes") = 0)
+        .def_readwrite("enabled", &ContextCacheConfig::enabled)
+        .def_readwrite("max_records", &ContextCacheConfig::maxRecords)
+        .def_readwrite("recurrent_snapshot_pool_bytes", &ContextCacheConfig::recurrentSnapshotPoolBytes)
+        .def_readwrite("partial_kv_snapshot_pool_bytes", &ContextCacheConfig::partialKvSnapshotPoolBytes)
+        .def("__repr__", [](ContextCacheConfig const& c) {
+            return "ContextCacheConfig(enabled=" + std::string(c.enabled ? "True" : "False")
+                + ", max_records=" + std::to_string(c.maxRecords) + ")";
+        });
+
+    // ========================================================================
     // Runtime: unified (vanilla + Eagle speculative decoding)
     // ========================================================================
     py::class_<PyLLMRuntime>(m, "LLMRuntime",
         "Unified LLM inference runtime. Supports both vanilla decoding and Eagle speculative decoding.")
-        .def(py::init<std::string const&, std::string const&, std::unordered_map<std::string, std::string> const&>(),
+        .def(py::init<std::string const&, std::string const&, std::unordered_map<std::string, std::string> const&,
+                 ContextCacheConfig const&>(),
             py::arg("engine_dir"), py::arg("multimodal_engine_dir") = "",
             py::arg("lora_weights_map") = std::unordered_map<std::string, std::string>{},
-            "Construct for vanilla (non-speculative) decoding")
+            py::arg("context_cache_config") = ContextCacheConfig{},
+            "Construct for vanilla (non-speculative) decoding. Pass an enabled context_cache_config to turn on "
+            "prompt-prefix reuse.")
         .def(py::init<std::string const&, std::string const&, std::unordered_map<std::string, std::string> const&,
                  int32_t, int32_t, int32_t>(),
             py::arg("engine_dir"), py::arg("multimodal_engine_dir"), py::arg("lora_weights_map"),
@@ -836,7 +896,9 @@ PYBIND11_MODULE(_edgellm_runtime, m)
             py::return_value_policy::reference_internal)
         .def("get_eagle_generation_metrics", &PyLLMRuntime::getSpecDecodeGenerationMetrics,
             py::return_value_policy::reference_internal) // deprecated alias
-        .def("get_multimodal_metrics", &PyLLMRuntime::getMultimodalMetrics);
+        .def("get_multimodal_metrics", &PyLLMRuntime::getMultimodalMetrics)
+        .def("get_context_cache_metrics", &PyLLMRuntime::getContextCacheMetrics,
+            "Context-cache diagnostics as a dict, or None when context reuse is disabled");
 
     py::class_<PyTTSRuntime>(
         m, "TTSRuntime", "TTS-only runtime (Qwen3-TTS-style): Talker + CodePredictor + Code2Wav, no Thinker engine")

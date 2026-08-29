@@ -2225,6 +2225,29 @@ def main():
         default=8192,
         help="Max KV cache capacity",
     )
+    cache_group = parser.add_mutually_exclusive_group()
+    cache_group.add_argument(
+        "--context-cache",
+        dest="context_cache",
+        action="store_true",
+        default=None,
+        help="Enable prompt-prefix reuse so a shared prefix (e.g. the system "
+        "prompt) is prefilled once instead of on every request. Default on; "
+        "override with EDGELLM_CONTEXT_CACHE=0.",
+    )
+    cache_group.add_argument(
+        "--no-context-cache",
+        dest="context_cache",
+        action="store_false",
+        default=None,
+        help="Disable prompt-prefix reuse; every request re-prefills in full.",
+    )
+    parser.add_argument(
+        "--context-cache-max-records",
+        type=int,
+        default=1024,
+        help="Maximum retained context-cache records",
+    )
     parser.add_argument(
         "--spec-decode-engine-dir",
         dest="spec_decode_engine_dir",
@@ -2306,6 +2329,8 @@ def main():
         draft_top_k=args.draft_top_k,
         draft_step=args.draft_step,
         verify_tree_size=args.verify_tree_size,
+        context_cache=args.context_cache,
+        context_cache_max_records=args.context_cache_max_records,
     )
     llm.serve(
         host=args.host,
