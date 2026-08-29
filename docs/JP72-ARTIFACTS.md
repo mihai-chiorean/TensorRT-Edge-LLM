@@ -290,3 +290,102 @@ The reference's validated 4-560 profile covers that with headroom; keep it.
 **The engine build needs memory freed.** Stopping `edge-llm` for the build
 window releases 9.70 GiB. That is the main session's call, not the build
 agent's.
+
+## Measured results (2026-08-29)
+
+Build host: AMD Ryzen 7 8845HS, 8C/16T, 90 GB RAM, no NVIDIA GPU.
+
+### Stage 2 — quantization
+
+`TOTAL 7065.5s` (1 h 58 m), peak RSS 12.5 GB.
+
+| Phase | Time |
+|---|---|
+| `awq_lite` caching pass | 10 m 04 s (8 batches, 75.6 s/batch) |
+| `awq_lite` search pass | 1 h 46 m (8 batches, 795 s/batch — 10.5x the caching pass) |
+| `export_hf_checkpoint` | ~20 s |
+
+2,069 quantizers inserted. Output
+`~/tensorrt-edgellm-workspace/gemma-4-E4B/quantized-w4a16-awq`, 9.4 GB. The
+size is dominated by the *unquantized* BF16 lookup tables (input embedding
+1.34 GB + PLE 5.64 GB); AWQ only touches the projection weights. Stage 3's
+`--int8-embedding` is what reclaims those.
+
+`hf_quant_config.json` as produced — this is the recipe assertion to check
+against the JP6.2 engines:
+
+```json
+{
+  "producer": {"name": "modelopt", "version": "0.45.0"},
+  "quantization": {
+    "quant_algo": "W4A16_AWQ",
+    "kv_cache_quant_algo": null,
+    "group_size": 128,
+    "has_zero_point": false,
+    "pre_quant_scale": true,
+    "exclude_modules": ["lm_head", "model.audio_tower*", "model.embed_audio*",
+                        "model.embed_vision*", "model.vision_tower*"]
+  }
+}
+```
+
+### Stage 3 — ONNX export
+
+About 4 minutes. Output
+`~/tensorrt-edgellm-workspace/gemma-4-E4B/onnx-int8emb`, 7.4 GB:
+
+| File | Bytes |
+|---|---:|
+| `llm/model.onnx` | 10,674,254 |
+| `llm/model.onnx.data` | 3,394,634,232 |
+| `llm/ple_embedding.safetensors` | 2,862,612,824 |
+| `llm/embedding.safetensors` | 672,137,552 |
+| `llm/tokenizer.json` | 32,169,878 |
+| `llm/config.json`, `tokenizer_config.json`, `chat_template.jinja`, `processed_chat_template.json` | small |
+| `visual/model.onnx` + `.data` + `preprocessor_config.json` | 346,306,130 |
+| `audio/model.onnx` + `.data` + `config.json` | 621,510,542 |
+
+The two sidecar payload sizes land exactly on the figures in
+`docs/source/user_guide/features/int8-embedding.md` (672,137,216 and
+2,862,612,480 bytes plus safetensors headers), so the INT8 tables came out at
+the documented 3.21 GiB saving.
+
+Verified sidecar contract:
+
+```text
+embedding.safetensors      metadata: int8_symmetric_column_groups_per_row / v1 / embedding
+  embedding        [262144, 2560]   int8
+  embedding_scale  [262144]         float32     one scale per row
+ple_embedding.safetensors  metadata: int8_symmetric_column_groups_per_row / v1 / ple_embedding
+  weight           [262144, 10752]  int8
+  weight_scale     [262144, 42]     float32     one scale per row AND per layer input
+```
+
+### Where the artifacts live
+
+| Artifact | Host | Path | Size |
+|---|---|---|---|
+| HF checkpoint (BF16) | build host | `~/tensorrt-edgellm-workspace/gemma-4-E4B/hf` | 15 GB |
+| Quantized HF-style checkpoint | build host | `~/tensorrt-edgellm-workspace/gemma-4-E4B/quantized-w4a16-awq` | 9.4 GB |
+| **ONNX + sidecars (llm_build input)** | **Jetson** | **`~/tensorrt-edgellm-workspace/gemma-4-E4B/onnx-int8emb`** | **7.4 GB** |
+
+The quantized checkpoint is deliberately *not* copied to the device: the
+engine build consumes the ONNX directory, and the device has 57 GB free that
+the engines and any rebuild will want. Re-export from the build host if a
+different sidecar precision is ever needed.
+
+### Next step (engine build agent)
+
+```bash
+B=~/workspace/TensorRT-Edge-LLM-gemma-sidecars/build-jp72-sm87
+O=~/tensorrt-edgellm-workspace/gemma-4-E4B/onnx-int8emb
+E=~/tensorrt-edgellm-workspace/gemma-4-E4B/engines-int8-16384
+
+$B/examples/llm/llm_build --onnxDir $O/llm --engineDir $E/llm \
+  --maxInputLen 8192 --maxKVCacheCapacity 16384 --maxBatchSize 1
+$B/examples/multimodal/visual_build --onnxDir $O/visual --engineDir $E/visual
+```
+
+Use `llm_build`/`visual_build`, not `tensorrt-edgellm-build --model-dir`: the
+direct checkpoint builder still binds FP16 embedding tables and would discard
+the 3.21 GiB INT8 saving.
