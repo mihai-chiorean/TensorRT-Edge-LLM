@@ -389,3 +389,22 @@ $B/examples/multimodal/visual_build --onnxDir $O/visual --engineDir $E/visual
 Use `llm_build`/`visual_build`, not `tensorrt-edgellm-build --model-dir`: the
 direct checkpoint builder still binds FP16 embedding tables and would discard
 the 3.21 GiB INT8 saving.
+
+### The exported runtime config confirms the KV arithmetic
+
+`onnx-int8emb/llm/config.json` (written by the exporter, read by the C++
+runtime) carries the KV geometry explicitly, so the capacity table above is
+not an inference from the HF config:
+
+```text
+kv_sharing_donors : [-1 x24, then 22/22/22/22/22/23 x3 groups]   -> 24 allocating layers
+kv_layer_configs  : 42 entries, {num_kv_heads: 2, head_dim: 256}, head_dim 512 at
+                    layers 5/11/17/23/29/35/41
+kv_cache_dtype    : fp16
+ple_enabled       : true, num_ple_inputs 42, ple_hidden_size 256
+```
+
+The runtime therefore does honour KV sharing, which rules out the
+"no KV sharing" column. Real KV at 16,384 is 276 MiB if sliding-window layers
+are capped at their 512-token window and 896 MiB if they are not — not the
+1.53 GiB upper bound.
