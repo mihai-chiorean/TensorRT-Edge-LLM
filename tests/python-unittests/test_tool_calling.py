@@ -126,6 +126,61 @@ def test_parses_tool_calls(tmp_path):
     assert json.loads(parsed.tool_calls[0].arguments) == {"city": "Paris"}
 
 
+def test_parses_gemma4_tool_calls(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"model": "gemma4_text"}))
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "set_volume",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "percent": {
+                        "type": "integer"
+                    },
+                    "mode": {
+                        "type": "string"
+                    },
+                },
+            },
+        },
+    }]
+    config = validate_tool_request([{
+        "role": "user",
+        "content": "Set volume"
+    }], tools, "required")
+
+    parsed = parse_assistant_output(
+        'call:set_volume{mode:louder,percent:75}', config, str(tmp_path))
+
+    assert parsed.content == ""
+    assert len(parsed.tool_calls) == 1
+    assert parsed.tool_calls[0].name == "set_volume"
+    assert json.loads(parsed.tool_calls[0].arguments) == {
+        "mode": "louder",
+        "percent": 75,
+    }
+
+    tagged = parse_assistant_output(
+        '<|tool_call>call:set_volume{mode:<|"|>a,b<|"|>,percent:40}'
+        '<tool_call|>', config, str(tmp_path))
+    assert json.loads(tagged.tool_calls[0].arguments) == {
+        "mode": "a,b",
+        "percent": 40,
+    }
+
+
+def test_rejects_malformed_gemma4_tool_call(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"model": "gemma4_text"}))
+    config = _tool_config()
+    text = "call:get_weather{city:Paris,city:London}"
+
+    parsed = parse_assistant_output(text, config, str(tmp_path))
+
+    assert parsed.tool_calls == []
+    assert parsed.content == text
+
+
 def test_filters_forced_tool(tmp_path):
     text = "<tool_call>{\"name\":\"other\",\"arguments\":{}}</tool_call>"
     parsed = parse_assistant_output(

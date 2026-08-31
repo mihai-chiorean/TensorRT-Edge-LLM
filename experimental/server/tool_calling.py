@@ -290,6 +290,49 @@ class _GenericToolParser:
         return [{"type": "content", "text": text}], False
 
 
+class _Gemma4ToolParser:
+
+    _BLOCK_RE = re.compile(
+        r"<\|tool_call>(.*?)<tool_call\|>",
+        re.S,
+    )
+    _CALL_RE = re.compile(
+        r"^call:(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+        r"(?P<arguments>\{.*\})$",
+        re.S,
+    )
+
+    def parse(self, text: str,
+              tool_config: ToolConfig) -> Tuple[List[Dict[str, Any]], bool]:
+        events: List[Dict[str, Any]] = []
+        malformed = False
+        pos = 0
+        matched = False
+        for match in self._BLOCK_RE.finditer(text):
+            matched = True
+            if match.start() > pos:
+                events.append({
+                    "type": "content",
+                    "text": text[pos:match.start()]
+                })
+            call = _parse_gemma4_call(match.group(1), tool_config)
+            if call is None:
+                malformed = True
+                events.append({"type": "content", "text": match.group(0)})
+            else:
+                events.append({"type": "tool_call", "tool_call": call})
+            pos = match.end()
+        if pos < len(text):
+            events.append({"type": "content", "text": text[pos:]})
+        if matched:
+            return events, malformed
+
+        call = _parse_gemma4_call(text, tool_config)
+        if call is not None:
+            return [{"type": "tool_call", "tool_call": call}], False
+        return [{"type": "content", "text": text}], False
+
+
 class _ToolParserRegistry:
 
     def __init__(self):
@@ -300,6 +343,7 @@ class _ToolParserRegistry:
             "qwen3_xml": parser,
             "nemotron": parser,
             "openai": parser,
+            "gemma4": _Gemma4ToolParser(),
         }
 
     def get(self, model_dir: str):
@@ -318,7 +362,9 @@ def _parser_name_for_model(model_dir: str) -> str:
     model_type = ""
     try:
         with open(os.path.join(model_dir, "config.json")) as f:
-            model_type = str(json.load(f).get("model_type", "")).lower()
+            config = json.load(f)
+            model_type = str(
+                config.get("model_type") or config.get("model") or "").lower()
     except (OSError, ValueError):
         pass
     name = f"{model_type} {os.path.basename(model_dir).lower()}"
@@ -330,7 +376,131 @@ def _parser_name_for_model(model_dir: str) -> str:
         return "nemotron"
     if "openai" in name or "gpt-oss" in name:
         return "openai"
+    if "gemma4" in name:
+        return "gemma4"
     return "generic"
+
+
+def _parse_gemma4_call(text: str,
+                       tool_config: ToolConfig) -> Optional[ToolCall]:
+    match = _Gemma4ToolParser._CALL_RE.fullmatch(text.strip())
+    if match is None:
+        return None
+    name = match.group("name")
+    if not _tool_name_allowed(name, tool_config):
+        return None
+    try:
+        arguments = _parse_gemma4_object(match.group("arguments"),
+                                         _param_types_for(name, tool_config))
+    except ValueError:
+        return None
+    return ToolCall(id=_new_call_id(),
+                    name=name,
+                    arguments=_arguments_to_json(arguments))
+
+
+def _parse_gemma4_object(text: str,
+                         parameter_types: Optional[Dict[str, str]] = None) -> dict:
+    body = text.strip()
+    if not (body.startswith("{") and body.endswith("}")):
+        raise ValueError("Gemma tool arguments must be an object")
+    body = body[1:-1].strip()
+    if not body:
+        return {}
+
+    result = {}
+    for item in _split_gemma4_fields(body):
+        key, value = _split_gemma4_key_value(item)
+        if key in result:
+            raise ValueError("Duplicate Gemma tool argument")
+        expected_type = (parameter_types or {}).get(key)
+        result[key] = _parse_gemma4_value(value, expected_type)
+    return result
+
+
+def _split_gemma4_fields(text: str) -> List[str]:
+    fields = []
+    start = 0
+    depth = 0
+    in_string = False
+    index = 0
+    delimiter = '<|"|>'
+    while index < len(text):
+        if text.startswith(delimiter, index):
+            in_string = not in_string
+            index += len(delimiter)
+            continue
+        char = text[index]
+        if not in_string:
+            if char in "[{":
+                depth += 1
+            elif char in "]}":
+                depth -= 1
+                if depth < 0:
+                    raise ValueError("Unbalanced Gemma tool arguments")
+            elif char == "," and depth == 0:
+                fields.append(text[start:index].strip())
+                start = index + 1
+        index += 1
+    if in_string or depth != 0:
+        raise ValueError("Unbalanced Gemma tool arguments")
+    fields.append(text[start:].strip())
+    if any(not field for field in fields):
+        raise ValueError("Empty Gemma tool argument")
+    return fields
+
+
+def _split_gemma4_key_value(field: str) -> Tuple[str, str]:
+    depth = 0
+    in_string = False
+    index = 0
+    delimiter = '<|"|>'
+    while index < len(field):
+        if field.startswith(delimiter, index):
+            in_string = not in_string
+            index += len(delimiter)
+            continue
+        char = field[index]
+        if not in_string:
+            if char in "[{":
+                depth += 1
+            elif char in "]}":
+                depth -= 1
+            elif char == ":" and depth == 0:
+                key = field[:index].strip()
+                value = field[index + 1:].strip()
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or not value:
+                    break
+                return key, value
+        index += 1
+    raise ValueError("Invalid Gemma tool argument")
+
+
+def _parse_gemma4_value(text: str, expected_type: Optional[str] = None) -> Any:
+    value = text.strip()
+    delimiter = '<|"|>'
+    if value.startswith(delimiter) and value.endswith(delimiter):
+        return value[len(delimiter):-len(delimiter)]
+    if value.startswith("{"):
+        return _parse_gemma4_object(value)
+    if value.startswith("[") and value.endswith("]"):
+        body = value[1:-1].strip()
+        return ([] if not body else [
+            _parse_gemma4_value(item)
+            for item in _split_gemma4_fields(body)
+        ])
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    if value == "null":
+        return None
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        if expected_type == "string":
+            return value
+        raise ValueError("Invalid Gemma tool argument value")
 
 
 def _parse_tool_block(block: str, tool_config: ToolConfig) -> List[ToolCall]:
