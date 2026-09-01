@@ -301,6 +301,10 @@ class _Gemma4ToolParser:
         r"(?P<arguments>\{.*\})$",
         re.S,
     )
+    _CALL_PREFIX_RE = re.compile(
+        r"^\s*call:[A-Za-z_][A-Za-z0-9_]*(?P<arguments>\{)",
+        re.S,
+    )
 
     def parse(self, text: str,
               tool_config: ToolConfig) -> Tuple[List[Dict[str, Any]], bool]:
@@ -329,6 +333,13 @@ class _Gemma4ToolParser:
 
         call = _parse_gemma4_call(text, tool_config)
         if call is not None:
+            return [{"type": "tool_call", "tool_call": call}], False
+        call = _parse_gemma4_call_prefix(text, tool_config)
+        if call is not None:
+            # Gemma occasionally continues with a success sentence before the
+            # tool has run.  Once a valid canonical call prefix is present,
+            # expose only the call; the result-grounded continuation is a
+            # separate request.
             return [{"type": "tool_call", "tool_call": call}], False
         return [{"type": "content", "text": text}], False
 
@@ -397,6 +408,46 @@ def _parse_gemma4_call(text: str,
     return ToolCall(id=_new_call_id(),
                     name=name,
                     arguments=_arguments_to_json(arguments))
+
+
+def _parse_gemma4_call_prefix(
+    text: str,
+    tool_config: ToolConfig,
+) -> Optional[ToolCall]:
+    match = _Gemma4ToolParser._CALL_PREFIX_RE.match(text)
+    if match is None:
+        return None
+    start = match.start("arguments")
+    end = _gemma4_object_end(text, start)
+    if end is None:
+        return None
+    return _parse_gemma4_call(text[:end], tool_config)
+
+
+def _gemma4_object_end(text: str, start: int) -> Optional[int]:
+    """Return the end of one balanced Gemma object outside string tokens."""
+    if start < 0 or start >= len(text) or text[start] != "{":
+        return None
+    delimiter = '<|"|>'
+    depth = 0
+    in_string = False
+    index = start
+    while index < len(text):
+        if text.startswith(delimiter, index):
+            in_string = not in_string
+            index += len(delimiter)
+            continue
+        if not in_string:
+            if text[index] == "{":
+                depth += 1
+            elif text[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    return index + 1
+                if depth < 0:
+                    return None
+        index += 1
+    return None
 
 
 def _parse_gemma4_object(text: str,

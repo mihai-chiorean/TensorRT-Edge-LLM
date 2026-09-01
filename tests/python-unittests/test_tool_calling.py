@@ -169,6 +169,20 @@ def test_parses_gemma4_tool_calls(tmp_path):
         "percent": 40,
     }
 
+    premature = parse_assistant_output(
+        "call:set_volume{percent:75,mode:louder}"
+        "I have already changed the volume.",
+        config,
+        str(tmp_path),
+    )
+    assert premature.content == ""
+    assert len(premature.tool_calls) == 1
+    assert premature.tool_calls[0].name == "set_volume"
+    assert json.loads(premature.tool_calls[0].arguments) == {
+        "mode": "louder",
+        "percent": 75,
+    }
+
 
 def test_rejects_malformed_gemma4_tool_call(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({"model": "gemma4_text"}))

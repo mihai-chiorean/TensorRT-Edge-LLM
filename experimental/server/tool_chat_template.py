@@ -144,6 +144,44 @@ def normalize_messages_for_tools(
     return normalized_messages
 
 
+def _inject_tool_requirement(
+    messages: List[Dict[str, Any]],
+    tool_choice: Optional[Union[str, Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Put OpenAI required/forced choice semantics in the model system turn.
+
+    Several canonical model templates render tool declarations but ignore the
+    ``tool_choice`` Jinja variable.  The API still accepts that field, which
+    otherwise makes ``required`` silently advisory.  Make the constraint
+    explicit at system priority without mutating caller-owned messages.
+    """
+    if tool_choice == "required":
+        instruction = (
+            "For this turn, you must call exactly one of the declared tools. "
+            "Do not answer with prose instead of the tool call."
+        )
+    elif isinstance(tool_choice, dict):
+        function = tool_choice.get("function")
+        name = function.get("name") if isinstance(function, dict) else None
+        if not isinstance(name, str) or not name:
+            return messages
+        instruction = (
+            f"For this turn, you must call the declared tool {name} exactly "
+            "once. Do not answer with prose instead of that tool call."
+        )
+    else:
+        return messages
+
+    result = copy.deepcopy(messages)
+    if result and result[0].get("role") in {"system", "developer"}:
+        content = result[0].get("content")
+        if isinstance(content, str):
+            result[0]["content"] = content.rstrip() + "\n\n" + instruction
+            return result
+    result.insert(0, {"role": "system", "content": instruction})
+    return result
+
+
 class ToolChatTemplateFormatter:
     """Apply HF chat templates for tool-aware requests."""
 
@@ -204,6 +242,9 @@ class ToolChatTemplateFormatter:
         """Format messages and tools into a model-native prompt."""
         owner = self._load_template_owner()
         normalized_messages = normalize_messages_for_tools(messages)
+        normalized_messages = _inject_tool_requirement(
+            normalized_messages, tool_choice,
+        )
 
         kwargs: Dict[str, Any] = {
             "tools": list(tools or []),

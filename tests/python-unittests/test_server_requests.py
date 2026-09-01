@@ -214,6 +214,7 @@ def _make_stub_llm():
         def __init__(self):
             self._runtime = _RT()
             self.captured = None
+            self.captured_tool_config = None
             # Advertise ASR capability (the endpoint probes for an audio/
             # engine subdir with an ASR-typed config).
             self._multimodal_engine_dir = tempfile.mkdtemp()
@@ -243,6 +244,7 @@ def _make_stub_llm():
                                      tool_choice=None,
                                      tool_config=None):
             self.captured = messages
+            self.captured_tool_config = tool_config
             req = types.SimpleNamespace(
                 audio_buffers=list(self._audio_buffers))
             return types.SimpleNamespace(requests=[req])
@@ -273,6 +275,35 @@ def client_and_llm():
     llm = _make_stub_llm()
     # Local media is opt-in; these cases exercise the media pipeline itself.
     return TestClient(_create_app(llm, allowed_local_media_path="/")), llm
+
+
+def test_streaming_forced_tool_preserves_exact_choice(client_and_llm):
+    client, llm = client_and_llm
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test",
+            "messages": [{"role": "user", "content": "set volume"}],
+            "max_tokens": 16,
+            "stream": True,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "set_volume",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "set_volume"},
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert llm.captured_tool_config is not None
+    assert llm.captured_tool_config.tool_choice == "function"
+    assert llm.captured_tool_config.forced_name == "set_volume"
 
 
 @pytest.mark.parametrize("response_format,expect_json", [("json", True),

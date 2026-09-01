@@ -105,8 +105,12 @@ def test_formats_tool_template():
     )
 
     formatted = json.loads(prompt)
-    tool_call = formatted["messages"][0]["tool_calls"][0]
-    tool_message = formatted["messages"][1]
+    assert formatted["messages"][0]["role"] == "system"
+    assert "must call the declared tool get_weather exactly once" in (
+        formatted["messages"][0]["content"]
+    )
+    tool_call = formatted["messages"][1]["tool_calls"][0]
+    tool_message = formatted["messages"][2]
     assert formatted["tools"] == tools
     assert formatted["tool_choice"] == {
         "type": "function",
@@ -117,6 +121,27 @@ def test_formats_tool_template():
     assert formatted["add_generation_prompt"] is True
     assert tool_call["function"]["arguments"] == {"city": "Paris"}
     assert tool_message["content"] == '{"temperature": 22}'
+
+
+def test_required_tool_instruction_extends_existing_system_turn():
+    owner = _RecordingTemplateOwner()
+    formatter = ToolChatTemplateFormatter([], template_owner=owner)
+    formatter.format(
+        [{"role": "system", "content": "trusted boundary"},
+         {"role": "user", "content": "do it"}],
+        tools=[{
+            "type": "function",
+            "function": {"name": "set_volume", "parameters": {}},
+        }],
+        tool_choice="required",
+    )
+
+    assert owner.messages[0]["role"] == "system"
+    assert owner.messages[0]["content"].startswith("trusted boundary\n\n")
+    assert "must call exactly one of the declared tools" in (
+        owner.messages[0]["content"]
+    )
+    assert owner.messages[1] == {"role": "user", "content": "do it"}
 
 
 def test_normalize_converts_video_url_spelling():

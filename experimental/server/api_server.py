@@ -1100,7 +1100,8 @@ def _create_app(llm_instance,
                     messages,
                     params,
                     tools=tool_config.tools,
-                    tool_choice=tool_config.tool_choice)
+                    tool_choice=tool_config.tool_choice,
+                    tool_config=tool_config)
             except (ValueError, KeyError) as exc:
                 sem.release()
                 admission.release()
