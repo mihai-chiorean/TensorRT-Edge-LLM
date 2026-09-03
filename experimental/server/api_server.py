@@ -58,7 +58,7 @@ from .audio_preprocess import MAX_AUDIO_UPLOAD_BYTES
 from .batching import BatcherOverflow, RequestBatcher, resolve_batch_size
 from .engine import (OMNI_AUDIO_SAMPLE_RATE, AudioParams, SamplingParams,
                      _normalize_logit_bias, _validate_logit_bias_spec_decode,
-                     finish_reason_name)
+                     finish_reason_name, normalize_greedy_sampling)
 from .tool_calling import (ToolConfig, make_stream_parser,
                            parse_assistant_output, partial_marker_len,
                            validate_tool_request)
@@ -626,6 +626,9 @@ def _apply_talker_knobs(cfg: Dict[str, Any], params: AudioParams,
         if value < minimum:
             return f"'{field_prefix}{name}' must be >= {minimum}"
         setattr(params, name, typ(value))
+    # setattr bypasses __post_init__, so re-pin the greedy tuple here.
+    params.talker_top_p, params.talker_top_k = normalize_greedy_sampling(
+        params.talker_temperature, params.talker_top_p, params.talker_top_k)
     return None
 
 
@@ -750,10 +753,13 @@ def _create_app(llm_instance,
 
     @app.get("/health")
     def health():
+        context_cache = getattr(llm_instance, "context_cache_metrics",
+                                lambda: None)()
         return {
             "status": "healthy",
             "model": llm_instance.model_dir,
             "speculative_decoding": llm_instance.has_draft_model,
+            "context_cache": context_cache,
             "batching": {
                 "enabled": batcher is not None,
                 "max_batch_size": batcher.max_batch_size if batcher else 1,

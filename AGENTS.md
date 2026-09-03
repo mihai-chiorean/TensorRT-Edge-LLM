@@ -30,7 +30,7 @@ TensorRT Edge-LLM: NVIDIA C++/CUDA/Python inference runtime for deploying LLMs a
 |------|---------|
 | Build (minimal) | `mkdir -p build && cd build && cmake .. -DTRT_PACKAGE_DIR=$TRT_PACKAGE_DIR && make -j$(nproc)` |
 | Build (with unit tests) | `cmake .. -DTRT_PACKAGE_DIR=$TRT_PACKAGE_DIR -DBUILD_UNIT_TESTS=ON && make -j$(nproc)` |
-| Build (cross-compile AArch64) | `cmake .. -DTRT_PACKAGE_DIR=$TRT_PACKAGE_DIR -DAARCH64_BUILD=ON && make -j$(nproc)` |
+| Build (AArch64 / Jetson) | `cmake .. -DTRT_PACKAGE_DIR=$TRT_PACKAGE_DIR -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake -DEMBEDDED_TARGET=jetson-orin -DCUDA_CTK_VERSION=13.2 && make -j$(nproc)`. `EMBEDDED_TARGET` selects the SM arch: `jetson-orin` (87), `jetson-thor` / `auto-thor` (110), `gb10` (121). The toolchain file sets `AARCH64_BUILD`, `CMAKE_CUDA_ARCHITECTURES` and `CUDA_DIR` — passing those by hand skips the cross-compilers and the arch selection. `CUDA_CTK_VERSION` defaults per target (12.6 for `jetson-orin`), so pass it explicitly on JetPack 7.x. |
 | Build (NVTX profiling) | `cmake .. -DTRT_PACKAGE_DIR=$TRT_PACKAGE_DIR -DENABLE_NVTX_PROFILING=ON && make -j$(nproc)` |
 | Build against TRT-RTX | Same as above, but point `TRT_PACKAGE_DIR` at a TRT-RTX package (`libtensorrt_rtx.so` + `tensorrt_onnxparser_rtx`). `FindTensorRT.cmake` selects the correct lib automatically. |
 | C++ unit tests (all) | `./build/unitTest` |
@@ -100,7 +100,7 @@ The pipeline is: `HuggingFace Model → Python Export (quantize + ONNX) → C++ 
 - **`east-const` style enforced** — `.clang-format` uses `QualifierAlignment: Right`, so write `int const x` not `const int x`.
 - **Integration tests need GPUs + models** — always set `LLM_SDK_DIR`, `ONNX_DIR`, `ENGINE_DIR`, and `LLM_MODELS_DIR`. C++ unit tests don't need models.
 - **CUDA code coverage limitation** — `*.cu` files are excluded from gcov coverage; only `.cpp` files are instrumented.
-- **FMHA kernels are SM-specific** — built per SM arch. When adding new SM support, update `cpp/CMakeLists.txt` FMHA build lists and optionally `cmake/CuteDslFMHA.cmake` for Blackwell+.
+- **SM support lives in `cmake/`, not in `cpp/CMakeLists.txt`** — kernel sources are globbed, so there are no per-SM source lists to edit. Adding an SM arch means four files: `cmake/aarch64_linux_toolchain.cmake` (per-`EMBEDDED_TARGET` `CMAKE_CUDA_ARCHITECTURES` and `CUDA_DIR`), the x86 list in the root `CMakeLists.txt`, `cmake/XQACubins.cmake` (`_all_sm_versions`), and `cmake/CuteDsl.cmake` (artifact-tag inference). A matching CuTe DSL artifact tarball must exist for the new tag; the optimized Blackwell FMHA variant is gated to `sm_100` / `sm_101` / `sm_110` only.
 - **Plugin shared library** — `NvInfer_edgellm_plugin` is shared (not static) because TRT loads plugins dynamically.
 - **One concern per PR** — avoid scope creep. If a PR touches unrelated areas, split it.
 - **HF checkpoint consistency** — Python model classes in `models/` must stay compatible with HuggingFace checkpoint tensor names when adding new models.

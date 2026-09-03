@@ -44,7 +44,7 @@ import sys
 import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Sequence, Union
+from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple, Union
 
 from .tool_calling import (ToolConfig, parse_assistant_output,
                            validate_tool_request)
@@ -79,6 +79,36 @@ def _exporter_model_types():
 # Public data classes
 # ---------------------------------------------------------------------------
 
+#: Temperatures below this select greedy decoding. Mirrors the ``1e-3f``
+#: threshold in ``shouldUseNonGreedySampling`` (cpp/sampler/samplingUtils.cpp)
+#: and in the native ``SamplingParams`` constructor (cpp/sampler/sampling.h),
+#: which silently rewrites topK/topP and logs a warning for every sub-threshold
+#: temperature it is handed with topK != 1 or topP != 1.0.
+GREEDY_TEMPERATURE_EPSILON = 1e-3
+
+#: The (top_p, top_k) tuple the native constructor considers already greedy.
+GREEDY_TOP_P = 1.0
+GREEDY_TOP_K = 1
+
+
+def normalize_greedy_sampling(temperature: float, top_p: float,
+                              top_k: int) -> Tuple[float, int]:
+    """Return ``(top_p, top_k)`` pinned to the greedy tuple when ``temperature``
+    asks for deterministic decoding.
+
+    OpenAI clients spell greedy decoding as ``temperature=0`` alone and leave
+    ``top_p``/``top_k`` at their defaults, so an un-normalized request reaches
+    the native sampler as an inconsistent triple. Resolving it once at ingress
+    keeps the native constructor off its rewrite-and-warn branch no matter how
+    often the request object is re-validated downstream, and lets otherwise
+    identical greedy requests share a micro-batch (top_p/top_k are batch
+    compatibility keys). Negative temperatures are left alone so the native
+    range check still rejects them.
+    """
+    if 0.0 <= temperature < GREEDY_TEMPERATURE_EPSILON:
+        return GREEDY_TOP_P, GREEDY_TOP_K
+    return top_p, top_k
+
 
 @dataclass
 class SamplingParams:
@@ -93,6 +123,10 @@ class SamplingParams:
     num_logprobs: int = 0
     stop: List[str] = field(default_factory=list)
     logit_bias: Dict[int, float] = field(default_factory=dict)
+
+    def __post_init__(self):
+        self.top_p, self.top_k = normalize_greedy_sampling(
+            self.temperature, self.top_p, self.top_k)
 
 
 @dataclass
@@ -162,6 +196,13 @@ class AudioParams:
     max_audio_length: int = 4096
     codec_chunk_frames: int = 10
     talker_prefill_threshold: int = 4
+
+    def __post_init__(self):
+        # The talker/code-predictor path builds a native SamplingParams per
+        # decode step (qwen3OmniTTSRuntime), so an un-normalized greedy request
+        # warns once per step rather than once per request.
+        self.talker_top_p, self.talker_top_k = normalize_greedy_sampling(
+            self.talker_temperature, self.talker_top_p, self.talker_top_k)
 
 
 #: Sample rate of Omni Code2Wav PCM output.
@@ -2022,6 +2063,31 @@ def _convert_messages_to_cpp(rt_module, messages: List[Dict[str, Any]]):
     return cpp_messages
 
 
+def _image_item_source(item: Dict[str, Any]) -> str:
+    """The image reference in either OpenAI spelling (``image`` /
+    ``image_url``)."""
+    source = item.get("image", "")
+    if item.get("type") == "image_url":
+        source = item.get("image_url", "")
+        source = source.get("url", "") if isinstance(source, dict) else source
+    if not isinstance(source, str):
+        raise ValueError("image source must be a string")
+    return source
+
+
+def _image_local_path(source: str) -> str:
+    """Local filesystem path for a non-``data:`` image reference. Remote URLs
+    are a client error: fetching them would make the server an SSRF proxy for
+    anyone who can reach it."""
+    if source.startswith("file:"):
+        from .media_source import resolve_file_url
+        source = resolve_file_url(source)
+    if source.startswith(("http://", "https://")):
+        raise ValueError("remote image URLs are not supported; use a base64 "
+                         "data URL")
+    return source
+
+
 def _load_image_buffers(rt_module,
                         messages: List[Dict[str, Any]],
                         video_family_fn=lambda: "qwen",
@@ -2070,52 +2136,61 @@ def _load_image_buffers(rt_module,
                      or limits["max_image_tokens"] //
                      max(1, limits.get("min_image_tokens", 1)))
     image_upper = 0
+    # Phase 0: decode and bound every data: image once. The bytes feed the
+    # phase-2 buffer load and the header dimensions feed the phase-1 token
+    # reservation, which has no file to probe for an in-memory image. Doing it
+    # before any decode also keeps a declared-huge canvas from reaching
+    # stb_image, which allocates width * height * channels up front.
+    from .image_preflight import preflight_image_data_url
+    decoded_images = {}
+    for idx, item in enumerate(items):
+        if item.get("type") not in ("image", "image_url"):
+            continue
+        source = _image_item_source(item)
+        if source.startswith("data:"):
+            decoded_images[idx] = preflight_image_data_url(source)
     # Phase 1: reserve every image up front so the video sampler's budget is
     # order-independent ([image, video] and [video, image] behave identically).
     if budget is not None:
-        from .video_sampling import estimate_image_tokens
-        for item in items:
-            if item.get("type") != "image":
+        from .video_sampling import (estimate_image_tokens,
+                                     estimate_image_tokens_for_size)
+        for idx, item in enumerate(items):
+            if item.get("type") not in ("image", "image_url"):
                 continue
-            path = item.get("image", "")
-            if path and os.path.isfile(path):
+            do_resize = bool(item.get("do_resize", True))
+            if idx in decoded_images:
+                _, (width, height) = decoded_images[idx]
+                est = estimate_image_tokens_for_size(width,
+                                                     height,
+                                                     family,
+                                                     limits,
+                                                     do_resize=do_resize)
+            else:
+                path = _image_local_path(_image_item_source(item))
+                if not (path and os.path.isfile(path)):
+                    continue
                 est = estimate_image_tokens(path,
                                             family,
                                             limits,
-                                            do_resize=bool(
-                                                item.get("do_resize", True)))
-                image_upper += est
-                budget -= est
-                if cu_budget is not None:
-                    # One cu_seqlens entry per image (Qwen families only;
-                    # InternVL has no cu_seqlens binding).
-                    cu_budget -= 1
+                                            do_resize=do_resize)
+            image_upper += est
+            budget -= est
+            if cu_budget is not None:
+                # One cu_seqlens entry per image (Qwen families only;
+                # InternVL has no cu_seqlens binding).
+                cu_budget -= 1
     # Phase 2: build the buffers in original message order (the C++ runner
     # matches them positionally against the placeholders).
-    for item in items:
+    for idx, item in enumerate(items):
         itype = item.get("type")
         if itype in ("image", "image_url"):
-            source = item.get("image", "")
-            if itype == "image_url":
-                source = item.get("image_url", "")
-                source = source.get("url", "") if isinstance(source,
-                                                             dict) else source
-            if not isinstance(source, str):
-                raise ValueError("image source must be a string")
-            if source.startswith("data:"):
-                from .media_source import decode_base64_data_url
-                image = rt_module.load_image_from_bytes(
-                    decode_base64_data_url(source, "image", strict=True))
+            if idx in decoded_images:
+                payload, _ = decoded_images[idx]
+                image = rt_module.load_image_from_bytes(payload)
             else:
-                if source.startswith("file:"):
-                    from .media_source import resolve_file_url
-                    source = resolve_file_url(source)
-                if source.startswith(("http://", "https://")):
-                    raise ValueError(
-                        "remote image URLs are not supported; use a base64 "
-                        "data URL")
-                image = (rt_module.load_image_from_path(source)
-                         if source and os.path.isfile(source) else None)
+                path = _image_local_path(_image_item_source(item))
+                image = (rt_module.load_image_from_path(path)
+                         if path and os.path.isfile(path) else None)
             if image is not None:
                 image.do_resize = bool(item.get("do_resize", True))
                 images.append(image)

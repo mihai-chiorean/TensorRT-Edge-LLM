@@ -315,6 +315,32 @@ tests:
   - tests/python-unittests/test_server_requests.py::test_local_media_frames_rejected_when_unset
   - tests/python-unittests/test_server_requests.py::test_integer_params_reject_floats
   - tests/python-unittests/test_server_requests.py::test_include_usage_rejects_non_bool
+  - tests/python-unittests/test_server_requests.py::test_greedy_temperature_pins_top_p_and_top_k
+  - tests/python-unittests/test_server_requests.py::test_sampling_temperature_leaves_top_p_and_top_k_alone
+  - tests/python-unittests/test_server_requests.py::test_negative_temperature_is_left_for_the_native_range_check
+  - tests/python-unittests/test_server_requests.py::test_sampling_params_normalizes_bare_temperature_zero
+  - tests/python-unittests/test_server_requests.py::test_greedy_requests_share_one_batch_key
+  - tests/python-unittests/test_server_requests.py::test_audio_params_normalizes_greedy_talker_temperature
+  - tests/python-unittests/test_server_requests.py::test_talker_knobs_renormalize_after_setattr
+  - tests/python-unittests/test_server_requests.py::test_chat_temperature_zero_reaches_the_runtime_as_greedy
+  - tests/python-unittests/test_server_requests.py::test_openai_image_url_data_is_converted_and_loaded_from_memory
+  - tests/python-unittests/test_server_requests.py::test_openai_image_url_rejects_remote_fetches
+  - tests/python-unittests/test_server_requests.py::test_openai_image_url_rejects_non_string_source
+  - tests/python-unittests/test_server_requests.py::test_preflight_probes_every_supported_container
+  - tests/python-unittests/test_server_requests.py::test_preflight_rejects_oversized_dimension_without_decoding
+  - tests/python-unittests/test_server_requests.py::test_preflight_does_not_wrap_unsigned_bmp_core_dimensions
+  - tests/python-unittests/test_server_requests.py::test_preflight_rejects_malformed_dimension_headers
+  - tests/python-unittests/test_server_requests.py::test_preflight_rejects_oversized_pixel_area
+  - tests/python-unittests/test_server_requests.py::test_preflight_accepts_dimensions_on_the_limit
+  - tests/python-unittests/test_server_requests.py::test_preflight_rejects_oversized_payload
+  - tests/python-unittests/test_server_requests.py::test_preflight_rejects_unmeasurable_formats
+  - tests/python-unittests/test_server_requests.py::test_preflight_rejects_truncated_headers
+  - tests/python-unittests/test_server_requests.py::test_preflight_rejects_empty_canvas
+  - tests/python-unittests/test_server_requests.py::test_preflight_errors_never_echo_the_payload
+  - tests/python-unittests/test_server_requests.py::test_data_url_image_still_loads_from_memory_after_preflight
+  - tests/python-unittests/test_server_requests.py::test_data_url_image_is_charged_to_the_visual_token_budget
+  - tests/python-unittests/test_server_requests.py::test_health_exposes_context_cache_metrics
+  - tests/python-unittests/test_server_requests.py::test_health_allows_runtimes_without_context_cache_metrics
   - tests/python-unittests/test_experimental_server_engine_dir_routing.py::test_detect_engine_type
   - tests/python-unittests/test_experimental_server_engine_dir_routing.py::test_validate_spec_decode_engine_dir_requires_both
   - tests/python-unittests/test_experimental_server_engine_dir_routing.py::test_find_multimodal_engine_dir

@@ -24,6 +24,7 @@ import asyncio
 import base64
 import json
 import os
+import struct
 import tempfile
 import time
 import types
@@ -106,7 +107,10 @@ def _engine():
 
 def test_openai_image_url_data_is_converted_and_loaded_from_memory():
     eng = _engine()
-    encoded = base64.b64encode(b"jpeg bytes").decode("ascii")
+    # A measurable container: the data: preflight reads the dimensions out of
+    # the header before the bytes reach the decoder.
+    payload = _jpeg_bytes(320, 240)
+    encoded = base64.b64encode(payload).decode("ascii")
     messages = [{
         "role":
         "user",
@@ -126,7 +130,7 @@ def test_openai_image_url_data_is_converted_and_loaded_from_memory():
             for content in cpp_messages[0].contents] == ["image", "text"]
 
     buffers = eng._load_image_buffers(_StubRt(), messages)
-    assert buffers == [("image_bytes", b"jpeg bytes")]
+    assert buffers == [("image_bytes", payload)]
 
 
 def test_openai_image_url_rejects_remote_fetches():
@@ -161,6 +165,239 @@ def test_openai_image_url_rejects_non_string_source():
 
     with pytest.raises(ValueError, match="image source must be a string"):
         eng._load_image_buffers(_StubRt(), messages)
+
+
+# ---------------------------------------------------------------------------
+# Issue #191: data: image preflight (dimension / size / format bounds)
+# ---------------------------------------------------------------------------
+
+
+def _png_bytes(width, height):
+    return (b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" +
+            struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+
+
+def _jpeg_bytes(width, height):
+    """SOI + a skipped APP0 + SOF0 carrying the dimensions + SOS."""
+    app0 = b"\xff\xe0" + struct.pack(">H", 4) + b"\x00\x00"
+    sof0 = (b"\xff\xc0" + struct.pack(">H", 11) + b"\x08" +
+            struct.pack(">HH", height, width) + b"\x01\x01\x11\x00")
+    return b"\xff\xd8" + app0 + sof0 + b"\xff\xda"
+
+
+def _gif_bytes(width, height):
+    return b"GIF89a" + struct.pack("<HH", width, height) + b"\x00\x00\x00"
+
+
+def _bmp_bytes(width, height):
+    # Negative height marks a top-down bitmap; the probe takes the magnitude.
+    return (b"BM" + b"\x00" * 12 + struct.pack("<I", 40) +
+            struct.pack("<ii", width, -height) + b"\x00" * 4)
+
+
+def _bmp_core_bytes(width, height):
+    return (b"BM" + b"\x00" * 12 + struct.pack("<I", 12) +
+            struct.pack("<HH", width, height) + b"\x00" * 4)
+
+
+def _image_data_url(payload, media_type="image/png"):
+    encoded = base64.b64encode(payload).decode("ascii")
+    return f"data:{media_type};base64,{encoded}"
+
+
+def _image_messages(url):
+    return [{
+        "role": "user",
+        "content": [{
+            "type": "image_url",
+            "image_url": {
+                "url": url
+            },
+        }],
+    }]
+
+
+def _preflight():
+    from experimental.server import image_preflight
+    return image_preflight
+
+
+@pytest.mark.parametrize("payload_fn,media_type", [
+    (_png_bytes, "image/png"),
+    (_jpeg_bytes, "image/jpeg"),
+    (_gif_bytes, "image/gif"),
+    (_bmp_bytes, "image/bmp"),
+])
+def test_preflight_probes_every_supported_container(payload_fn, media_type):
+    pf = _preflight()
+    data, size = pf.preflight_image_data_url(
+        _image_data_url(payload_fn(640, 480), media_type))
+    assert size == (640, 480)
+    assert data == payload_fn(640, 480)
+
+
+def test_preflight_rejects_oversized_dimension_without_decoding():
+    """A ~50-byte PNG declaring a 60000x60000 canvas must never reach
+    stb_image, which would allocate ~10 GB for it."""
+    pf = _preflight()
+    bomb = _png_bytes(60000, 60000)
+    assert len(bomb) < 100
+    with pytest.raises(ValueError, match="per side"):
+        pf.preflight_image_data_url(_image_data_url(bomb))
+
+
+def test_preflight_does_not_wrap_unsigned_bmp_core_dimensions():
+    pf = _preflight()
+    with pytest.raises(ValueError, match="per side"):
+        pf.preflight_image_data_url(
+            _image_data_url(_bmp_core_bytes(65535, 1), "image/bmp"))
+
+
+@pytest.mark.parametrize("payload", [
+    b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 12) + b"IHDR" +
+    struct.pack(">II", 1, 1),
+    b"\xff\xd8\xff\xc0\x00\x02" + b"\x00" * 8,
+])
+def test_preflight_rejects_malformed_dimension_headers(payload):
+    pf = _preflight()
+    with pytest.raises(ValueError, match="malformed"):
+        pf.preflight_image_data_url(_image_data_url(payload))
+
+
+def test_preflight_rejects_oversized_pixel_area():
+    pf = _preflight()
+    # Both sides under MAX_IMAGE_DIMENSION, product over MAX_IMAGE_PIXELS.
+    side = pf.MAX_IMAGE_DIMENSION
+    assert side * side > pf.MAX_IMAGE_PIXELS
+    with pytest.raises(ValueError, match="decoded pixels"):
+        pf.preflight_image_data_url(_image_data_url(_png_bytes(side, side)))
+
+
+def test_preflight_accepts_dimensions_on_the_limit():
+    pf = _preflight()
+    side = pf.MAX_IMAGE_DIMENSION
+    height = pf.MAX_IMAGE_PIXELS // side
+    _, size = pf.preflight_image_data_url(
+        _image_data_url(_png_bytes(side, height)))
+    assert size == (side, height)
+
+
+def test_preflight_rejects_oversized_payload():
+    pf = _preflight()
+    # The encoded-length pre-check trips before any base64 decode allocation.
+    oversized = "A" * (-(-pf.MAX_IMAGE_SOURCE_BYTES // 3) * 4 + 4)
+    with pytest.raises(ValueError, match="exceeds the supported maximum"):
+        pf.preflight_image_data_url(f"data:image/png;base64,{oversized}")
+
+
+@pytest.mark.parametrize("payload", [
+    b"RIFF\x00\x00\x00\x00WEBPVP8 ",
+    b"\x00\x01\x02\x03",
+    b"P6\n60000 60000\n255\n",
+])
+def test_preflight_rejects_unmeasurable_formats(payload):
+    """Anything the probe cannot measure is refused rather than passed to the
+    decoder unbounded -- a PNM header in particular is a one-line bomb."""
+    pf = _preflight()
+    with pytest.raises(ValueError, match="unsupported image format"):
+        pf.preflight_image_data_url(_image_data_url(payload))
+
+
+@pytest.mark.parametrize("payload", [
+    b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHD",
+    b"GIF89a\x10",
+    b"BM" + b"\x00" * 8,
+    b"\xff\xd8\xff\xc0\x00\x0b",
+])
+def test_preflight_rejects_truncated_headers(payload):
+    pf = _preflight()
+    with pytest.raises(ValueError):
+        pf.preflight_image_data_url(_image_data_url(payload))
+
+
+def test_preflight_rejects_empty_canvas():
+    pf = _preflight()
+    with pytest.raises(ValueError, match="empty canvas"):
+        pf.preflight_image_data_url(_image_data_url(_png_bytes(0, 32)))
+
+
+def test_preflight_errors_never_echo_the_payload():
+    """Error text reaches the client verbatim in a 400 body, so it must carry
+    only measured integers -- no media type, no slice of the base64."""
+    pf = _preflight()
+    secret = "SECRETMARKER"
+    urls = [
+        _image_data_url(_png_bytes(60000, 60000), f"image/{secret}"),
+        f"data:image/{secret};base64," + "A" * 40 + secret,
+        _image_data_url(b"\x00\x01" + secret.encode(), f"image/{secret}"),
+    ]
+    for url in urls:
+        with pytest.raises(ValueError) as excinfo:
+            pf.preflight_image_data_url(url)
+        assert secret not in str(excinfo.value)
+
+
+def test_data_url_image_still_loads_from_memory_after_preflight():
+    eng = _engine()
+    payload = _png_bytes(64, 48)
+    buffers = eng._load_image_buffers(
+        _StubRt(), _image_messages(_image_data_url(payload)))
+    assert buffers == [("image_bytes", payload)]
+
+
+def test_data_url_image_is_charged_to_the_visual_token_budget(monkeypatch):
+    """A data: image used to be invisible to the phase-1 reservation, so a
+    video in the same request could claim the whole engine budget."""
+    eng = _engine()
+    import experimental.server.video_sampling as vs_mod
+
+    limits = {
+        "model_type": "qwen2_5_vl",
+        "min_image_tokens": 4,
+        "max_image_tokens": 4096,
+        "max_image_tokens_per_image": 4096,
+        "patch_size": 14,
+        "merge_size": 2,
+        "temporal_patch_size": 2,
+    }
+    image_est = vs_mod.estimate_image_tokens_for_size(640, 480, "qwen", limits)
+    assert image_est > 0
+
+    seen = []
+
+    def fake_load_video_buffer(rt,
+                               item,
+                               family,
+                               frame_limits=None,
+                               budget=None,
+                               pixel_budget=None,
+                               cu_budget=None):
+        seen.append(budget)
+        return ("video", 0), 0, 0, 1
+
+    monkeypatch.setattr(vs_mod, "load_video_buffer", fake_load_video_buffer)
+
+    messages = [{
+        "role":
+        "user",
+        "content": [
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": _image_data_url(_png_bytes(640, 480))
+                },
+            },
+            {
+                "type": "video",
+                "video": "/nonexistent.mp4"
+            },
+        ],
+    }]
+    eng._load_image_buffers(_StubRt(),
+                            messages,
+                            video_family_fn=lambda: "qwen",
+                            video_frame_limits_fn=lambda: limits)
+    assert seen == [limits["max_image_tokens"] - image_est]
 
 
 def test_chat_response_strips_model_terminal_token(tmp_path):
@@ -214,6 +451,7 @@ def _make_stub_llm():
         def __init__(self):
             self._runtime = _RT()
             self.captured = None
+            self.captured_params = None
             self.captured_tool_config = None
             # Advertise ASR capability (the endpoint probes for an audio/
             # engine subdir with an ASR-typed config).
@@ -244,6 +482,7 @@ def _make_stub_llm():
                                      tool_choice=None,
                                      tool_config=None):
             self.captured = messages
+            self.captured_params = params
             self.captured_tool_config = tool_config
             req = types.SimpleNamespace(
                 audio_buffers=list(self._audio_buffers))
@@ -277,25 +516,60 @@ def client_and_llm():
     return TestClient(_create_app(llm, allowed_local_media_path="/")), llm
 
 
+def test_health_exposes_context_cache_metrics(client_and_llm):
+    client, llm = client_and_llm
+    expected = {
+        "hit_sequences": 3,
+        "reused_tokens": 768,
+        "media_aware_sequences": 4,
+    }
+    llm.context_cache_metrics = lambda: expected
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["context_cache"] == expected
+
+
+def test_health_allows_runtimes_without_context_cache_metrics(client_and_llm):
+    client, _ = client_and_llm
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["context_cache"] is None
+
+
 def test_streaming_forced_tool_preserves_exact_choice(client_and_llm):
     client, llm = client_and_llm
     response = client.post(
         "/v1/chat/completions",
         json={
-            "model": "test",
-            "messages": [{"role": "user", "content": "set volume"}],
-            "max_tokens": 16,
-            "stream": True,
+            "model":
+            "test",
+            "messages": [{
+                "role": "user",
+                "content": "set volume"
+            }],
+            "max_tokens":
+            16,
+            "stream":
+            True,
             "tools": [{
                 "type": "function",
                 "function": {
                     "name": "set_volume",
-                    "parameters": {"type": "object", "properties": {}},
+                    "parameters": {
+                        "type": "object",
+                        "properties": {}
+                    },
                 },
             }],
             "tool_choice": {
                 "type": "function",
-                "function": {"name": "set_volume"},
+                "function": {
+                    "name": "set_volume"
+                },
             },
         },
     )
@@ -1783,6 +2057,89 @@ def test_sampling_params_defaults():
     from experimental.server.api_server import parse_sampling_params
     out = parse_sampling_params({}, default_max_tokens=16)
     assert out["max_tokens"] == 16 and out["top_k"] == 50
+
+
+# ---------------------------------------------------------------------------
+# Issue #180: temperature=0 normalized to the greedy tuple at ingress
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("temperature", [0.0, 0, 1e-9, 9.99e-4])
+def test_greedy_temperature_pins_top_p_and_top_k(temperature):
+    from experimental.server.engine import normalize_greedy_sampling
+    assert normalize_greedy_sampling(temperature, 0.9, 50) == (1.0, 1)
+
+
+@pytest.mark.parametrize("temperature", [1e-3, 0.7, 1.0, 2.0])
+def test_sampling_temperature_leaves_top_p_and_top_k_alone(temperature):
+    from experimental.server.engine import normalize_greedy_sampling
+    assert normalize_greedy_sampling(temperature, 0.9, 50) == (0.9, 50)
+
+
+def test_negative_temperature_is_left_for_the_native_range_check():
+    from experimental.server.engine import normalize_greedy_sampling
+    assert normalize_greedy_sampling(-1.0, 0.9, 50) == (0.9, 50)
+
+
+def test_sampling_params_normalizes_bare_temperature_zero():
+    """The native SamplingParams constructor rewrites topK/topP and logs a
+    warning for every sub-threshold temperature it is handed with topK != 1;
+    normalizing here keeps it off that branch however often the request is
+    re-validated."""
+    from experimental.server.engine import SamplingParams
+    params = SamplingParams(temperature=0.0)
+    assert (params.top_p, params.top_k) == (1.0, 1)
+    assert params.temperature == 0.0
+
+
+def test_greedy_requests_share_one_batch_key():
+    """top_p/top_k are batch-compatibility fields: an un-normalized
+    temperature=0 request could not batch with an explicitly greedy one."""
+    from experimental.server.batching import BATCH_COMPATIBILITY_FIELDS
+    from experimental.server.engine import SamplingParams
+
+    bare = SamplingParams(temperature=0.0)
+    explicit = SamplingParams(temperature=0.0, top_p=1.0, top_k=1)
+    assert (bare.top_p, bare.top_k) == (explicit.top_p, explicit.top_k)
+    for field in ("temperature", "top_p", "top_k"):
+        assert field in BATCH_COMPATIBILITY_FIELDS
+
+
+def test_audio_params_normalizes_greedy_talker_temperature():
+    """The talker path builds a native SamplingParams per decode step, so an
+    un-normalized greedy request warns once per step."""
+    from experimental.server.engine import AudioParams
+    params = AudioParams(talker_temperature=0.0)
+    assert (params.talker_top_p, params.talker_top_k) == (1.0, 1)
+
+
+def test_talker_knobs_renormalize_after_setattr():
+    from experimental.server.api_server import _apply_talker_knobs
+    from experimental.server.engine import AudioParams
+
+    params = AudioParams()
+    assert _apply_talker_knobs({"talker_temperature": 0}, params, "") is None
+    assert (params.talker_top_p, params.talker_top_k) == (1.0, 1)
+
+
+def test_chat_temperature_zero_reaches_the_runtime_as_greedy(client_and_llm):
+    client, llm = client_and_llm
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test",
+            "messages": [{
+                "role": "user",
+                "content": "hi"
+            }],
+            "max_tokens": 8,
+            "temperature": 0,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert llm.captured_params.temperature == 0.0
+    assert llm.captured_params.top_p == 1.0
+    assert llm.captured_params.top_k == 1
 
 
 def test_usage_uses_runtime_prompt_token_counts():

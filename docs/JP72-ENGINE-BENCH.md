@@ -81,10 +81,17 @@ early is supported.
 
 ## 4. No prefix cache — the single most important finding
 
-`ContextCacheConfig::enabled` defaults to `false` and `experimental/server/`
-never constructs one, so **every request full-prefills**. Confirmed
-empirically: the *same* ~5.4k-token prompt sent three times gave TTFT
-**5.722 / 5.678 / 5.695 s** — no reuse whatsoever.
+> **Superseded.** This section describes the tree as of this document's commit.
+> `experimental/server/` now builds a `ContextCacheConfig` and enables it by
+> default (`EDGELLM_CONTEXT_CACHE`, `--context-cache` / `--no-context-cache`).
+> Every number in §5, §8 and §9 was measured without it and has not been
+> re-measured. Treat them as the cache-disabled baseline, reproducible with
+> `EDGELLM_CONTEXT_CACHE=0`.
+
+At the time of measurement, `ContextCacheConfig::enabled` defaulted to `false`
+and `experimental/server/` never constructed one, so **every request
+full-prefilled**. Confirmed empirically: the *same* ~5.4k-token prompt sent
+three times gave TTFT **5.722 / 5.678 / 5.695 s** — no reuse whatsoever.
 
 llama.cpp, by contrast, serves the ~890-token system prompt from its prefix
 cache: in the baseline's `short` scenario it evaluated only **12 of 905**
@@ -194,14 +201,17 @@ tail while the turn starts ~0.8 s later, and TTS begins at the *first clause*,
 so the front of the turn is what matters.
 
 The gap is not a TensorRT kernel deficiency — TRT prefills ~1.45x faster than
-llama.cpp. It is the absence of prompt-prefix reuse. The C++ runtime already
-ships a `contextCache` with a `ReusePlan`; nothing in the experimental Python
-server turns it on. **Wiring `ContextCacheConfig{enabled=true}` through
-`experimental/server/engine.py` is the one change that would decide this
-comparison**, and it would plausibly flip every row: TRT would keep its +28 %
-generation and its faster prefill while paying the system prompt only once.
-That is the experiment to run next, and it should be run before any swap
-decision.
+llama.cpp. It is the absence of prompt-prefix reuse. **Wiring
+`ContextCacheConfig{enabled=true}` through `experimental/server/engine.py` is
+the one change that would decide this comparison**, and it would plausibly flip
+every row: TRT would keep its +28 % generation and its faster prefill while
+paying the system prompt only once.
+
+That wiring has since landed and is on by default, so the verdict above rests
+on a configuration the server no longer runs. The table stands only as the
+cache-disabled baseline; **re-run §5 and §8 with the cache enabled before any
+swap decision.** The `short` TTFT row (bar 1) is the one to watch: it is the
+row the cache is expected to move. Bar 5 (peak memory) is independent of it.
 
 Secondary follow-ups: the streaming `prompt_tokens: 0` bug (§7), and the
 1.5 GB memory overage, which is dominated by a fully preallocated 16,384-token
