@@ -42,6 +42,7 @@ import math
 import os
 import sys
 import threading
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple, Union
@@ -470,7 +471,7 @@ _DEFAULT_CONTEXT_CACHE_MAX_RECORDS = 1024
 
 
 def _env_flag(name: str, default: bool) -> bool:
-    """Read a boolean environment override; unset or unparseable keeps `default`."""
+    """Read a boolean environment override; unset or unparsable keeps `default`."""
     raw = os.environ.get(name)
     if raw is None:
         return default
@@ -479,7 +480,7 @@ def _env_flag(name: str, default: bool) -> bool:
         return True
     if value in ("0", "false", "no", "off"):
         return False
-    logger.warning("Ignoring unparseable %s=%r; using default %s", name, raw,
+    logger.warning("Ignoring unparsable %s=%r; using default %s", name, raw,
                    default)
     return default
 
@@ -1238,6 +1239,42 @@ class LLM:
             self._tool_template_formatter = ToolChatTemplateFormatter(
                 self._tool_template_dirs())
         return self._tool_template_formatter
+
+    def warm_tool_template(self) -> bool:
+        """Load the tool chat template before serving.
+
+        The formatter imports transformers and loads the tokenizer or
+        processor lazily; on a Jetson that first use costs several seconds,
+        which otherwise lands on the first tool request after a restart
+        instead of on startup. A model without a tool template is not an
+        error here; the request path reports that per request.
+        """
+        started = time.perf_counter()
+        try:
+            self._get_tool_template_formatter().format(
+                [{
+                    "role": "user",
+                    "content": "warm-up"
+                }],
+                tools=[{
+                    "type": "function",
+                    "function": {
+                        "name": "warm_up",
+                        "description": "Warm-up probe.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {},
+                        },
+                    },
+                }],
+                tool_choice="auto",
+            )
+        except Exception as exc:
+            logger.info("Tool chat template not warmed: %s", exc)
+            return False
+        logger.info("Tool chat template ready in %.1f s",
+                    time.perf_counter() - started)
+        return True
 
     def _tool_choice_for_template(
             self, tool_config: ToolConfig) -> Union[str, Dict[str, Any]]:

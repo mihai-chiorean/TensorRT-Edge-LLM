@@ -436,11 +436,13 @@ def test_gemma4_stream_parser_bare_call_holds_and_drops_trailing_prose(
     per_delta = _feed_all(
         parser,
         ["ca", "ll:set_volume{per", "cent:75}", "I have changed the volume."])
-    assert per_delta[:4] == [[], [], [], []]
-    assert [e["type"] for e in per_delta[4]] == ["tool_call"]
-    assert json.loads(per_delta[4][0]["tool_call"].arguments) == {
+    # The call is final as soon as its object closes; later prose is dropped.
+    assert per_delta[0] == [] and per_delta[1] == []
+    assert [e["type"] for e in per_delta[2]] == ["tool_call"]
+    assert json.loads(per_delta[2][0]["tool_call"].arguments) == {
         "percent": 75
     }
+    assert per_delta[3] == [] and per_delta[4] == []
 
 
 def test_gemma4_stream_parser_start_holdback_only_for_call_prefix(tmp_path):
@@ -488,7 +490,8 @@ def test_gemma4_stream_parser_strips_tokens(tmp_path):
                                 str(tmp_path),
                                 strip_tokens=("<|im_end|>", ))
     per_delta = _feed_all(parser, ["call:set_volume{percent:5}<|im_end|>"])
-    assert [e["type"] for e in per_delta[1]] == ["tool_call"]
+    assert [e["type"] for e in per_delta[0]] == ["tool_call"]
+    assert per_delta[1] == []
 
 
 def test_gemma4_stream_parser_matches_whole_output_parser(tmp_path):
@@ -619,3 +622,103 @@ def test_thinking_state_machine_holds_only_partial_tags():
     assert list(sm.feed("ink>plan</th")) == [("reasoning", "plan")]
     assert list(sm.feed("ink>done")) == [("content", "done")]
     assert list(sm.flush()) == []
+
+
+def test_validate_tool_request_parallel_tool_calls():
+    config = validate_tool_request([{
+        "role": "user",
+        "content": "Weather?"
+    }], _tools(), "auto")
+    assert config.parallel_tool_calls is True
+    config = validate_tool_request([{
+        "role": "user",
+        "content": "Weather?"
+    }],
+                                   _tools(),
+                                   "auto",
+                                   parallel_tool_calls=False)
+    assert config.parallel_tool_calls is False
+    with pytest.raises(ValueError, match="parallel_tool_calls"):
+        validate_tool_request([{
+            "role": "user",
+            "content": "Weather?"
+        }],
+                              _tools(),
+                              "auto",
+                              parallel_tool_calls="no")
+
+
+class _FakeClosingGemmaLLM(_FakeGemmaLLM):
+    """Records how many deltas were consumed and whether the consumer closed
+    the generator before exhausting it."""
+
+    def __init__(self, model_dir, pieces):
+        super().__init__(model_dir, pieces)
+        self.consumed = 0
+        self.closed_early = False
+
+    def generate_stream(self, messages, params, **kw):
+        try:
+            for piece in self._pieces[:-1]:
+                self.consumed += 1
+                yield StreamDelta(text=piece, token_ids=[1], finished=False)
+            self.consumed += 1
+            yield StreamDelta(text=self._pieces[-1],
+                              token_ids=[1],
+                              finished=True,
+                              finish_reason="stop")
+        except GeneratorExit:
+            self.closed_early = True
+            raise
+
+
+def test_tool_stream_sse_stops_after_first_call_without_parallel_calls(
+        tmp_path):
+    pieces = ["call:set_", "volume{percent:75}", " I have", " set it.", "!"]
+    config = _gemma_config(tmp_path, "required")
+    config.parallel_tool_calls = False
+    llm = _FakeClosingGemmaLLM(tmp_path, pieces)
+    choices = _stream_payloads(llm, config)
+    assert llm.consumed == 2 and llm.closed_early
+    deltas = [c["delta"] for c in choices]
+    assert not any("content" in d for d in deltas)
+    assert sum("tool_calls" in d for d in deltas) == 2
+    assert choices[-1]["finish_reason"] == "tool_calls"
+
+    llm = _FakeClosingGemmaLLM(tmp_path, pieces)
+    config.parallel_tool_calls = True
+    choices = _stream_payloads(llm, config)
+    assert llm.consumed == len(pieces) and not llm.closed_early
+    assert choices[-1]["finish_reason"] == "tool_calls"
+
+
+def test_warm_tool_template_reports_outcome():
+    from experimental.server.engine import LLM
+
+    class _Formatter:
+
+        def __init__(self):
+            self.calls = []
+
+        def format(self, messages, **kw):
+            self.calls.append((messages, kw))
+            return "prompt"
+
+    class _Stub:
+        _formatter = _Formatter()
+
+        def _get_tool_template_formatter(self):
+            return self._formatter
+
+    stub = _Stub()
+    assert LLM.warm_tool_template(stub) is True
+    (messages, kw), = stub._formatter.calls
+    assert messages[0]["role"] == "user"
+    assert kw["tools"][0]["function"]["name"] == "warm_up"
+
+    class _Broken:
+
+        def _get_tool_template_formatter(self):
+            raise RuntimeError("no template")
+
+    assert LLM.warm_tool_template(_Broken()) is False

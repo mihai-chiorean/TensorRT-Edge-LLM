@@ -32,6 +32,9 @@ class ToolConfig:
     tools: List[Dict[str, Any]] = field(default_factory=list)
     tool_choice: str = "none"
     forced_name: Optional[str] = None
+    #: OpenAI ``parallel_tool_calls``. When false the turn is complete once
+    #: the first tool call closes, so streaming may stop generation there.
+    parallel_tool_calls: bool = True
 
     @property
     def parse_output(self) -> bool:
@@ -88,8 +91,13 @@ def validate_tool_request(
     messages: Sequence[Dict[str, Any]],
     tools: Optional[Sequence[Dict[str, Any]]] = None,
     tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+    parallel_tool_calls: Optional[bool] = None,
 ) -> ToolConfig:
     """Validate OpenAI-style tool fields and message links."""
+    if parallel_tool_calls is None:
+        parallel_tool_calls = True
+    elif not isinstance(parallel_tool_calls, bool):
+        raise ValueError("'parallel_tool_calls' must be a boolean")
     if tools is None:
         tool_list: List[Dict[str, Any]] = []
     elif isinstance(tools, list):
@@ -102,7 +110,8 @@ def validate_tool_request(
     _validate_tool_messages(messages)
     return ToolConfig(tools=tool_list,
                       tool_choice=choice,
-                      forced_name=forced_name)
+                      forced_name=forced_name,
+                      parallel_tool_calls=parallel_tool_calls)
 
 
 def parse_assistant_output(text: str, tool_config: ToolConfig,
@@ -438,9 +447,12 @@ class _Gemma4ToolStreamParser(ToolStreamParser):
     streams up to the opener, the block is buffered to its closer and parsed
     like the whole-output path (a malformed block is content, verbatim). The
     bare form (``call:NAME{...}``) is only recognised at the very start, so
-    nothing is released until the first non-blank text rules it out; once it
-    is seen the rest of the output is buffered and handed to the whole-output
-    parser at ``finish`` so its trailing-prose rule applies unchanged.
+    nothing is released until the first non-blank text rules it out. Once it
+    is seen the output is buffered until the call's object closes, at which
+    point the call is emitted and everything after it is dropped (the
+    whole-output parser's trailing-prose rule, applied as soon as the
+    boundary is known so the caller can stop generation). A bare prefix that
+    never closes is handed to the whole-output parser at ``finish``.
     """
 
     def __init__(self, parser, tool_config: ToolConfig,
@@ -456,12 +468,15 @@ class _Gemma4ToolStreamParser(ToolStreamParser):
         self._at_start = True
         self._in_block = False
         self._bare = False
+        self._done = False
 
     def feed(self, text: str) -> List[Dict[str, Any]]:
+        if self._done:
+            return []
         self._buf += text
         events: List[Dict[str, Any]] = []
         if self._bare:
-            return events
+            return self._bare_progress()
         while self._buf:
             if self._in_block:
                 idx = self._buf.find(self._closer, len(self._opener))
@@ -476,6 +491,7 @@ class _Gemma4ToolStreamParser(ToolStreamParser):
                 head = self._buf.lstrip()
                 if head.startswith(self._bare_prefix):
                     self._bare = True
+                    events.extend(self._bare_progress())
                     break
                 if self._bare_prefix.startswith(head):
                     break
@@ -499,6 +515,8 @@ class _Gemma4ToolStreamParser(ToolStreamParser):
 
     def finish(self) -> List[Dict[str, Any]]:
         buf, self._buf = self._buf, ""
+        if self._done:
+            return []
         text = _strip_tokens(buf, self._strip_tokens)
         if self._bare or self._at_start:
             events, _ = self._parser.parse(text, self._tool_config)
@@ -506,6 +524,15 @@ class _Gemma4ToolStreamParser(ToolStreamParser):
         # An unterminated block or a held marker prefix is content, which is
         # what the whole-output parser reports for it too.
         return [_content_event(text)] if text else []
+
+    def _bare_progress(self) -> List[Dict[str, Any]]:
+        call = _parse_gemma4_call_prefix(
+            _strip_tokens(self._buf, self._strip_tokens), self._tool_config)
+        if call is None:
+            return []
+        self._done = True
+        self._buf = ""
+        return [{"type": "tool_call", "tool_call": call}]
 
     def _earliest_marker(self) -> Tuple[int, Optional[str]]:
         best_idx, best = -1, None

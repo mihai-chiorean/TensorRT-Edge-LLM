@@ -997,6 +997,7 @@ def _create_app(llm_instance,
         max_tokens = sampling["max_tokens"]
         tools = body.get("tools")
         tool_choice = body.get("tool_choice")
+        parallel_tool_calls = body.get("parallel_tool_calls")
         try:
             logit_bias = _normalize_logit_bias(body.get("logit_bias"))
             _validate_logit_bias_spec_decode(
@@ -1034,7 +1035,11 @@ def _create_app(llm_instance,
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
         try:
-            tool_config = validate_tool_request(messages, tools, tool_choice)
+            tool_config = validate_tool_request(
+                messages,
+                tools,
+                tool_choice,
+                parallel_tool_calls=parallel_tool_calls)
         except ValueError as exc:
             return JSONResponse(
                 status_code=400,
@@ -1818,7 +1823,12 @@ def _generate_tool_stream_sse(llm_instance,
     """Tool-mode streaming: content is released as it is produced and only
     the span that may still become a tool call is held back; tool calls are
     emitted as they close. ``<think>`` spans are split regardless of the
-    request's thinking flag, as the whole-output tool parser does."""
+    request's thinking flag, as the whole-output tool parser does.
+
+    With ``parallel_tool_calls`` false the turn ends at the first completed
+    call: the delta generator is closed, which cancels the runtime's stream
+    channel, so the model does not keep decoding prose that would be dropped
+    anyway."""
     model_name = llm_instance._model_id
     created = int(time.time())
 
@@ -1874,23 +1884,27 @@ def _generate_tool_stream_sse(llm_instance,
                 })
             tool_index += 1
 
+    deltas = llm_instance.generate_stream(messages,
+                                          params,
+                                          prebuilt_request=prebuilt_request,
+                                          admission_handoff=handoff,
+                                          tools=tool_config.tools,
+                                          tool_choice=tool_config.tool_choice)
     try:
-        for delta in llm_instance.generate_stream(
-                messages,
-                params,
-                prebuilt_request=prebuilt_request,
-                admission_handoff=handoff,
-                tools=tool_config.tools,
-                tool_choice=tool_config.tool_choice):
+        for delta in deltas:
             completion_tokens += len(delta.token_ids or [])
             if delta.text:
                 yield from emit_events(stream_parser.feed(delta.text))
             if delta.finished:
                 finish_reason = delta.finish_reason or "stop"
+            if tool_index and not tool_config.parallel_tool_calls:
+                break
     except Exception as exc:
         logger.exception("Streaming inference failed")
         finish_reason = "error"
         error_message = str(exc)
+    finally:
+        deltas.close()
 
     yield from emit_events(stream_parser.finish())
     for field, text in sm.flush():
@@ -2352,6 +2366,7 @@ def main():
         context_cache=args.context_cache,
         context_cache_max_records=args.context_cache_max_records,
     )
+    llm.warm_tool_template()
     llm.serve(
         host=args.host,
         port=args.port,
