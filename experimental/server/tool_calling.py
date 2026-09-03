@@ -243,6 +243,14 @@ def _split_reasoning_events(text: str) -> List[Dict[str, Any]]:
 
 class _GenericToolParser:
 
+    def stream_parser(
+        self, tool_config: "ToolConfig", strip_tokens: Sequence[str] = ()
+    ) -> "ToolStreamParser":
+        # The generic grammar has no fixed opener for its bare forms (raw
+        # JSON, code fences, pythonic lines), so it cannot release content
+        # before the whole output is known.
+        return _BufferedToolStreamParser(self, tool_config, strip_tokens)
+
     _BLOCK_RE = re.compile(
         r"(<tool_call>.*?</tool_call>|<tool_calls>.*?</tool_calls>|"
         r"<toolcall>.*?</toolcall>|<toolcalls>.*?</toolcalls>|"
@@ -291,6 +299,15 @@ class _GenericToolParser:
 
 
 class _Gemma4ToolParser:
+
+    BLOCK_OPENER = "<|tool_call>"
+    BLOCK_CLOSER = "<tool_call|>"
+    BARE_PREFIX = "call:"
+
+    def stream_parser(
+        self, tool_config: "ToolConfig", strip_tokens: Sequence[str] = ()
+    ) -> "ToolStreamParser":
+        return _Gemma4ToolStreamParser(self, tool_config, strip_tokens)
 
     _BLOCK_RE = re.compile(
         r"<\|tool_call>(.*?)<tool_call\|>",
@@ -342,6 +359,169 @@ class _Gemma4ToolParser:
             # separate request.
             return [{"type": "tool_call", "tool_call": call}], False
         return [{"type": "content", "text": text}], False
+
+
+def make_stream_parser(
+    tool_config: ToolConfig, model_dir: str,
+    strip_tokens: Sequence[str] = ()) -> "ToolStreamParser":
+    """Incremental counterpart of :func:`parse_assistant_output`.
+
+    ``strip_tokens`` are removed from every content span and from tool-call
+    bodies before parsing, matching the whole-output path. ``<think>`` tags are
+    left in content for the caller to split.
+    """
+    return _select_parser(model_dir).stream_parser(tool_config, strip_tokens)
+
+
+def partial_marker_len(text: str, markers: Sequence[str]) -> int:
+    """Length of the longest suffix of ``text`` that is a proper prefix of one
+    of ``markers``: the span a streaming splitter must hold back because the
+    next delta may complete a marker."""
+    best = 0
+    for marker in markers:
+        for size in range(min(len(text), len(marker) - 1), best, -1):
+            if text.endswith(marker[:size]):
+                best = size
+                break
+    return best
+
+
+def _strip_tokens(text: str, tokens: Sequence[str]) -> str:
+    for token in tokens:
+        text = text.replace(token, "")
+    return text
+
+
+def _content_event(text: str) -> Dict[str, Any]:
+    return {"type": "content", "text": text}
+
+
+class ToolStreamParser:
+    """Splits a token stream into ordered content and tool-call events.
+
+    ``feed`` returns the events that became final with the new text;
+    ``finish`` returns whatever is still held back at end of generation.
+    Events have the shape produced by the parser ``parse`` methods.
+    """
+
+    def feed(self, text: str) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+    def finish(self) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+
+class _BufferedToolStreamParser(ToolStreamParser):
+
+    def __init__(self, parser, tool_config: ToolConfig,
+                 strip_tokens: Sequence[str]):
+        self._parser = parser
+        self._tool_config = tool_config
+        self._strip_tokens = tuple(strip_tokens)
+        self._parts: List[str] = []
+
+    def feed(self, text: str) -> List[Dict[str, Any]]:
+        self._parts.append(text)
+        return []
+
+    def finish(self) -> List[Dict[str, Any]]:
+        text = _strip_tokens("".join(self._parts), self._strip_tokens)
+        self._parts = []
+        events, _ = self._parser.parse(text, self._tool_config)
+        return events
+
+
+class _Gemma4ToolStreamParser(ToolStreamParser):
+    """Releases content as soon as it can no longer become a tool call.
+
+    Block form (``<|tool_call>...<tool_call|>``) may appear anywhere: content
+    streams up to the opener, the block is buffered to its closer and parsed
+    like the whole-output path (a malformed block is content, verbatim). The
+    bare form (``call:NAME{...}``) is only recognised at the very start, so
+    nothing is released until the first non-blank text rules it out; once it
+    is seen the rest of the output is buffered and handed to the whole-output
+    parser at ``finish`` so its trailing-prose rule applies unchanged.
+    """
+
+    def __init__(self, parser, tool_config: ToolConfig,
+                 strip_tokens: Sequence[str]):
+        self._parser = parser
+        self._tool_config = tool_config
+        self._strip_tokens = tuple(strip_tokens)
+        self._opener = parser.BLOCK_OPENER
+        self._closer = parser.BLOCK_CLOSER
+        self._bare_prefix = parser.BARE_PREFIX
+        self._scan_markers = (self._opener, ) + self._strip_tokens
+        self._buf = ""
+        self._at_start = True
+        self._in_block = False
+        self._bare = False
+
+    def feed(self, text: str) -> List[Dict[str, Any]]:
+        self._buf += text
+        events: List[Dict[str, Any]] = []
+        if self._bare:
+            return events
+        while self._buf:
+            if self._in_block:
+                idx = self._buf.find(self._closer, len(self._opener))
+                if idx == -1:
+                    break
+                end = idx + len(self._closer)
+                events.append(self._block_event(self._buf[:end]))
+                self._buf = self._buf[end:]
+                self._in_block = False
+                continue
+            if self._at_start:
+                head = self._buf.lstrip()
+                if head.startswith(self._bare_prefix):
+                    self._bare = True
+                    break
+                if self._bare_prefix.startswith(head):
+                    break
+                self._at_start = False
+            idx, marker = self._earliest_marker()
+            if marker is None:
+                hold = partial_marker_len(self._buf, self._scan_markers)
+                release = self._buf[:len(self._buf) - hold]
+                if release:
+                    events.append(_content_event(release))
+                self._buf = self._buf[len(release):]
+                break
+            if idx > 0:
+                events.append(_content_event(self._buf[:idx]))
+            if marker == self._opener:
+                self._buf = self._buf[idx:]
+                self._in_block = True
+            else:
+                self._buf = self._buf[idx + len(marker):]
+        return events
+
+    def finish(self) -> List[Dict[str, Any]]:
+        buf, self._buf = self._buf, ""
+        text = _strip_tokens(buf, self._strip_tokens)
+        if self._bare or self._at_start:
+            events, _ = self._parser.parse(text, self._tool_config)
+            return [e for e in events if e["type"] != "content" or e["text"]]
+        # An unterminated block or a held marker prefix is content, which is
+        # what the whole-output parser reports for it too.
+        return [_content_event(text)] if text else []
+
+    def _earliest_marker(self) -> Tuple[int, Optional[str]]:
+        best_idx, best = -1, None
+        for marker in self._scan_markers:
+            idx = self._buf.find(marker)
+            if idx != -1 and (best is None or idx < best_idx):
+                best_idx, best = idx, marker
+        return best_idx, best
+
+    def _block_event(self, block: str) -> Dict[str, Any]:
+        block = _strip_tokens(block, self._strip_tokens)
+        body = block[len(self._opener):-len(self._closer)]
+        call = _parse_gemma4_call(body, self._tool_config)
+        if call is None:
+            return _content_event(block)
+        return {"type": "tool_call", "tool_call": call}
 
 
 class _ToolParserRegistry:
@@ -451,7 +631,8 @@ def _gemma4_object_end(text: str, start: int) -> Optional[int]:
 
 
 def _parse_gemma4_object(text: str,
-                         parameter_types: Optional[Dict[str, str]] = None) -> dict:
+                         parameter_types: Optional[Dict[str,
+                                                        str]] = None) -> dict:
     body = text.strip()
     if not (body.startswith("{") and body.endswith("}")):
         raise ValueError("Gemma tool arguments must be an object")
@@ -520,7 +701,8 @@ def _split_gemma4_key_value(field: str) -> Tuple[str, str]:
             elif char == ":" and depth == 0:
                 key = field[:index].strip()
                 value = field[index + 1:].strip()
-                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or not value:
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*",
+                                    key) or not value:
                     break
                 return key, value
         index += 1
@@ -537,8 +719,7 @@ def _parse_gemma4_value(text: str, expected_type: Optional[str] = None) -> Any:
     if value.startswith("[") and value.endswith("]"):
         body = value[1:-1].strip()
         return ([] if not body else [
-            _parse_gemma4_value(item)
-            for item in _split_gemma4_fields(body)
+            _parse_gemma4_value(item) for item in _split_gemma4_fields(body)
         ])
     if value == "true":
         return True

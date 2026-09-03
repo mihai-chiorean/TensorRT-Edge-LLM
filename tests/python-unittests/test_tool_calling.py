@@ -18,9 +18,11 @@ import json
 import pytest
 
 from experimental.server.api_server import (_build_message_body,
-                                            _generate_stream_sse)
+                                            _generate_stream_sse,
+                                            _ThinkingStateMachine)
 from experimental.server.engine import StreamDelta
-from experimental.server.tool_calling import (parse_assistant_output,
+from experimental.server.tool_calling import (make_stream_parser,
+                                              parse_assistant_output,
                                               validate_tool_request)
 
 
@@ -150,8 +152,8 @@ def test_parses_gemma4_tool_calls(tmp_path):
         "content": "Set volume"
     }], tools, "required")
 
-    parsed = parse_assistant_output(
-        'call:set_volume{mode:louder,percent:75}', config, str(tmp_path))
+    parsed = parse_assistant_output('call:set_volume{mode:louder,percent:75}',
+                                    config, str(tmp_path))
 
     assert parsed.content == ""
     assert len(parsed.tool_calls) == 1
@@ -355,3 +357,265 @@ def test_tool_stream_usage_chunk(tmp_path):
     assert usage_payload["usage"]["prompt_tokens"] == 100
     assert usage_payload["usage"]["total_tokens"] == (
         100 + usage_payload["usage"]["completion_tokens"])
+
+
+def _gemma_config(tmp_path, tool_choice="auto"):
+    (tmp_path / "config.json").write_text(json.dumps({"model": "gemma4_text"}))
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "set_volume",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "percent": {
+                        "type": "integer"
+                    },
+                },
+            },
+        },
+    }]
+    return validate_tool_request([{
+        "role": "user",
+        "content": "Set volume"
+    }], tools, tool_choice)
+
+
+def _feed_all(parser, deltas):
+    """Return per-delta event lists plus the finish events."""
+    out = [parser.feed(d) for d in deltas]
+    out.append(parser.finish())
+    return out
+
+
+def _texts(events):
+    return [e["text"] for e in events if e["type"] == "content"]
+
+
+def test_gemma4_stream_parser_releases_prose_incrementally(tmp_path):
+    config = _gemma_config(tmp_path)
+    parser = make_stream_parser(config,
+                                str(tmp_path),
+                                strip_tokens=("<|im_end|>", ))
+
+    per_delta = _feed_all(parser, ["Owls ", "can ", "rotate<", "|to", "wn"])
+    assert _texts(per_delta[0]) == ["Owls "]
+    assert _texts(per_delta[1]) == ["can "]
+    # "<" and "<|to" may still open a tool-call block: held back.
+    assert _texts(per_delta[2]) == ["rotate"]
+    assert per_delta[3] == []
+    assert _texts(per_delta[4]) == ["<|town"]
+    assert per_delta[5] == []
+
+
+def test_gemma4_stream_parser_block_after_prose(tmp_path):
+    config = _gemma_config(tmp_path)
+    parser = make_stream_parser(config, str(tmp_path))
+
+    per_delta = _feed_all(parser, [
+        "Sure. <|tool_call>call:set_vol",
+        "ume{percent:40}<tool_ca",
+        "ll|> Done.",
+    ])
+    assert _texts(per_delta[0]) == ["Sure. "]
+    assert per_delta[1] == []
+    kinds = [e["type"] for e in per_delta[2]]
+    assert kinds == ["tool_call", "content"]
+    call = per_delta[2][0]["tool_call"]
+    assert call.name == "set_volume"
+    assert json.loads(call.arguments) == {"percent": 40}
+    assert per_delta[2][1]["text"] == " Done."
+    assert per_delta[3] == []
+
+
+def test_gemma4_stream_parser_bare_call_holds_and_drops_trailing_prose(
+        tmp_path):
+    config = _gemma_config(tmp_path, "required")
+    parser = make_stream_parser(config, str(tmp_path))
+
+    per_delta = _feed_all(
+        parser,
+        ["ca", "ll:set_volume{per", "cent:75}", "I have changed the volume."])
+    assert per_delta[:4] == [[], [], [], []]
+    assert [e["type"] for e in per_delta[4]] == ["tool_call"]
+    assert json.loads(per_delta[4][0]["tool_call"].arguments) == {
+        "percent": 75
+    }
+
+
+def test_gemma4_stream_parser_start_holdback_only_for_call_prefix(tmp_path):
+    config = _gemma_config(tmp_path)
+    parser = make_stream_parser(config, str(tmp_path))
+    per_delta = _feed_all(parser, ["  ", "ca", "ts fly"])
+    assert per_delta[0] == [] and per_delta[1] == []
+    assert _texts(per_delta[2]) == ["  cats fly"]
+
+    parser = make_stream_parser(config, str(tmp_path))
+    assert _texts(parser.feed("Owls")) == ["Owls"]
+
+    parser = make_stream_parser(config, str(tmp_path))
+    assert parser.feed("ca") == []
+    assert _texts(parser.finish()) == ["ca"]
+
+
+def test_gemma4_stream_parser_malformed_block_is_content(tmp_path):
+    config = _gemma_config(tmp_path)
+    parser = make_stream_parser(config, str(tmp_path))
+    block = "<|tool_call>call:set_volume{percent:1,percent:2}<tool_call|>"
+    per_delta = _feed_all(parser, ["Hi ", block, "!"])
+    assert _texts(per_delta[1]) == [block]
+    assert _texts(per_delta[2]) == ["!"]
+
+
+def test_gemma4_stream_parser_unterminated_block_flushes_content(tmp_path):
+    config = _gemma_config(tmp_path)
+    parser = make_stream_parser(config, str(tmp_path))
+    per_delta = _feed_all(parser, ["Hi <|tool_call>call:set_volume{"])
+    assert _texts(per_delta[0]) == ["Hi "]
+    assert _texts(per_delta[1]) == ["<|tool_call>call:set_volume{"]
+
+
+def test_gemma4_stream_parser_strips_tokens(tmp_path):
+    config = _gemma_config(tmp_path)
+    parser = make_stream_parser(config,
+                                str(tmp_path),
+                                strip_tokens=("<|im_end|>", ))
+    per_delta = _feed_all(parser, ["Bye<|im_", "end|>", "<|im_end|>"])
+    assert _texts(per_delta[0]) == ["Bye"]
+    assert per_delta[1] == [] and per_delta[2] == [] and per_delta[3] == []
+
+    parser = make_stream_parser(config,
+                                str(tmp_path),
+                                strip_tokens=("<|im_end|>", ))
+    per_delta = _feed_all(parser, ["call:set_volume{percent:5}<|im_end|>"])
+    assert [e["type"] for e in per_delta[1]] == ["tool_call"]
+
+
+def test_gemma4_stream_parser_matches_whole_output_parser(tmp_path):
+    """Chunking must not change the event sequence the whole-output parser
+    produces, for every split point of representative outputs."""
+    config = _gemma_config(tmp_path)
+    samples = [
+        "Owls can rotate their heads. <|tool_call>call:set_volume{percent:40}"
+        "<tool_call|> Done.",
+        "call:set_volume{percent:75}I have changed the volume.",
+        "  call:set_volume{percent:75}",
+        "<|tool_call>call:set_volume{percent:1,percent:2}<tool_call|>tail",
+        "call:nothing here <|tool_call>call:set_volume{percent:9}<tool_call|>",
+        "Plain <| prose with < angle brackets<|im_end|>",
+        "<|tool_call>call:set_volume{percent:3}<tool_call|>"
+        "<|tool_call>call:set_volume{percent:4}<tool_call|>",
+    ]
+    for sample in samples:
+        expected = parse_assistant_output(sample.replace("<|im_end|>", ""),
+                                          config, str(tmp_path))
+        for split in range(len(sample) + 1):
+            parser = make_stream_parser(config,
+                                        str(tmp_path),
+                                        strip_tokens=("<|im_end|>", ))
+            events = parser.feed(sample[:split]) + parser.feed(
+                sample[split:]) + parser.finish()
+            content = "".join(_texts(events))
+            calls = [(e["tool_call"].name, e["tool_call"].arguments)
+                     for e in events if e["type"] == "tool_call"]
+            assert content == expected.content, (sample, split)
+            assert calls == [(c.name, c.arguments)
+                             for c in expected.tool_calls], (sample, split)
+
+
+def test_generic_stream_parser_buffers_until_finish(tmp_path):
+    config = _tool_config()
+    parser = make_stream_parser(config, str(tmp_path))
+    per_delta = _feed_all(parser, [
+        "<tool_call>{\"name\":\"get_weather\",",
+        "\"arguments\":{\"city\":\"Paris\"}}</tool_call>"
+    ])
+    assert per_delta[0] == [] and per_delta[1] == []
+    assert [e["type"] for e in per_delta[2]] == ["tool_call"]
+
+
+class _FakeGemmaLLM:
+
+    def __init__(self, model_dir, pieces):
+        self.model_dir = str(model_dir)
+        self._model_id = "fake-gemma"
+        self._pieces = pieces
+
+    def _make_generation_request(self, messages, params, **kw):
+        return object()
+
+    def generate_stream(self, messages, params, **kw):
+        for piece in self._pieces[:-1]:
+            yield StreamDelta(text=piece, token_ids=[1], finished=False)
+        yield StreamDelta(text=self._pieces[-1],
+                          token_ids=[1],
+                          finished=True,
+                          finish_reason="stop")
+
+
+def _stream_payloads(llm, config):
+    chunks = list(
+        _generate_stream_sse(llm, [{
+            "role": "user",
+            "content": "Owls?"
+        }],
+                             object(),
+                             "chatcmpl-gemma",
+                             False,
+                             tool_config=config))
+    assert chunks[-1] == "data: [DONE]\n\n"
+    return [
+        json.loads(c.removeprefix("data: "))["choices"][0] for c in chunks
+        if c.startswith("data: {")
+    ]
+
+
+def test_tool_stream_sse_streams_content_per_delta(tmp_path):
+    config = _gemma_config(tmp_path)
+    pieces = ["Owls ", "can ", "rotate ", "their ", "heads."]
+    choices = _stream_payloads(_FakeGemmaLLM(tmp_path, pieces), config)
+    contents = [
+        c["delta"]["content"] for c in choices if "content" in c["delta"]
+    ]
+    assert contents == pieces
+    assert choices[-1]["finish_reason"] == "stop"
+
+
+def test_tool_stream_sse_prose_then_block_call(tmp_path):
+    config = _gemma_config(tmp_path)
+    pieces = [
+        "Sure. ", "<|tool_call>call:set_volume", "{percent:40}", "<tool_call|>"
+    ]
+    choices = _stream_payloads(_FakeGemmaLLM(tmp_path, pieces), config)
+    deltas = [c["delta"] for c in choices]
+    assert deltas[1] == {"content": "Sure. "}
+    head, args = deltas[2]["tool_calls"][0], deltas[3]["tool_calls"][0]
+    assert head["index"] == 0 and head["type"] == "function"
+    assert head["function"] == {"name": "set_volume", "arguments": ""}
+    assert args == {"index": 0, "function": {"arguments": '{"percent": 40}'}}
+    assert choices[-1]["finish_reason"] == "tool_calls"
+
+
+def test_tool_stream_sse_forced_bare_call_has_no_content(tmp_path):
+    config = _gemma_config(tmp_path, {
+        "type": "function",
+        "function": {
+            "name": "set_volume"
+        }
+    })
+    pieces = ["call:set_", "volume{percent:75}", "Volume set."]
+    choices = _stream_payloads(_FakeGemmaLLM(tmp_path, pieces), config)
+    deltas = [c["delta"] for c in choices]
+    assert not any("content" in d for d in deltas)
+    assert [d["tool_calls"][0]["index"] for d in deltas
+            if "tool_calls" in d] == [0, 0]
+    assert choices[-1]["finish_reason"] == "tool_calls"
+
+
+def test_thinking_state_machine_holds_only_partial_tags():
+    sm = _ThinkingStateMachine(True)
+    assert list(sm.feed("Owls can rotate")) == [("content", "Owls can rotate")]
+    assert list(sm.feed(" <th")) == [("content", " ")]
+    assert list(sm.feed("ink>plan</th")) == [("reasoning", "plan")]
+    assert list(sm.feed("ink>done")) == [("content", "done")]
+    assert list(sm.flush()) == []

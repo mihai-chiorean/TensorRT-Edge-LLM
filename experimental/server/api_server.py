@@ -59,7 +59,8 @@ from .batching import BatcherOverflow, RequestBatcher, resolve_batch_size
 from .engine import (OMNI_AUDIO_SAMPLE_RATE, AudioParams, SamplingParams,
                      _normalize_logit_bias, _validate_logit_bias_spec_decode,
                      finish_reason_name)
-from .tool_calling import (ToolConfig, parse_assistant_output,
+from .tool_calling import (ToolConfig, make_stream_parser,
+                           parse_assistant_output, partial_marker_len,
                            validate_tool_request)
 from .video_sampling import MAX_SOURCE_BYTES as MAX_VIDEO_SOURCE_BYTES
 
@@ -1539,13 +1540,11 @@ class _ThinkingStateMachine:
             if not self._in_think:
                 idx = self._buf.find(THINK_OPEN_TAG)
                 if idx == -1:
-                    if len(self._buf) > len(THINK_OPEN_TAG):
-                        safe = self._buf[:-len(THINK_OPEN_TAG)]
-                        self._buf = self._buf[len(safe):]
-                        if safe and self._think_opened:
-                            yield "content", safe
-                        elif safe:
-                            yield "content", safe
+                    hold = partial_marker_len(self._buf, (THINK_OPEN_TAG, ))
+                    safe = self._buf[:len(self._buf) - hold]
+                    self._buf = self._buf[len(safe):]
+                    if safe:
+                        yield "content", safe
                     break
                 if idx > 0 and self._think_opened:
                     yield "content", self._buf[:idx]
@@ -1557,11 +1556,11 @@ class _ThinkingStateMachine:
             else:
                 idx = self._buf.find(THINK_CLOSE_TAG)
                 if idx == -1:
-                    if len(self._buf) > len(THINK_CLOSE_TAG):
-                        safe = self._buf[:-len(THINK_CLOSE_TAG)]
-                        self._buf = self._buf[len(safe):]
-                        if safe:
-                            yield "reasoning", safe
+                    hold = partial_marker_len(self._buf, (THINK_CLOSE_TAG, ))
+                    safe = self._buf[:len(self._buf) - hold]
+                    self._buf = self._buf[len(safe):]
+                    if safe:
+                        yield "reasoning", safe
                     break
                 if idx > 0:
                     yield "reasoning", self._buf[:idx]
@@ -1810,6 +1809,10 @@ def _generate_tool_stream_sse(llm_instance,
                               handoff=None,
                               include_usage: bool = False,
                               prompt_tokens: Optional[int] = None):
+    """Tool-mode streaming: content is released as it is produced and only
+    the span that may still become a tool call is held back; tool calls are
+    emitted as they close. ``<think>`` spans are split regardless of the
+    request's thinking flag, as the whole-output tool parser does."""
     model_name = llm_instance._model_id
     created = int(time.time())
 
@@ -1821,39 +1824,27 @@ def _generate_tool_stream_sse(llm_instance,
                           null_usage=include_usage,
                           **kw)
 
-    text_parts: List[str] = []
+    stream_parser = make_stream_parser(tool_config,
+                                       llm_instance.model_dir,
+                                       strip_tokens=(IM_END_TOKEN, ))
+    sm = _ThinkingStateMachine(True)
     finish_reason: Optional[str] = None
     error_message: Optional[str] = None
     completion_tokens = 0
-
-    try:
-        for delta in llm_instance.generate_stream(
-                messages,
-                params,
-                prebuilt_request=prebuilt_request,
-                admission_handoff=handoff,
-                tools=tool_config.tools,
-                tool_choice=tool_config.tool_choice):
-            completion_tokens += len(delta.token_ids or [])
-            if delta.text:
-                text_parts.append(delta.text)
-            if delta.finished:
-                finish_reason = delta.finish_reason or "stop"
-    except Exception as exc:
-        logger.exception("Streaming inference failed")
-        finish_reason = "error"
-        error_message = str(exc)
-
-    output_text = "".join(text_parts).replace(IM_END_TOKEN, "")
-    parsed = parse_assistant_output(output_text, tool_config,
-                                    llm_instance.model_dir)
     tool_index = 0
-    for event in parsed.events:
-        if event["type"] == "reasoning" and event["text"]:
-            yield emit({"reasoning": event["text"]})
-        elif event["type"] == "content" and event["text"]:
-            yield emit({"content": event["text"]})
-        elif event["type"] == "tool_call":
+
+    def emit_events(events):
+        nonlocal tool_index
+        for event in events:
+            if event["type"] == "content":
+                for field, text in sm.feed(event["text"]):
+                    if text:
+                        yield emit({field: text})
+                continue
+            if event["type"] != "tool_call":
+                continue
+            for field, text in sm.flush():
+                yield emit({field: text})
             call = event["tool_call"]
             yield emit({
                 "tool_calls": [{
@@ -1876,6 +1867,28 @@ def _generate_tool_stream_sse(llm_instance,
                     }]
                 })
             tool_index += 1
+
+    try:
+        for delta in llm_instance.generate_stream(
+                messages,
+                params,
+                prebuilt_request=prebuilt_request,
+                admission_handoff=handoff,
+                tools=tool_config.tools,
+                tool_choice=tool_config.tool_choice):
+            completion_tokens += len(delta.token_ids or [])
+            if delta.text:
+                yield from emit_events(stream_parser.feed(delta.text))
+            if delta.finished:
+                finish_reason = delta.finish_reason or "stop"
+    except Exception as exc:
+        logger.exception("Streaming inference failed")
+        finish_reason = "error"
+        error_message = str(exc)
+
+    yield from emit_events(stream_parser.finish())
+    for field, text in sm.flush():
+        yield emit({field: text})
 
     finish = "tool_calls" if tool_index else finish_reason or "stop"
     if error_message and "EDGELLM_INPUT_TOO_LONG" in error_message:
