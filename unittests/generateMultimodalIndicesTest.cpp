@@ -171,6 +171,20 @@ TEST(ComputeMultimodalRowBases, RejectsPrefixBeyondInput)
     EXPECT_THROW(rt::computeMultimodalRowBases(inputs, {4}, 50, std::nullopt), std::exception);
 }
 
+TEST(SuffixContainsToken, ReportsPlaceholdersAtOrAfterPrefillStart)
+{
+    int32_t constexpr kImageTok = 50;
+    std::vector<std::vector<int32_t>> const inputs{{1, kImageTok, kImageTok, 2}, {3, 4}};
+    EXPECT_TRUE(rt::suffixContainsToken(inputs, nullptr, kImageTok));
+    std::vector<int32_t> const insideRun{2, 0};
+    EXPECT_TRUE(rt::suffixContainsToken(inputs, &insideRun, kImageTok));
+    std::vector<int32_t> const pastRun{3, 0};
+    EXPECT_FALSE(rt::suffixContainsToken(inputs, &pastRun, kImageTok));
+    std::vector<int32_t> const atEnd{4, 2};
+    EXPECT_FALSE(rt::suffixContainsToken(inputs, &atEnd, kImageTok));
+    EXPECT_FALSE(rt::suffixContainsToken(inputs, nullptr, 99));
+}
+
 // The device kernel agrees with the host reference, with and without row bases.
 TEST(GenerateMultimodalIndices, DeviceKernelMatchesHostReference)
 {

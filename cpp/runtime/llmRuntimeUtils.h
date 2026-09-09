@@ -403,6 +403,17 @@ MultimodalRowBases computeMultimodalRowBases(std::vector<std::vector<int32_t>> c
     std::optional<int32_t> audioTokenId);
 
 /*!
+ * @brief Check whether any sequence's prefill suffix still holds a placeholder token
+ *
+ * @param inputIds Complete token IDs per sequence
+ * @param prefillStarts Per-sequence offset at which prefill begins, or nullptr for zero everywhere
+ * @param tokenId Placeholder token id to look for
+ * @return True when tokenId occurs at or after prefillStarts[i] in some sequence i
+ */
+bool suffixContainsToken(
+    std::vector<std::vector<int32_t>> const& inputIds, std::vector<int32_t> const* prefillStarts, int32_t tokenId);
+
+/*!
  * @brief Generate multimodal indices for embeddingLookup kernel
  *
  * Scans input IDs and generates sequential indices for audio/image embeddings.

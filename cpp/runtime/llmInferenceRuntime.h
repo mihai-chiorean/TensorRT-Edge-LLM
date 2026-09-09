@@ -349,12 +349,26 @@ private:
     //! Validate request shape/runtime compatibility.
     bool validateRequestConfig(LLMGenerationRequest const& request);
 
+    //! Encoders whose inputs multiModalRuntimePreprocess staged for the current request.
+    struct MultimodalEncodePlan
+    {
+        bool audio{false};
+        bool vision{false};
+    };
+
     //! Prepare per-request runtime state for models built with multimodal support.
-    //! Runs multimodal preprocessing when audio or vision inputs are present.
+    //! Runs multimodal preprocessing (tokenization and encoder input staging) when audio or
+    //! vision inputs are present; encoder inference is deferred to multiModalRuntimeEncode.
     //! For text-only requests on MRope-based multimodal models, restores text-only RoPE state
     //! and clears stale multimodal request state.
-    bool multiModalRuntimePreprocess(
-        LLMGenerationRequest const& request, DecodingInferenceContext& context, cudaStream_t stream);
+    bool multiModalRuntimePreprocess(LLMGenerationRequest const& request, DecodingInferenceContext& context,
+        MultimodalEncodePlan& plan, cudaStream_t stream);
+
+    //! Run the staged encoders and publish their embeddings into the context. An encoder is skipped
+    //! when every placeholder of its modality lies inside a reused prefix (prefillStarts), since the
+    //! prefill suffix then never reads its output.
+    bool multiModalRuntimeEncode(MultimodalEncodePlan const& plan, DecodingInferenceContext& context,
+        std::vector<int32_t> const* prefillStarts, cudaStream_t stream);
 
     // Consume system prompt, produce the hash table of system prompt KVCache if kv cache reuse is enabled.
     //! @throws std::runtime_error if a CUDA operation fails

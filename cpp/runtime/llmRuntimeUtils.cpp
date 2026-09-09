@@ -763,6 +763,24 @@ int32_t clampMaxGenerateLengthForKVCapacity(std::vector<int32_t> const& effectiv
     return clampedMaxGenerateLength;
 }
 
+bool suffixContainsToken(
+    std::vector<std::vector<int32_t>> const& inputIds, std::vector<int32_t> const* prefillStarts, int32_t tokenId)
+{
+    check::check(prefillStarts == nullptr || prefillStarts->size() == inputIds.size(),
+        "prefillStarts must describe every sequence");
+    for (size_t i = 0; i < inputIds.size(); ++i)
+    {
+        std::vector<int32_t> const& ids = inputIds[i];
+        int32_t const start = prefillStarts != nullptr ? (*prefillStarts)[i] : 0;
+        check::check(start >= 0 && static_cast<size_t>(start) <= ids.size(), "Prefill start is outside the sequence");
+        if (std::find(ids.begin() + start, ids.end(), tokenId) != ids.end())
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 MultimodalRowBases computeMultimodalRowBases(std::vector<std::vector<int32_t>> const& fullInputIds,
     std::vector<int32_t> const& prefixLengths, std::optional<int32_t> imageTokenId, std::optional<int32_t> audioTokenId)
 {

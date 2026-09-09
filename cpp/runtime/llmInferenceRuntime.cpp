@@ -804,9 +804,10 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     bool const supportsMultimodalInput
         = (mAudioRunner != nullptr) || (mVisionRunner != nullptr) || (mActionRunner != nullptr);
 
+    MultimodalEncodePlan encodePlan;
     if (supportsMultimodalInput)
     {
-        if (!multiModalRuntimePreprocess(request, context, stream))
+        if (!multiModalRuntimePreprocess(request, context, encodePlan, stream))
         {
             return false;
         }
@@ -969,11 +970,16 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         contextCacheRequest.emplace(std::move(*admitted));
     }
     ContextCacheRequest* const managedRequest = contextCacheRequest.has_value() ? &*contextCacheRequest : nullptr;
+    std::vector<int32_t> const* const contextCachePrefillStarts
+        = managedRequest != nullptr ? &managedRequest->prefillStarts() : nullptr;
+
+    if (supportsMultimodalInput && !multiModalRuntimeEncode(encodePlan, context, contextCachePrefillStarts, stream))
+    {
+        return false;
+    }
 
     // Conduct the preparation work to handle a new set of sequences, including inputIds packing, input/output tensor
     // preparation, reset the KVCache state, and apply reused prefix KVCache if available.
-    std::vector<int32_t> const* const contextCachePrefillStarts
-        = managedRequest != nullptr ? &managedRequest->prefillStarts() : nullptr;
     if (!setUpForPrefillExecution(context, decodingStrategy, contextCachePrefillStarts))
     {
         LOG_ERROR("Prefill execution setup failed. This request cannot be handled.");
@@ -1548,9 +1554,10 @@ bool LLMInferenceRuntime::validateRequestConfig(LLMGenerationRequest const& requ
     return true;
 }
 
-bool LLMInferenceRuntime::multiModalRuntimePreprocess(
-    LLMGenerationRequest const& request, DecodingInferenceContext& context, cudaStream_t stream)
+bool LLMInferenceRuntime::multiModalRuntimePreprocess(LLMGenerationRequest const& request,
+    DecodingInferenceContext& context, MultimodalEncodePlan& plan, cudaStream_t stream)
 {
+    plan = MultimodalEncodePlan{};
     int32_t const activeBatchSize = static_cast<int32_t>(request.requests.size());
     bool const hasAudio = std::any_of(
         request.requests.begin(), request.requests.end(), [](auto const& req) { return !req.audioBuffers.empty(); });
@@ -1588,12 +1595,7 @@ bool LLMInferenceRuntime::multiModalRuntimePreprocess(
             LOG_ERROR("Audio preprocessing failed. This request cannot be handled.");
             return false;
         }
-
-        if (!mAudioRunner->infer(stream))
-        {
-            LOG_ERROR("Audio inference failed. This request cannot be handled.");
-            return false;
-        }
+        plan.audio = true;
     }
 
     // Process vision inputs (if present)
@@ -1605,16 +1607,7 @@ bool LLMInferenceRuntime::multiModalRuntimePreprocess(
             LOG_ERROR("Vision preprocessing failed. This request cannot be handled.");
             return false;
         }
-
-        NVTX_SCOPED_RANGE(nvtx_vision, "VISION_ENCODER", nvtx_colors::ORANGE);
-        CUDA_CHECK(cudaEventRecord(mVisionEncoderStart, stream));
-        if (!mVisionRunner->infer(stream))
-        {
-            LOG_ERROR("Vision inference failed. This request cannot be handled.");
-            return false;
-        }
-        CUDA_CHECK(cudaEventRecord(mVisionEncoderStop, stream));
-        mVisionEncoderTimed = true;
+        plan.vision = true;
     }
 
     // Process action inputs (if present)
@@ -1652,24 +1645,73 @@ bool LLMInferenceRuntime::multiModalRuntimePreprocess(
         }
     }
 
-    // Get embeddings from independent runners — gate on request having multimodal data,
-    // not just runner existence, to avoid leaking stale embeddings from previous requests.
-    rt::OptionalInputTensor visionEmbeddings
-        = (hasVision && mVisionRunner) ? std::optional{std::ref(mVisionRunner->getOutputEmbedding())} : std::nullopt;
-    rt::OptionalInputTensor audioEmbeddings
-        = (hasAudio && mAudioRunner) ? std::optional{std::ref(mAudioRunner->getOutputEmbedding())} : std::nullopt;
-    rt::OptionalInputTensors deepstackFeatures
-        = (hasVision && mVisionRunner) ? mVisionRunner->getDeepstackFeatures() : rt::OptionalInputTensors{};
-
-    context.visualEmbeddings = visionEmbeddings;
-    context.deepstackFeatures = deepstackFeatures;
-    context.audioEmbeddings = audioEmbeddings;
-
     // Populate system prompts and raw input IDs from batchedInputIds
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
         context.systemPrompts[i] = request.formattedRequests[i].formattedSystemPrompt;
         context.rawBatchedInputIds.push_back(batchedInputIds[i]);
+    }
+
+    return true;
+}
+
+bool LLMInferenceRuntime::multiModalRuntimeEncode(MultimodalEncodePlan const& plan, DecodingInferenceContext& context,
+    std::vector<int32_t> const* prefillStarts, cudaStream_t stream)
+{
+    NVTX_SCOPED_RANGE(nvtx_encode, "MULTIMODAL_ENCODE", nvtx_colors::ORANGE);
+
+    // Embeddings are published only for encoders that ran, so a stale buffer from a previous
+    // request can never be read by this one.
+    if (plan.audio)
+    {
+        bool const suffixReadsAudio = mDeployment.base.audioTokenId < 0
+            || suffixContainsToken(context.rawBatchedInputIds, prefillStarts, mDeployment.base.audioTokenId);
+        if (!suffixReadsAudio)
+        {
+            LOG_INFO("Audio encoder skipped: every audio token lies inside the reused prefix");
+        }
+        else
+        {
+            if (!mAudioRunner->infer(stream))
+            {
+                LOG_ERROR("Audio inference failed. This request cannot be handled.");
+                return false;
+            }
+            context.audioEmbeddings = std::ref(mAudioRunner->getOutputEmbedding());
+        }
+    }
+
+    if (plan.vision)
+    {
+        bool const suffixReadsVision = mDeployment.base.imageTokenId < 0
+            || suffixContainsToken(context.rawBatchedInputIds, prefillStarts, mDeployment.base.imageTokenId);
+        for (size_t i = 0; i < context.rawBatchedInputIds.size(); ++i)
+        {
+            std::vector<int32_t> const& ids = context.rawBatchedInputIds[i];
+            int32_t const start = prefillStarts != nullptr ? (*prefillStarts)[i] : 0;
+            auto const firstImage = std::find(ids.begin(), ids.end(), mDeployment.base.imageTokenId);
+            auto const lastImage = std::find(ids.rbegin(), ids.rend(), mDeployment.base.imageTokenId);
+            LOG_INFO("Vision layout seq %zu: %zu tokens, image run [%ld, %ld), prefill start %d", i, ids.size(),
+                static_cast<long>(firstImage - ids.begin()), static_cast<long>(ids.rend() - lastImage), start);
+        }
+        if (!suffixReadsVision)
+        {
+            LOG_INFO("Vision encoder skipped: every image token lies inside the reused prefix");
+        }
+        else
+        {
+            NVTX_SCOPED_RANGE(nvtx_vision, "VISION_ENCODER", nvtx_colors::ORANGE);
+            CUDA_CHECK(cudaEventRecord(mVisionEncoderStart, stream));
+            if (!mVisionRunner->infer(stream))
+            {
+                LOG_ERROR("Vision inference failed. This request cannot be handled.");
+                return false;
+            }
+            CUDA_CHECK(cudaEventRecord(mVisionEncoderStop, stream));
+            mVisionEncoderTimed = true;
+            context.visualEmbeddings = std::ref(mVisionRunner->getOutputEmbedding());
+            context.deepstackFeatures = mVisionRunner->getDeepstackFeatures();
+        }
     }
 
     return true;
