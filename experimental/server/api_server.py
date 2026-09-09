@@ -51,7 +51,7 @@ import wave
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import anthropic_compat as _anthropic
 from .audio_preprocess import MAX_AUDIO_UPLOAD_BYTES
@@ -885,6 +885,12 @@ def _create_app(llm_instance,
                       if len(response.output_ids) > response_idx else [])
         completion_tokens = len(output_ids)
         try:
+            decoder = getattr(llm_instance, "decode_tool_output", None)
+            if callable(decoder):
+                output_text = decoder(raw_text,
+                                      output_ids,
+                                      tool_config,
+                                      stop_strings=params.stop)
             # Tool post-processing (parsing/serializing generated calls) can
             # raise; keep it inside the Anthropic error body rather than
             # surfacing a generic framework 500.
@@ -1174,6 +1180,7 @@ def _create_app(llm_instance,
                 include_top_logprobs=include_top_logprobs,
                 include_logprobs=num_logprobs > 0,
                 prompt_tokens=prompt_tokens,
+                stop_strings=params.stop,
             )
         except ToolProtocolError as exc:
             return JSONResponse(status_code=502,
@@ -1836,7 +1843,8 @@ def _generate_tool_stream_sse(llm_instance,
 
     stream_parser = make_stream_parser(tool_config,
                                        llm_instance.model_dir,
-                                       strip_tokens=(IM_END_TOKEN, ))
+                                       strip_tokens=_terminal_special_tokens(
+                                           llm_instance.model_dir))
     sm = _ThinkingStateMachine(True)
     finish_reason: Optional[str] = None
     error_message: Optional[str] = None
@@ -2073,13 +2081,21 @@ def _build_chat_completion_response(llm_instance,
                                     *,
                                     include_top_logprobs: bool = True,
                                     include_logprobs: bool = False,
-                                    prompt_tokens: Optional[int] = None):
+                                    prompt_tokens: Optional[int] = None,
+                                    stop_strings: Sequence[str] = ()):
     raw_text = (response.output_texts[response_idx]
                 if len(response.output_texts) > response_idx else "")
     output_text = raw_text.replace(IM_END_TOKEN, "")
     output_ids = (response.output_ids[response_idx]
                   if len(response.output_ids) > response_idx else [])
     completion_tokens = len(output_ids)
+
+    decoder = getattr(llm_instance, "decode_tool_output", None)
+    if callable(decoder):
+        output_text = decoder(raw_text,
+                              output_ids,
+                              tool_config,
+                              stop_strings=stop_strings)
 
     message_body, has_tool_calls = _build_message_body(output_text,
                                                        tool_config,

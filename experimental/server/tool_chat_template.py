@@ -158,8 +158,7 @@ def _inject_tool_requirement(
     if tool_choice == "required":
         instruction = (
             "For this turn, you must call exactly one of the declared tools. "
-            "Do not answer with prose instead of the tool call."
-        )
+            "Do not answer with prose instead of the tool call.")
     elif isinstance(tool_choice, dict):
         function = tool_choice.get("function")
         name = function.get("name") if isinstance(function, dict) else None
@@ -167,8 +166,7 @@ def _inject_tool_requirement(
             return messages
         instruction = (
             f"For this turn, you must call the declared tool {name} exactly "
-            "once. Do not answer with prose instead of that tool call."
-        )
+            "once. Do not answer with prose instead of that tool call.")
     else:
         return messages
 
@@ -243,7 +241,8 @@ class ToolChatTemplateFormatter:
         owner = self._load_template_owner()
         normalized_messages = normalize_messages_for_tools(messages)
         normalized_messages = _inject_tool_requirement(
-            normalized_messages, tool_choice,
+            normalized_messages,
+            tool_choice,
         )
 
         kwargs: Dict[str, Any] = {
@@ -294,3 +293,11 @@ class ToolChatTemplateFormatter:
             return len(encode(text, add_special_tokens=False))
         except TypeError:
             return len(encode(text))
+
+    def decode_tokens(self, token_ids: Sequence[int]) -> str:
+        """Decode generated IDs without discarding model protocol delimiters."""
+        owner = self._load_template_owner()
+        tokenizer = getattr(owner, "tokenizer", owner)
+        return tokenizer.decode(list(token_ids),
+                                skip_special_tokens=False,
+                                clean_up_tokenization_spaces=False)

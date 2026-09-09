@@ -46,7 +46,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple, Union
 
-from .tool_calling import (ToolConfig, parse_assistant_output,
+from .tool_calling import (ToolConfig, ToolProtocolError,
+                           _parser_name_for_model, parse_assistant_output,
                            validate_tool_request)
 from .tool_chat_template import (ToolChatTemplateFormatter,
                                  needs_tool_chat_template)
@@ -1491,6 +1492,43 @@ class LLM:
         request.num_logprobs = params.num_logprobs
         return request
 
+    def decode_tool_output(
+            self,
+            text: str,
+            token_ids: Sequence[int],
+            tool_config: ToolConfig,
+            stop_strings: Sequence[str] = (),
+    ) -> str:
+        """Restore Gemma tool syntax removed by native non-stream decoding."""
+        if (not tool_config.parse_output
+                or _parser_name_for_model(self.model_dir) != "gemma4"):
+            return text
+        if not token_ids:
+            if text:
+                raise ToolProtocolError("decode_failed")
+            return ""
+        try:
+            decoded = self._get_tool_template_formatter().decode_tokens(
+                token_ids)
+        except Exception:
+            raise ToolProtocolError("decode_failed") from None
+        if not isinstance(decoded, str):
+            raise ToolProtocolError("decode_failed")
+        # Native output_ids include tokens past stop-string truncation.
+        stops = [decoded.find(stop) for stop in stop_strings if stop]
+        matched = [position for position in stops if position >= 0]
+        if matched:
+            decoded = decoded[:min(matched)]
+        terminals = ("<turn|>", "<eos>", "<|im_end|>")
+        while True:
+            stripped = decoded.rstrip()
+            terminal = next(
+                (token for token in terminals if stripped.endswith(token)),
+                None)
+            if terminal is None:
+                return decoded
+            decoded = stripped[:-len(terminal)]
+
     def _parse_generation_output(
         self,
         text: str,
@@ -1604,6 +1642,10 @@ class LLM:
                 if response.finish_reasons else "stop"
             lps = _convert_logprobs(response.logprobs[0]) if (
                 params.num_logprobs > 0 and response.logprobs) else []
+            text = self.decode_tool_output(text,
+                                           ids,
+                                           tool_config,
+                                           stop_strings=params.stop)
             out = self._parse_generation_output(text, ids, reason, tool_config)
             out.logprobs = lps
             outputs.append(out)
@@ -1653,7 +1695,12 @@ class LLM:
         params = sampling_params or SamplingParams()
 
         channel = self._rt.StreamChannel.create()
-        channel.set_skip_special_tokens(True)
+        tool_config = validate_tool_request(messages, tools, tool_choice)
+        preserve_tool_tokens = (tool_config.parse_output
+                                and _parser_name_for_model(
+                                    self.model_dir) == "gemma4")
+        # Gemma call framing and string quotes are special tokens, not decoration.
+        channel.set_skip_special_tokens(not preserve_tool_tokens)
 
         # Admission spans decode through inference; the HTTP layer acquires
         # it itself before prebuilding (and owns the release), so only the

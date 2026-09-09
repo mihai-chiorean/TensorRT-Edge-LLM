@@ -2496,3 +2496,107 @@ def test_include_usage_rejects_non_bool(client_and_llm):
         },
     )
     assert resp.status_code == 400
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/chat/completions", "/v1/messages"])
+def test_nonstream_recovers_tool_delimiters_from_ids(client_and_llm, tmp_path,
+                                                     endpoint):
+    client, llm = client_and_llm
+    (tmp_path / "config.json").write_text('{"model_type":"gemma4"}')
+    llm.model_dir = str(tmp_path)
+    llm._runtime._resp_text = 'call:lookup{query:alpha, beta}'
+    observed = []
+
+    def decode(text, ids, config, stop_strings=()):
+        observed.append((text, ids, list(stop_strings), config.parse_output))
+        return '<|tool_call>call:lookup{query:<|"|>alpha, beta<|"|>}<tool_call|>'
+
+    llm.decode_tool_output = decode
+    schema = {"type": "object", "properties": {"query": {"type": "string"}}}
+    body = {
+        "model": "gemma",
+        "messages": [{
+            "role": "user",
+            "content": "Look up alpha and beta"
+        }],
+        "max_tokens": 64
+    }
+    if endpoint == "/v1/messages":
+        body.update(tools=[{
+            "name": "lookup",
+            "description": "Look up facts",
+            "input_schema": schema
+        }],
+                    stop_sequences=["END"])
+    else:
+        body.update(tools=[{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": schema
+            }
+        }],
+                    stop=["END"])
+    response = client.post(endpoint, json=body)
+    assert response.status_code == 200, response.text
+    assert observed == [('call:lookup{query:alpha, beta}', [1, 2,
+                                                            3], ['END'], True)]
+    if endpoint == "/v1/messages":
+        assert response.json()["content"][0]["input"] == {
+            "query": "alpha, beta"
+        }
+    else:
+        call = response.json()["choices"][0]["message"]["tool_calls"][0]
+        assert json.loads(call["function"]["arguments"]) == {
+            "query": "alpha, beta"
+        }
+
+
+def test_tool_stream_removes_split_terminal_not_string_markers(
+        client_and_llm, tmp_path):
+    from experimental.server.engine import StreamDelta
+    client, llm = client_and_llm
+    (tmp_path / "config.json").write_text('{"model_type":"gemma4"}')
+    (tmp_path / "tokenizer_config.json").write_text('{"eot_token":"<turn|>"}')
+    llm.model_dir = str(tmp_path)
+
+    def stream(*args, **kwargs):
+        for piece in ["Hello.", "<tu", "rn|>"]:
+            yield StreamDelta(text=piece, token_ids=[1])
+        yield StreamDelta(text="",
+                          token_ids=[],
+                          finished=True,
+                          finish_reason="stop")
+
+    llm.generate_stream = stream
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Hi"
+                               }],
+                               "stream":
+                               True,
+                               "tools": [{
+                                   "type": "function",
+                                   "function": {
+                                       "name": "lookup",
+                                       "parameters": {
+                                           "type": "object",
+                                           "properties": {
+                                               "query": {
+                                                   "type": "string"
+                                               }
+                                           }
+                                       }
+                                   }
+                               }]
+                           })
+    payloads = [
+        json.loads(line[6:]) for line in response.text.splitlines()
+        if line.startswith("data: {")
+    ]
+    assert response.status_code == 200
+    assert "<turn|>" not in response.text
+    assert ''.join(p["choices"][0]["delta"].get("content", "")
+                   for p in payloads if p.get("choices")) == "Hello."

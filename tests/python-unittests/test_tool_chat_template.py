@@ -14,6 +14,9 @@
 # limitations under the License.
 
 import json
+from types import SimpleNamespace
+
+import pytest
 
 from experimental.server.tool_chat_template import (
     ToolChatTemplateFormatter, needs_tool_chat_template,
@@ -62,6 +65,29 @@ class _RecordingTemplateOwner:
             sort_keys=True)
 
 
+@pytest.mark.parametrize("processor", [False, True])
+def test_decode_tokens_reuses_template_tokenizer_and_preserves_protocol(
+        processor):
+
+    class _Tokenizer:
+        calls = []
+
+        def decode(self, ids, **kwargs):
+            self.calls.append((ids, kwargs))
+            return '<|tool_call>call:f{x:<|"|>é,{}<|"|>}<tool_call|><turn|>'
+
+    tokenizer = _Tokenizer()
+    owner = SimpleNamespace(tokenizer=tokenizer) if processor else tokenizer
+    formatter = ToolChatTemplateFormatter([], template_owner=owner)
+    decoded = formatter.decode_tokens((48, 52, 52, 49))
+    assert decoded.endswith("<tool_call|><turn|>")
+    assert '<|"|>é,{}<|"|>' in decoded
+    assert tokenizer.calls == [([48, 52, 52, 49], {
+        "skip_special_tokens": False,
+        "clean_up_tokenization_spaces": False,
+    })]
+
+
 def test_formats_tool_template():
     owner = _RecordingTemplateOwner()
     formatter = ToolChatTemplateFormatter([], template_owner=owner)
@@ -107,8 +133,7 @@ def test_formats_tool_template():
     formatted = json.loads(prompt)
     assert formatted["messages"][0]["role"] == "system"
     assert "must call the declared tool get_weather exactly once" in (
-        formatted["messages"][0]["content"]
-    )
+        formatted["messages"][0]["content"])
     tool_call = formatted["messages"][1]["tool_calls"][0]
     tool_message = formatted["messages"][2]
     assert formatted["tools"] == tools
@@ -127,11 +152,19 @@ def test_required_tool_instruction_extends_existing_system_turn():
     owner = _RecordingTemplateOwner()
     formatter = ToolChatTemplateFormatter([], template_owner=owner)
     formatter.format(
-        [{"role": "system", "content": "trusted boundary"},
-         {"role": "user", "content": "do it"}],
+        [{
+            "role": "system",
+            "content": "trusted boundary"
+        }, {
+            "role": "user",
+            "content": "do it"
+        }],
         tools=[{
             "type": "function",
-            "function": {"name": "set_volume", "parameters": {}},
+            "function": {
+                "name": "set_volume",
+                "parameters": {}
+            },
         }],
         tool_choice="required",
     )
@@ -139,8 +172,7 @@ def test_required_tool_instruction_extends_existing_system_turn():
     assert owner.messages[0]["role"] == "system"
     assert owner.messages[0]["content"].startswith("trusted boundary\n\n")
     assert "must call exactly one of the declared tools" in (
-        owner.messages[0]["content"]
-    )
+        owner.messages[0]["content"])
     assert owner.messages[1] == {"role": "user", "content": "do it"}
 
 
