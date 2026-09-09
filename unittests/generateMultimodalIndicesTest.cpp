@@ -16,7 +16,10 @@
  */
 
 #include "common/tensor.h"
+#include "kernels/embeddingKernels/embeddingKernels.h"
 #include "runtime/llmRuntimeUtils.h"
+#include <cuda_runtime.h>
+#include <functional>
 #include <gtest/gtest.h>
 #include <optional>
 #include <vector>
@@ -123,6 +126,91 @@ TEST(GenerateVisionBlockIds, BlockIdsRestartPerBatch)
     auto result = rt::generateVisionBlockIds(ids, kImageTok);
     auto v = toVec(result);
     EXPECT_EQ(v, (std::vector<int32_t>{0, -1, 1, -1, 0, 0}));
+}
+
+// Row bases restart each row's counters at the encoder rows its placeholders occupy.
+TEST(GenerateMultimodalIndices, RowBasesOffsetSuffixRows)
+{
+    int32_t constexpr kAudioTok = 99;
+    int32_t constexpr kImageTok = 50;
+    // Row 0 is a suffix whose reused prefix already consumed 3 image rows; row 1 begins after
+    // row 0's full input (5 image rows) plus one reused audio row.
+    auto ids = makeCpuIds({kImageTok, kImageTok, 10, kAudioTok, kImageTok, kAudioTok}, 2, 3);
+    rt::MultimodalRowBases const bases{{3, 5}, {0, 1}};
+    auto result = rt::generateMultimodalIndices(ids, kAudioTok, kImageTok, &bases);
+    auto v = toVec(result);
+    EXPECT_EQ(v, (std::vector<int32_t>{3, 4, 0, 1, 5, 2}));
+}
+
+TEST(ComputeMultimodalRowBases, SuffixInsideMediaRunSkipsReusedRows)
+{
+    int32_t constexpr kImageTok = 50;
+    int32_t constexpr kAudioTok = 99;
+    // [sys, sys, img x6, txt] with a reused prefix of 5 tokens: 3 image rows lie inside the prefix.
+    std::vector<std::vector<int32_t>> const inputs{
+        {1, 2, kImageTok, kImageTok, kImageTok, kImageTok, kImageTok, kImageTok, 3},
+        {kAudioTok, kAudioTok, kImageTok, 4},
+    };
+    auto const bases = rt::computeMultimodalRowBases(inputs, {5, 1}, kImageTok, kAudioTok);
+    EXPECT_EQ(bases.image, (std::vector<int32_t>{3, 6}));
+    EXPECT_EQ(bases.audio, (std::vector<int32_t>{0, 1}));
+}
+
+TEST(ComputeMultimodalRowBases, NoReuseMatchesGlobalCounters)
+{
+    int32_t constexpr kImageTok = 50;
+    std::vector<std::vector<int32_t>> const inputs{{kImageTok, 1, kImageTok}, {2, kImageTok}, {3}};
+    auto const bases = rt::computeMultimodalRowBases(inputs, {0, 0, 0}, kImageTok, std::nullopt);
+    EXPECT_EQ(bases.image, (std::vector<int32_t>{0, 2, 3}));
+    EXPECT_EQ(bases.audio, (std::vector<int32_t>{0, 0, 0}));
+}
+
+TEST(ComputeMultimodalRowBases, RejectsPrefixBeyondInput)
+{
+    std::vector<std::vector<int32_t>> const inputs{{1, 2, 3}};
+    EXPECT_THROW(rt::computeMultimodalRowBases(inputs, {4}, 50, std::nullopt), std::exception);
+}
+
+// The device kernel agrees with the host reference, with and without row bases.
+TEST(GenerateMultimodalIndices, DeviceKernelMatchesHostReference)
+{
+    int32_t constexpr kAudioTok = 99;
+    int32_t constexpr kImageTok = 50;
+    std::vector<int32_t> const tokens{kImageTok, kImageTok, 10, kAudioTok, kImageTok, kAudioTok, kImageTok, 11};
+    auto hostIds = makeCpuIds(tokens, 2, 4);
+    rt::MultimodalRowBases const bases{{7, 9}, {2, 4}};
+
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    rt::Tensor deviceIds({2, 4}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor deviceIndices({2, 4}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor deviceBases({2, 2}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    std::vector<int32_t> const flatBases{bases.image[0], bases.audio[0], bases.image[1], bases.audio[1]};
+    ASSERT_EQ(
+        cudaMemcpy(deviceIds.rawPointer(), tokens.data(), tokens.size() * sizeof(int32_t), cudaMemcpyHostToDevice),
+        cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(deviceBases.rawPointer(), flatBases.data(), flatBases.size() * sizeof(int32_t),
+                  cudaMemcpyHostToDevice),
+        cudaSuccess);
+
+    auto readBack = [&]() {
+        std::vector<int32_t> out(tokens.size());
+        EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        EXPECT_EQ(
+            cudaMemcpy(out.data(), deviceIndices.rawPointer(), out.size() * sizeof(int32_t), cudaMemcpyDeviceToHost),
+            cudaSuccess);
+        return out;
+    };
+
+    kernel::generateMultimodalIndices(deviceIds, deviceIndices, kImageTok, kAudioTok, stream);
+    EXPECT_EQ(readBack(), toVec(rt::generateMultimodalIndices(hostIds, kAudioTok, kImageTok)));
+
+    kernel::generateMultimodalIndices(
+        deviceIds, deviceIndices, kImageTok, kAudioTok, stream, rt::OptionalInputTensor{std::ref(deviceBases)});
+    EXPECT_EQ(readBack(), toVec(rt::generateMultimodalIndices(hostIds, kAudioTok, kImageTok, &bases)));
+    EXPECT_EQ(readBack(), (std::vector<int32_t>{7, 8, 0, 2, 9, 4, 10, 0}));
+
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 }
 
 TEST(LLMRuntimeUtils, ClampMaxGenerateLengthForKVCapacitySingleBatch)

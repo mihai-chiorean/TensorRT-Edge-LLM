@@ -85,9 +85,13 @@ void assembleDeepstackEmbedding(rt::Tensor const& inputIds, rt::Tensor const& de
 //! \param[in]  imageTokenId      Image placeholder token id, or std::nullopt if no image
 //! \param[in]  audioTokenId      Audio placeholder token id, or std::nullopt if no audio
 //! \param[in]  stream            CUDA stream for execution
+//! \param[in]  rowBases          Optional GPU INT32 tensor [batchSize, 2]; column 0 (image) and column 1 (audio)
+//!                               hold the encoder row at which each batch row's counter starts. Lets a row whose
+//!                               tokens are a suffix of a longer input (reused KV prefix) address the encoder rows
+//!                               that belong to its placeholders. Absent means both counters start at zero.
 void generateMultimodalIndices(rt::Tensor const& inputIds, rt::Tensor& multimodalIndices,
     std::optional<int32_t> imageTokenId = std::nullopt, std::optional<int32_t> audioTokenId = std::nullopt,
-    cudaStream_t stream = nullptr);
+    cudaStream_t stream = nullptr, rt::OptionalInputTensor rowBases = std::nullopt);
 
 //! \brief Gather Gemma4 per-layer token-identity embeddings.
 //!

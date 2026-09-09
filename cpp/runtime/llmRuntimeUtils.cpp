@@ -763,13 +763,49 @@ int32_t clampMaxGenerateLengthForKVCapacity(std::vector<int32_t> const& effectiv
     return clampedMaxGenerateLength;
 }
 
-rt::Tensor generateMultimodalIndices(
-    rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId, std::optional<int32_t> imageTokenId)
+MultimodalRowBases computeMultimodalRowBases(std::vector<std::vector<int32_t>> const& fullInputIds,
+    std::vector<int32_t> const& prefixLengths, std::optional<int32_t> imageTokenId, std::optional<int32_t> audioTokenId)
+{
+    check::check(fullInputIds.size() == prefixLengths.size(), "prefixLengths must describe every sequence");
+    MultimodalRowBases bases;
+    bases.image.reserve(fullInputIds.size());
+    bases.audio.reserve(fullInputIds.size());
+
+    auto countTokens = [](std::vector<int32_t> const& ids, size_t end, std::optional<int32_t> tokenId) {
+        if (!tokenId.has_value())
+        {
+            return int32_t{0};
+        }
+        return static_cast<int32_t>(std::count(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(end), *tokenId));
+    };
+
+    int32_t imageRows = 0;
+    int32_t audioRows = 0;
+    for (size_t b = 0; b < fullInputIds.size(); ++b)
+    {
+        std::vector<int32_t> const& ids = fullInputIds[b];
+        check::check(prefixLengths[b] >= 0 && static_cast<size_t>(prefixLengths[b]) <= ids.size(),
+            "Reused prefix length is outside the input sequence");
+        size_t const prefix = static_cast<size_t>(prefixLengths[b]);
+        bases.image.push_back(imageRows + countTokens(ids, prefix, imageTokenId));
+        bases.audio.push_back(audioRows + countTokens(ids, prefix, audioTokenId));
+        imageRows += countTokens(ids, ids.size(), imageTokenId);
+        audioRows += countTokens(ids, ids.size(), audioTokenId);
+    }
+    return bases;
+}
+
+rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId,
+    std::optional<int32_t> imageTokenId, MultimodalRowBases const* rowBases)
 {
     auto const shape = inputIds.getShape();
     check::check(shape.getNumDims() == 2, "inputIds must be 2D tensor");
     int64_t const batchSize = shape[0];
     int64_t const seqLen = shape[1];
+    check::check(rowBases == nullptr
+            || (static_cast<int64_t>(rowBases->image.size()) == batchSize
+                && static_cast<int64_t>(rowBases->audio.size()) == batchSize),
+        "rowBases must describe every batch row");
 
     rt::Tensor multimodalIndices({batchSize, seqLen}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32);
 
@@ -781,6 +817,11 @@ rt::Tensor generateMultimodalIndices(
 
     for (int64_t b = 0; b < batchSize; ++b)
     {
+        if (rowBases != nullptr)
+        {
+            imageIndex = rowBases->image[static_cast<size_t>(b)];
+            audioIndex = rowBases->audio[static_cast<size_t>(b)];
+        }
         for (int64_t s = 0; s < seqLen; ++s)
         {
             int64_t const pos = b * seqLen + s;

@@ -305,7 +305,12 @@ private:
     rt::Tensor mHostReuseKVCacheLengths; //!< Host pinned memory for reuse KV cache lengths
 
     // [5] Multimodal support tensors for audio/image token indexing
-    rt::Tensor mMultimodalIndices; //!< Multimodal indices tensor [batchSize, seqLen] for audio/image embeddings
+    rt::Tensor mMultimodalIndices;      //!< Multimodal indices tensor [batchSize, seqLen] for audio/image embeddings
+    rt::Tensor mHostMultimodalRowBases; //!< Host pinned [batchSize, 2] encoder row bases (image, audio) per row
+    rt::Tensor mMultimodalRowBases;     //!< GPU copy of mHostMultimodalRowBases consumed by the index kernel
+    cudaEvent_t mVisionEncoderStart{};  //!< Bracket the vision encoder enqueue for per-request timing
+    cudaEvent_t mVisionEncoderStop{};
+    bool mVisionEncoderTimed{false}; //!< Set when the current request enqueued the vision encoder
 
     // [6] Logprobs support tensors. Non-Diffusion paths allocate at construction to preserve existing behavior.
     // DiffusionGemma allocates lazily when a request asks for numLogprobs because its row count is B * canvasLen.

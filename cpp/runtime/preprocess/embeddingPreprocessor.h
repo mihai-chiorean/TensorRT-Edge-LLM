@@ -60,8 +60,11 @@ public:
     //! @param audioEmbeds  Optional audio embeddings.
     //! @param io           Pipeline I/O – `inputsEmbeds` is written.
     //! @param stream       CUDA stream for execution.
+    //! @param multimodalRowBases Optional GPU INT32 tensor [batchSize, 2] with the encoder row at which each
+    //!                     row's image (column 0) and audio (column 1) placeholders start; required whenever
+    //!                     `tokenIds` is a suffix of the input the encoders saw (reused KV prefix).
     void embed(Tensor const& tokenIds, OptionalInputTensor visionEmbeds, OptionalInputTensor audioEmbeds,
-        PipelineIO& io, cudaStream_t stream);
+        PipelineIO& io, cudaStream_t stream, OptionalInputTensor multimodalRowBases = std::nullopt);
 
     //! Assemble deepstack features at image placeholder positions.
     //!
