@@ -80,18 +80,21 @@ def _apply_generic_token_ids(config: Dict[str, Any], root: Dict[str, Any],
             if isinstance(value, int):
                 config[runtime_key] = value
 
-    eos = root.get("eos_token_id")
+    # generation_config.json can add stop tokens absent from the model
+    # config, such as Gemma 4's <|tool_response> handoff token (50), so it
+    # takes precedence over both config files.
+    eos = None
+    generation_path = os.path.join(runtime_model_dir, "generation_config.json")
+    if os.path.isfile(generation_path):
+        with open(generation_path) as generation_file:
+            eos = json.load(generation_file).get("eos_token_id")
+    if eos is None:
+        eos = root.get("eos_token_id")
     if eos is None:
         runtime_config_path = os.path.join(runtime_model_dir, "config.json")
         if os.path.isfile(runtime_config_path):
             with open(runtime_config_path) as runtime_config_file:
                 eos = json.load(runtime_config_file).get("eos_token_id")
-    if eos is None:
-        generation_path = os.path.join(runtime_model_dir,
-                                       "generation_config.json")
-        if os.path.isfile(generation_path):
-            with open(generation_path) as generation_file:
-                eos = json.load(generation_file).get("eos_token_id")
     if eos is not None:
         config["eos_token_id"] = ([int(value) for value in eos] if isinstance(
             eos, list) else [int(eos)])
