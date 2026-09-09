@@ -36,7 +36,7 @@ EmbeddingPreprocessor::EmbeddingPreprocessor(EmbeddingData const& embedding, LLM
 }
 
 void EmbeddingPreprocessor::embed(Tensor const& tokenIds, OptionalInputTensor visionEmbeds,
-    OptionalInputTensor audioEmbeds, PipelineIO& io, cudaStream_t stream)
+    OptionalInputTensor audioEmbeds, PipelineIO& io, cudaStream_t stream, OptionalInputTensor multimodalRowBases)
 {
     // Prefill embeds every modality through the single embeddingLookup kernel:
     // image/audio embeddings are inserted at the imageTokenId / audioTokenId
@@ -55,7 +55,8 @@ void EmbeddingPreprocessor::embed(Tensor const& tokenIds, OptionalInputTensor vi
         // result stays on-device for embeddingLookup. Cached in `mMultimodalIndices` and reused by a
         // following assembleDeepstack() for these same tokens (no recomputation).
         mMultimodalIndices = Tensor(tokenIds.getShape(), DeviceType::kGPU, tokenIds.getDataType());
-        kernel::generateMultimodalIndices(tokenIds, mMultimodalIndices, imageTokenOpt, audioTokenOpt, stream);
+        kernel::generateMultimodalIndices(
+            tokenIds, mMultimodalIndices, imageTokenOpt, audioTokenOpt, stream, multimodalRowBases);
 
         kernel::embeddingLookup(tokenIds, mEmbedding.table, mEmbedding.scalesAsOptional(), io.inputsEmbeds, stream,
             std::optional{std::ref(mMultimodalIndices)}, imageTokenOpt, visionEmbeds, audioTokenOpt, audioEmbeds);

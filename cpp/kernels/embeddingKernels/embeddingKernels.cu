@@ -409,12 +409,13 @@ void launchGemma4PleGatherInt8(int32_t const* inputIds, int8_t const* pleTable, 
 
 // Generate multimodal indices on-device: for each image/audio placeholder position, store the running
 // count of that modality's placeholders seen so far (its row in imageEmbeds/audioEmbeds); other
-// positions get 0. The counters are global across the whole [batchSize, seqLen] range in batch-major
-// order (they are not reset per row), matching the host reference. The scan is inherently sequential, so
-// a single thread performs it; the buffer is a prefill-length row of ints and this runs once per prefill,
+// positions get 0. Without rowBases the counters are global across the whole [batchSize, seqLen] range
+// in batch-major order (they are not reset per row), matching the host reference; with rowBases each row
+// restarts its counters at the supplied encoder rows. The scan is inherently sequential, so a single
+// thread performs it; the buffer is a prefill-length row of ints and this runs once per prefill,
 // avoiding any device<->host copy to build the indices.
-__global__ void generateMultimodalIndicesKernel(
-    int32_t const* inputIds, int32_t* multimodalIndices, int64_t total, int32_t imageTokenId, int32_t audioTokenId)
+__global__ void generateMultimodalIndicesKernel(int32_t const* inputIds, int32_t const* rowBases,
+    int32_t* multimodalIndices, int64_t batchSize, int64_t seqLen, int32_t imageTokenId, int32_t audioTokenId)
 {
     if (blockIdx.x != 0 || threadIdx.x != 0)
     {
@@ -422,26 +423,36 @@ __global__ void generateMultimodalIndicesKernel(
     }
     int32_t imageIndex = 0;
     int32_t audioIndex = 0;
-    for (int64_t pos = 0; pos < total; ++pos)
+    for (int64_t b = 0; b < batchSize; ++b)
     {
-        int32_t const tokenId = inputIds[pos];
-        if (audioTokenId >= 0 && tokenId == audioTokenId)
+        if (rowBases != nullptr)
         {
-            multimodalIndices[pos] = audioIndex++;
+            imageIndex = rowBases[2 * b];
+            audioIndex = rowBases[2 * b + 1];
         }
-        else if (imageTokenId >= 0 && tokenId == imageTokenId)
+        for (int64_t s = 0; s < seqLen; ++s)
         {
-            multimodalIndices[pos] = imageIndex++;
-        }
-        else
-        {
-            multimodalIndices[pos] = 0;
+            int64_t const pos = b * seqLen + s;
+            int32_t const tokenId = inputIds[pos];
+            if (audioTokenId >= 0 && tokenId == audioTokenId)
+            {
+                multimodalIndices[pos] = audioIndex++;
+            }
+            else if (imageTokenId >= 0 && tokenId == imageTokenId)
+            {
+                multimodalIndices[pos] = imageIndex++;
+            }
+            else
+            {
+                multimodalIndices[pos] = 0;
+            }
         }
     }
 }
 
 void generateMultimodalIndices(rt::Tensor const& inputIds, rt::Tensor& multimodalIndices,
-    std::optional<int32_t> imageTokenId, std::optional<int32_t> audioTokenId, cudaStream_t stream)
+    std::optional<int32_t> imageTokenId, std::optional<int32_t> audioTokenId, cudaStream_t stream,
+    rt::OptionalInputTensor rowBases)
 {
     auto const inputShape = inputIds.getShape();
     check::check(inputShape.getNumDims() == 2, "inputIds must be 2D tensor [batchSize, seqLen]");
@@ -450,9 +461,20 @@ void generateMultimodalIndices(rt::Tensor const& inputIds, rt::Tensor& multimoda
     check::check(inputIds.getDataType() == nvinfer1::DataType::kINT32, "inputIds must be INT32");
     check::check(multimodalIndices.getDataType() == nvinfer1::DataType::kINT32, "multimodalIndices must be INT32");
 
-    int64_t const total = inputShape.volume();
-    generateMultimodalIndicesKernel<<<1, 1, 0, stream>>>(inputIds.dataPointer<int32_t>(),
-        multimodalIndices.dataPointer<int32_t>(), total, imageTokenId.value_or(-1), audioTokenId.value_or(-1));
+    int32_t const* rowBasesPtr = nullptr;
+    if (rowBases.has_value())
+    {
+        rt::Tensor const& bases = rowBases.value().get();
+        check::check(bases.getDataType() == nvinfer1::DataType::kINT32, "rowBases must be INT32");
+        check::check(
+            bases.getShape().getNumDims() == 2 && bases.getShape()[0] == inputShape[0] && bases.getShape()[1] == 2,
+            "rowBases must have shape [batchSize, 2]");
+        rowBasesPtr = bases.dataPointer<int32_t>();
+    }
+
+    generateMultimodalIndicesKernel<<<1, 1, 0, stream>>>(inputIds.dataPointer<int32_t>(), rowBasesPtr,
+        multimodalIndices.dataPointer<int32_t>(), inputShape[0], inputShape[1], imageTokenId.value_or(-1),
+        audioTokenId.value_or(-1));
 }
 
 void assembleDeepstackEmbedding(rt::Tensor const& inputIds, rt::Tensor const& deepstackFeatures,

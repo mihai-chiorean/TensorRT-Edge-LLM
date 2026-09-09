@@ -159,60 +159,6 @@ BlockHash hashRequestExactPrefix(int32_t const* tokens, size_t tokenCount, Block
               tokens, static_cast<int32_t>(tokenCount), fullBlockHashes, extras, perPositionMediaHash);
 }
 
-//! Trim trailing reused pages from a vanilla reuse plan when media tokens span across the reuse boundary.
-//!
-//! Without an encoder embedding cache, the runtime cannot slice cached ViT/audio embeddings to provide only the
-//! suffix portion. If the reuse boundary falls inside a contiguous media run, the suffix would contain media
-//! placeholders whose embedding indices don't start at zero in the full encoder output. This trims back until
-//! the boundary no longer splits a media run.
-void trimMediaBoundaryPages(ReusePlan& plan, Hash128 const* perPositionMediaHash, size_t tokenCount)
-{
-    if (perPositionMediaHash == nullptr || plan.basePageBindings.empty())
-    {
-        return;
-    }
-
-    int32_t const pageSize = kTOKENS_PER_PAGE;
-    Hash128 const kZERO{};
-
-    while (!plan.basePageBindings.empty())
-    {
-        int32_t const reuseLen = static_cast<int32_t>(plan.basePageBindings.size()) * pageSize;
-        // Check if the token at the reuse boundary (first suffix token) is a media token.
-        bool const suffixStartsWithMedia
-            = static_cast<size_t>(reuseLen) < tokenCount && perPositionMediaHash[reuseLen] != kZERO;
-        // Check if the last token of the last reused page is a media token.
-        bool const lastReusedIsMedia = reuseLen > 0 && perPositionMediaHash[reuseLen - 1] != kZERO;
-
-        if (suffixStartsWithMedia && lastReusedIsMedia)
-        {
-            // Media run spans across the reuse boundary — trim the last page.
-            plan.basePageBindings.pop_back();
-            plan.matchedBlockHashes.pop_back();
-        }
-        else
-        {
-            break;
-        }
-    }
-
-    // Update plan fields to reflect trimmed state.
-    int64_t const reusablePageCount = static_cast<int64_t>(plan.basePageBindings.size());
-    int64_t const totalInputPages
-        = (static_cast<int64_t>(tokenCount) + static_cast<int64_t>(pageSize) - 1) / static_cast<int64_t>(pageSize);
-    plan.reuseTokenLength = static_cast<int32_t>(reusablePageCount * static_cast<int64_t>(pageSize));
-    plan.matchedTokenLength = plan.reuseTokenLength;
-    plan.demand.baseKvPages = static_cast<int32_t>(totalInputPages - reusablePageCount);
-    if (plan.basePageBindings.empty())
-    {
-        plan.kind = ReusePlanKind::kNoReusablePrefix;
-    }
-    else
-    {
-        plan.kind = ReusePlanKind::kStandard;
-    }
-}
-
 int32_t pageCountForStateLength(int32_t stateLength)
 {
     ELLM_CHECK(stateLength >= 0, "Context cache state length must be non-negative");
@@ -526,14 +472,6 @@ ContextCacheCoordinator::AcquireSequenceResult ContextCacheCoordinator::acquireS
     {
         acquired = acquire(ContextCacheLookupPolicy::kBypass);
         forcedCold = true;
-    }
-
-    // When media-aware hashing is active, trim trailing reused pages that would split a contiguous media run
-    // across the reuse boundary. Without an encoder embedding cache, the runtime cannot supply correctly-offset
-    // embeddings for partial media context in the suffix.
-    if (!admission.perPositionMediaHash.empty() && acquired.plan.reuseTokenLength > 0)
-    {
-        trimMediaBoundaryPages(acquired.plan, admission.perPositionMediaHash.data(), admission.tokenIds.size());
     }
 
     auto const planningEnd = std::chrono::steady_clock::now();

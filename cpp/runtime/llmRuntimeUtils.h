@@ -380,19 +380,43 @@ EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cud
 int32_t clampMaxGenerateLengthForKVCapacity(std::vector<int32_t> const& effectivePrefillLengths,
     int32_t requestedMaxGenerateLength, int32_t kvCacheCapacity, int32_t kvCacheReserveLength);
 
+//! Encoder-output row at which each batch row's first image and audio placeholder starts.
+//! Encoders pack every placeholder of every sequence in batch order, so a row whose reused KV
+//! prefix already covers some placeholders starts past them.
+struct MultimodalRowBases
+{
+    std::vector<int32_t> image;
+    std::vector<int32_t> audio;
+};
+
+/*!
+ * @brief Compute the encoder row bases for a batch whose prefill may start after a reused prefix
+ *
+ * @param fullInputIds Complete token IDs per sequence, as given to the encoder
+ * @param prefixLengths Per-sequence count of leading tokens whose KV state is reused (not prefilled)
+ * @param imageTokenId Image placeholder token id, or std::nullopt if none
+ * @param audioTokenId Audio placeholder token id, or std::nullopt if none
+ * @return Per-sequence bases; a modality with no placeholder id yields zeros
+ */
+MultimodalRowBases computeMultimodalRowBases(std::vector<std::vector<int32_t>> const& fullInputIds,
+    std::vector<int32_t> const& prefixLengths, std::optional<int32_t> imageTokenId,
+    std::optional<int32_t> audioTokenId);
+
 /*!
  * @brief Generate multimodal indices for embeddingLookup kernel
  *
  * Scans input IDs and generates sequential indices for audio/image embeddings.
- * Audio and image indices are tracked independently, both globally across batches.
+ * Audio and image indices are tracked independently, both globally across batches unless
+ * rowBases restarts them per row.
  *
  * @param inputIds Input token IDs on CPU [batchSize, seqLen]
  * @param audioTokenId Special token ID for audio, or std::nullopt if no audio
  * @param imageTokenId Special token ID for image, or std::nullopt if no image
+ * @param rowBases Optional per-row starting rows for each modality
  * @return multimodalIndices tensor on CPU [batchSize, seqLen]
  */
-rt::Tensor generateMultimodalIndices(
-    rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId, std::optional<int32_t> imageTokenId);
+rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId,
+    std::optional<int32_t> imageTokenId, MultimodalRowBases const* rowBases = nullptr);
 
 /*! \brief Build Gemma4 block IDs from host token IDs.
  *

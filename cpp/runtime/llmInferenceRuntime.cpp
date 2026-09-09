@@ -167,6 +167,14 @@ LLMInferenceRuntime::~LLMInferenceRuntime() noexcept
         LOG_ERROR("Context-cache shutdown could not prove stream quiescence.");
         std::terminate();
     }
+    if (mVisionEncoderStart != nullptr)
+    {
+        cudaEventDestroy(mVisionEncoderStart);
+    }
+    if (mVisionEncoderStop != nullptr)
+    {
+        cudaEventDestroy(mVisionEncoderStop);
+    }
 }
 
 void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::string const& multimodalEngineDir,
@@ -414,6 +422,12 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
         // Pre-allocate multimodal indices tensor (used for audio/vision embedding lookup).
         mMultimodalIndices = rt::Tensor({mMaxRuntimeBatchSize, maxInputLength}, rt::DeviceType::kGPU, DataType::kINT32,
             "LLMInferenceRuntime::mMultimodalIndices");
+        mHostMultimodalRowBases = rt::Tensor({mMaxRuntimeBatchSize, 2}, rt::DeviceType::kCPU, DataType::kINT32,
+            "LLMInferenceRuntime::mHostMultimodalRowBases");
+        mMultimodalRowBases = rt::Tensor({mMaxRuntimeBatchSize, 2}, rt::DeviceType::kGPU, DataType::kINT32,
+            "LLMInferenceRuntime::mMultimodalRowBases");
+        CUDA_CHECK(cudaEventCreate(&mVisionEncoderStart));
+        CUDA_CHECK(cudaEventCreate(&mVisionEncoderStop));
 
         if (mLogprobsMaxBatchDim > 0)
         {
@@ -1023,6 +1037,15 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         LOG_ERROR("Failed to execute prefill step for base model.");
         return false;
     }
+    if (mVisionEncoderTimed)
+    {
+        // Prefill already drained the stream for its sampled token, so this does not stall.
+        CUDA_CHECK(cudaEventSynchronize(mVisionEncoderStop));
+        float visionEncoderMs = 0.0F;
+        CUDA_CHECK(cudaEventElapsedTime(&visionEncoderMs, mVisionEncoderStart, mVisionEncoderStop));
+        LOG_INFO("Vision encoder: %.2f ms", visionEncoderMs);
+        mVisionEncoderTimed = false;
+    }
 
     if (managedRequest != nullptr && !decodingStrategy.initializeForGeneration(context))
     {
@@ -1540,6 +1563,7 @@ bool LLMInferenceRuntime::multiModalRuntimePreprocess(
     context.visualEmbeddings = std::nullopt;
     context.audioEmbeddings = std::nullopt;
     context.deepstackFeatures.clear();
+    mVisionEncoderTimed = false;
     // Treat multimodal indices as request-scoped state. Only request paths that explicitly rebuild
     // mMultimodalIndices for the current request should observe a non-empty tensor downstream.
     check::check(mMultimodalIndices.reshape({0}), "Tensor reshape failed");
@@ -1582,11 +1606,15 @@ bool LLMInferenceRuntime::multiModalRuntimePreprocess(
             return false;
         }
 
+        NVTX_SCOPED_RANGE(nvtx_vision, "VISION_ENCODER", nvtx_colors::ORANGE);
+        CUDA_CHECK(cudaEventRecord(mVisionEncoderStart, stream));
         if (!mVisionRunner->infer(stream))
         {
             LOG_ERROR("Vision inference failed. This request cannot be handled.");
             return false;
         }
+        CUDA_CHECK(cudaEventRecord(mVisionEncoderStop, stream));
+        mVisionEncoderTimed = true;
     }
 
     // Process action inputs (if present)
@@ -1750,7 +1778,39 @@ bool LLMInferenceRuntime::runBaseModelPrefill(
 
     // Embedding lookup (text / vision / audio-multimodal) into mPipelineIO->inputsEmbeds;
     // deepstack slots are populated from features or zero-filled depending on the request.
-    mEmbeddingPre->embed(mIdsInput, context.visualEmbeddings, context.audioEmbeddings, *mPipelineIO, context.stream);
+    // The encoders saw the full inputs, so a sequence prefilled from a reused prefix must
+    // address its placeholders past the rows that prefix already consumed.
+    rt::OptionalInputTensor multimodalRowBases;
+    if (context.visualEmbeddings.has_value() || context.audioEmbeddings.has_value())
+    {
+        std::vector<int32_t> prefixLengths(static_cast<size_t>(activeBatchSize));
+        for (int32_t i = 0; i < activeBatchSize; ++i)
+        {
+            size_t const fullLength = context.rawBatchedInputIds[i].size();
+            size_t const prefillLength = context.tokenIds[i].size();
+            ELLM_CHECK(prefillLength <= fullLength, "Prefill tokens must be a suffix of the raw input");
+            prefixLengths[static_cast<size_t>(i)] = static_cast<int32_t>(fullLength - prefillLength);
+        }
+        std::optional<int32_t> const imageTokenOpt
+            = mDeployment.base.imageTokenId >= 0 ? std::optional{mDeployment.base.imageTokenId} : std::nullopt;
+        std::optional<int32_t> const audioTokenOpt
+            = mDeployment.base.audioTokenId >= 0 ? std::optional{mDeployment.base.audioTokenId} : std::nullopt;
+        MultimodalRowBases const bases
+            = computeMultimodalRowBases(context.rawBatchedInputIds, prefixLengths, imageTokenOpt, audioTokenOpt);
+        check::check(mHostMultimodalRowBases.reshape({activeBatchSize, 2}), "Tensor reshape failed");
+        check::check(mMultimodalRowBases.reshape({activeBatchSize, 2}), "Tensor reshape failed");
+        int32_t* hostRowBases = mHostMultimodalRowBases.dataPointer<int32_t>();
+        for (int32_t i = 0; i < activeBatchSize; ++i)
+        {
+            hostRowBases[2 * i] = bases.image[static_cast<size_t>(i)];
+            hostRowBases[2 * i + 1] = bases.audio[static_cast<size_t>(i)];
+        }
+        CUDA_CHECK(cudaMemcpyAsync(mMultimodalRowBases.rawPointer(), hostRowBases,
+            static_cast<size_t>(activeBatchSize) * 2 * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+        multimodalRowBases = std::ref(mMultimodalRowBases);
+    }
+    mEmbeddingPre->embed(
+        mIdsInput, context.visualEmbeddings, context.audioEmbeddings, *mPipelineIO, context.stream, multimodalRowBases);
     mEmbeddingPre->prepareDeepstack(mIdsInput, context.deepstackFeatures, *mPipelineIO, context.stream);
     if (mGemma4Ple)
     {

@@ -190,6 +190,53 @@ TEST_F(ContextCacheCoordinatorTests, PublishesColdPrefixAndReusesLongestFullBloc
     finish(*second.admission);
 }
 
+// A media run straddling the reuse boundary keeps every matching page: the runtime addresses
+// encoder rows past the reused prefix, so the suffix may start mid-run.
+TEST_F(ContextCacheCoordinatorTests, MediaRunAcrossReuseBoundaryKeepsReusedPages)
+{
+    constexpr int32_t kMediaToken{777};
+    std::vector<int32_t> tokens = makeTokens(2 * kTOKENS_PER_PAGE + 16);
+    std::vector<Hash128> mediaHash(tokens.size(), Hash128{});
+    for (size_t i = 64; i < static_cast<size_t>(2 * kTOKENS_PER_PAGE + 8); ++i)
+    {
+        tokens[i] = kMediaToken;
+        mediaHash[i] = Hash128{0x1234, 0x5678};
+    }
+    auto beginMedia = [&](std::vector<Hash128> const& hash) {
+        ContextCacheBatchAdmission admission;
+        admission.sequences.push_back(ContextCacheSequenceAdmission{tokens, {}, hash});
+        return mCoordinator->beginRequest(admission, mStream);
+    };
+
+    auto first = beginMedia(mediaHash);
+    ASSERT_EQ(first.status, ContextCacheCoordinatorStatus::kOk);
+    ASSERT_TRUE(first.admission.has_value());
+    EXPECT_EQ(first.admission->prefillStarts[0], 0);
+    finalizePrefillWithLengths(*first.admission, {static_cast<int32_t>(tokens.size())});
+    finish(*first.admission);
+
+    auto second = beginMedia(mediaHash);
+    ASSERT_EQ(second.status, ContextCacheCoordinatorStatus::kOk);
+    ASSERT_TRUE(second.admission.has_value());
+    EXPECT_EQ(second.admission->prefillStarts[0], 2 * kTOKENS_PER_PAGE);
+    finish(*second.admission);
+
+    // The same placeholders carrying different media content share no page.
+    std::vector<Hash128> otherHash = mediaHash;
+    for (Hash128& h : otherHash)
+    {
+        if (h != Hash128{})
+        {
+            h = Hash128{0x9999, 0x1};
+        }
+    }
+    auto other = beginMedia(otherHash);
+    ASSERT_EQ(other.status, ContextCacheCoordinatorStatus::kOk);
+    ASSERT_TRUE(other.admission.has_value());
+    EXPECT_EQ(other.admission->prefillStarts[0], 0);
+    finish(*other.admission);
+}
+
 TEST_F(ContextCacheCoordinatorTests, ExactFullInputHitReportsMatchButRewindsExecution)
 {
     auto producer = begin({makeTokens(129)});
