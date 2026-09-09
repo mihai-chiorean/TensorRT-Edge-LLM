@@ -35,6 +35,13 @@ namespace trt_edgellm
 {
 namespace rt
 {
+namespace
+{
+
+//! Slots reserved for cached encoder rows; each holds one image at the per-image token budget.
+constexpr size_t kEmbeddingCacheSlots{4};
+
+} // namespace
 
 Gemma4ViTRunner::Gemma4ViTRunner(std::string const& engineDir, cudaStream_t stream)
     : MultimodalRunner(engineDir, stream)
@@ -248,6 +255,13 @@ bool Gemma4ViTRunner::allocateBuffer(cudaStream_t stream)
     setTensorAddressStatus
         &= mVisualContext->setTensorAddress(binding_names::kVisualOutput, mOutputEmbedding.rawPointer());
 
+    mEmbeddingCache
+        = EncoderEmbeddingCache(kEmbeddingCacheSlots, mConfig.maxImageTokensPerImage, mConfig.outHiddenSize);
+    LOG_INFO("Gemma4 vision embedding cache: %zu slots x %ld rows (%.1f MiB device memory)", mEmbeddingCache.capacity(),
+        mConfig.maxImageTokensPerImage,
+        static_cast<double>(mEmbeddingCache.bytesPerSlot()) * static_cast<double>(mEmbeddingCache.capacity())
+            / (1024.0 * 1024.0));
+
     if (!setTensorAddressStatus)
     {
         LOG_ERROR("Failed to set tensor address to the engine");
@@ -337,9 +351,92 @@ void Gemma4ViTRunner::generatePoolingWeights(
     }
 }
 
+std::optional<Hash128> Gemma4ViTRunner::embeddingCacheKey(rt::imageUtils::ImageData const& image) const
+{
+    if (mEmbeddingCache.capacity() == 0 || image.isVideo || image.frames != 1 || image.buffer == nullptr)
+    {
+        return std::nullopt;
+    }
+    EncoderEmbeddingKeyParams params;
+    params.frames = image.frames;
+    params.height = image.height;
+    params.width = image.width;
+    params.channels = image.channels;
+    params.doResize = image.doResize;
+    params.targetHeight = image.height;
+    params.targetWidth = image.width;
+    if (image.doResize)
+    {
+        std::tie(params.targetHeight, params.targetWidth) = rt::imageUtils::gemma4ResizeTarget(
+            image.height, image.width, mConfig.maxImageTokensPerImage, mConfig.poolingKernelSize, mConfig.patchSize);
+    }
+    params.patchSize = mConfig.patchSize;
+    params.poolingKernelSize = mConfig.poolingKernelSize;
+    size_t const totalBytes = static_cast<size_t>(image.bytesPerFrame()) * static_cast<size_t>(image.frames);
+    std::string_view const pixels(reinterpret_cast<char const*>(image.data()), totalBytes);
+    return makeEncoderEmbeddingKey(pixels, params);
+}
+
+bool Gemma4ViTRunner::assembleFromEmbeddingCache(rt::LLMGenerationRequest const& request,
+    std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages, cudaStream_t stream)
+{
+    std::vector<EncoderEmbeddingCache::CachedRows> hits;
+    std::vector<int64_t> imagesPerRequest;
+    imagesPerRequest.reserve(request.requests.size());
+    for (auto const& req : request.requests)
+    {
+        for (auto const& image : req.imageBuffers)
+        {
+            std::optional<Hash128> const key = embeddingCacheKey(image);
+            std::optional<EncoderEmbeddingCache::CachedRows> const hit
+                = key.has_value() ? mEmbeddingCache.find(*key) : std::nullopt;
+            if (!hit.has_value())
+            {
+                return false;
+            }
+            hits.push_back(*hit);
+        }
+        imagesPerRequest.push_back(static_cast<int64_t>(req.imageBuffers.size()));
+    }
+    if (hits.empty())
+    {
+        return false;
+    }
+
+    int64_t totalRows = 0;
+    for (auto const& hit : hits)
+    {
+        totalRows += hit.rows;
+    }
+    ELLM_CHECK(totalRows <= mConfig.maxImageTokens, "Gemma4 total soft token count exceeds VIT engine profile");
+
+    check::check(mVitInput.reshape({0, mConfig.inputDim}), "Tensor reshape failed");
+    check::check(mOutputEmbedding.reshape({totalRows, mConfig.outHiddenSize}), "Tensor reshape failed");
+    size_t const rowBytes = static_cast<size_t>(mConfig.outHiddenSize) * sizeof(half);
+    char* destination = static_cast<char*>(mOutputEmbedding.rawPointer());
+    for (auto const& hit : hits)
+    {
+        size_t const bytes = static_cast<size_t>(hit.rows) * rowBytes;
+        CUDA_CHECK(cudaMemcpyAsync(destination, hit.data, bytes, cudaMemcpyDeviceToDevice, stream));
+        destination += bytes;
+        imageTokenLengths.push_back(hit.rows);
+    }
+    numImages = std::move(imagesPerRequest);
+    mMultimodalMetrics.recordRun(static_cast<int64_t>(hits.size()), totalRows);
+    LOG_INFO("Vision embedding cache hit: %zu image(s), %ld rows copied instead of encoding", hits.size(),
+        static_cast<long>(totalRows));
+    return true;
+}
+
 void Gemma4ViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<ImageGrid>& imageGrids,
     std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages, cudaStream_t stream)
 {
+    mPendingCacheInserts.clear();
+    if (assembleFromEmbeddingCache(request, imageTokenLengths, numImages, stream))
+    {
+        return;
+    }
+
     // Restore mVitInput to full engine-profile capacity before writing patches.
     // imagePreprocess shrinks it to {totalPatches, inputDim} at the end (for engine execution),
     // so a subsequent call would see a reduced shape and fail the capacity check in the kernel.
@@ -349,12 +446,14 @@ void Gemma4ViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
     cuSeqlensData[0] = 0;
     int64_t cuSeqlensSize = 1;
     int64_t maxSeqLen = 0;
+    int64_t softTokenOffset = 0;
 
     for (auto const& req : request.requests)
     {
         int64_t numImage = 0;
         for (auto const& image : req.imageBuffers)
         {
+            std::optional<Hash128> const cacheKey = embeddingCacheKey(image);
             if (image.doResize)
             {
                 auto [resizedHeight, resizedWidth] = rt::imageUtils::gemma4ResizeTarget(image.height, image.width,
@@ -377,6 +476,12 @@ void Gemma4ViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
                     image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, image.height, image.width, stream);
                 formatPatch(image, imageGrids, imageTokenLengths, cuSeqlensData, cuSeqlensSize, maxSeqLen, stream);
             }
+            int64_t const softTokens = imageTokenLengths.back();
+            if (cacheKey.has_value())
+            {
+                mPendingCacheInserts.push_back(PendingCacheInsert{*cacheKey, softTokenOffset, softTokens});
+            }
+            softTokenOffset += softTokens;
             ++numImage;
         }
         numImages.emplace_back(numImage);
@@ -599,6 +704,21 @@ bool Gemma4ViTRunner::infer(cudaStream_t stream) noexcept
             return false;
         }
     }
+
+    try
+    {
+        for (PendingCacheInsert const& pending : mPendingCacheInserts)
+        {
+            mEmbeddingCache.insert(pending.key, mOutputEmbedding, pending.rowOffset, pending.rows, stream);
+        }
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("Failed to cache Gemma4 vision embeddings: %s", e.what());
+        mPendingCacheInserts.clear();
+        return false;
+    }
+    mPendingCacheInserts.clear();
 
     return true;
 }
