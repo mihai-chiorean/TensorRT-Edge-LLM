@@ -892,6 +892,35 @@ def _runtime_embedding_scale(model: "CausalLM") -> float:
     return 1.0
 
 
+def _runtime_eos_token_ids(model_dir: str,
+                           root_cfg: Dict[str, Any]) -> list[int] | None:
+    """Resolve generation stop tokens, falling back to model configuration."""
+    candidates = []
+    if model_dir:
+        generation_path = os.path.join(model_dir, "generation_config.json")
+        if os.path.exists(generation_path):
+            with open(generation_path) as generation_file:
+                generation_cfg = json.load(generation_file)
+            if not isinstance(generation_cfg, dict):
+                raise ValueError(
+                    "generation_config.json must contain an object")
+            candidates.append(
+                ("generation_config.json", generation_cfg.get("eos_token_id")))
+    candidates.append(("config.json", root_cfg.get("eos_token_id")))
+
+    for source, eos in candidates:
+        if eos is None:
+            continue
+        tokens = eos if isinstance(eos, list) else [eos]
+        if tokens and all(
+                type(token) is int and token >= 0 for token in tokens):
+            return list(tokens)
+        raise ValueError(
+            f"Invalid eos_token_id in {source}: {eos!r}; expected a "
+            "nonnegative integer or a nonempty list of nonnegative integers")
+    return None
+
+
 def write_runtime_artifacts(model: "CausalLM",
                             model_dir: str,
                             out_dir: str,
@@ -935,24 +964,16 @@ def write_runtime_artifacts(model: "CausalLM",
         if os.path.exists(hf_cfg_path):
             with open(hf_cfg_path) as _f:
                 root_cfg = json.load(_f)
+            if not isinstance(root_cfg, dict):
+                raise ValueError("config.json must contain an object")
             if root_cfg.get("vision_config"):
                 cfg_json["vision_config"] = root_cfg["vision_config"]
-            # Propagate eos_token_id so the C++ runtime can stop on any EOS
-            # token (e.g. Gemma4 uses [1, 106]).  Check config.json first,
-            # then fall back to generation_config.json (some models only set
-            # eos_token_id there).
-            eos = root_cfg.get("eos_token_id")
-            if eos is None:
-                gen_cfg_path = os.path.join(model_dir,
-                                            "generation_config.json")
-                if os.path.exists(gen_cfg_path):
-                    with open(gen_cfg_path) as _gf:
-                        gen_cfg = json.load(_gf)
-                    eos = gen_cfg.get("eos_token_id")
-            if isinstance(eos, list):
-                cfg_json["eos_token_id"] = [int(x) for x in eos]
-            elif isinstance(eos, int):
-                cfg_json["eos_token_id"] = [eos]
+
+    # Generation config can add stop tokens absent from model config, such
+    # as Gemma4's <|tool_response> handoff token (50).
+    eos = _runtime_eos_token_ids(model_dir, root_cfg)
+    if eos is not None:
+        cfg_json["eos_token_id"] = eos
 
     cfg_path = os.path.join(out_dir, config_filename)
     with open(cfg_path, "w") as f:
