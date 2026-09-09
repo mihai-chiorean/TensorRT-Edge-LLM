@@ -21,7 +21,8 @@ from experimental.server.api_server import (_build_message_body,
                                             _generate_stream_sse,
                                             _ThinkingStateMachine)
 from experimental.server.engine import StreamDelta
-from experimental.server.tool_calling import (make_stream_parser,
+from experimental.server.tool_calling import (ToolProtocolError,
+                                              make_stream_parser,
                                               parse_assistant_output,
                                               validate_tool_request)
 
@@ -191,10 +192,8 @@ def test_rejects_malformed_gemma4_tool_call(tmp_path):
     config = _tool_config()
     text = "call:get_weather{city:Paris,city:London}"
 
-    parsed = parse_assistant_output(text, config, str(tmp_path))
-
-    assert parsed.tool_calls == []
-    assert parsed.content == text
+    with pytest.raises(ToolProtocolError):
+        parse_assistant_output(text, config, str(tmp_path))
 
 
 def test_filters_forced_tool(tmp_path):
@@ -420,11 +419,10 @@ def test_gemma4_stream_parser_block_after_prose(tmp_path):
     assert _texts(per_delta[0]) == ["Sure. "]
     assert per_delta[1] == []
     kinds = [e["type"] for e in per_delta[2]]
-    assert kinds == ["tool_call", "content"]
+    assert kinds == ["tool_call"]
     call = per_delta[2][0]["tool_call"]
     assert call.name == "set_volume"
     assert json.loads(call.arguments) == {"percent": 40}
-    assert per_delta[2][1]["text"] == " Done."
     assert per_delta[3] == []
 
 
@@ -458,21 +456,26 @@ def test_gemma4_stream_parser_start_holdback_only_for_call_prefix(tmp_path):
     assert _texts(parser.finish()) == ["ca"]
 
 
-def test_gemma4_stream_parser_malformed_block_is_content(tmp_path):
+def test_gemma4_stream_parser_malformed_block_fails_closed(tmp_path):
     config = _gemma_config(tmp_path)
     parser = make_stream_parser(config, str(tmp_path))
     block = "<|tool_call>call:set_volume{percent:1,percent:2}<tool_call|>"
-    per_delta = _feed_all(parser, ["Hi ", block, "!"])
-    assert _texts(per_delta[1]) == [block]
-    assert _texts(per_delta[2]) == ["!"]
+    assert _texts(parser.feed("Hi ")) == ["Hi "]
+    with pytest.raises(ToolProtocolError):
+        parser.feed(block)
+    with pytest.raises(ToolProtocolError):
+        parser.feed("Success!")
+    with pytest.raises(ToolProtocolError):
+        parser.finish()
 
 
-def test_gemma4_stream_parser_unterminated_block_flushes_content(tmp_path):
+def test_gemma4_stream_parser_unterminated_block_fails_closed(tmp_path):
     config = _gemma_config(tmp_path)
     parser = make_stream_parser(config, str(tmp_path))
-    per_delta = _feed_all(parser, ["Hi <|tool_call>call:set_volume{"])
-    assert _texts(per_delta[0]) == ["Hi "]
-    assert _texts(per_delta[1]) == ["<|tool_call>call:set_volume{"]
+    assert _texts(parser.feed("Hi <|tool_call>call:set_volume{")) == ["Hi "]
+    with pytest.raises(ToolProtocolError) as raised:
+        parser.finish()
+    assert raised.value.reason == "incomplete"
 
 
 def test_gemma4_stream_parser_strips_tokens(tmp_path):
@@ -500,8 +503,6 @@ def test_gemma4_stream_parser_matches_whole_output_parser(tmp_path):
         "<tool_call|> Done.",
         "call:set_volume{percent:75}I have changed the volume.",
         "  call:set_volume{percent:75}",
-        "<|tool_call>call:set_volume{percent:1,percent:2}<tool_call|>tail",
-        "call:nothing here <|tool_call>call:set_volume{percent:9}<tool_call|>",
         "Plain <| prose with < angle brackets<|im_end|>",
         "<|tool_call>call:set_volume{percent:3}<tool_call|>"
         "<|tool_call>call:set_volume{percent:4}<tool_call|>",
@@ -532,6 +533,136 @@ def test_generic_stream_parser_buffers_until_finish(tmp_path):
     ])
     assert per_delta[0] == [] and per_delta[1] == []
     assert [e["type"] for e in per_delta[2]] == ["tool_call"]
+
+
+_INVALID_GEMMA_TURNS = [
+    "call:get_weather{city:Berkeley, California}",
+    "call:get_weather{city:Berkeley, California}It is sunny.",
+    'call:get_weather{city:"Berkeley, California}',
+    'call:get_weather{city:<|"|>Berkeley, California}',
+    'call:get_weather{city:<|"|>Paris<|"|>,city:<|"|>London<|"|>}',
+    'call:get_weather{"city":"Paris","city":"London"}',
+    'call:unknown{city:"Paris"}',
+    "call:",
+    "call:!not_a_name{}Success.",
+    "call:get_weather{",
+    "<|tool_call>",
+    "<|tool_call>call:get_weather{city:Paris}",
+    "<|tool_call>nonsense<tool_call|>Success.",
+    "<|tool_call>call:unknown{}<tool_call|>Success.",
+    "<|tool_call>call:get_weather{city:Paris,city:London}<tool_call|>Success.",
+    "call:nothing here <|tool_call>call:get_weather{city:Paris}<tool_call|>",
+    "<|tool_call>call:get_weather{city:Paris,city:London}<tool_call|>"
+    "<|tool_call>call:get_weather{city:Paris}<tool_call|>",
+]
+
+
+@pytest.mark.parametrize("sample", _INVALID_GEMMA_TURNS)
+def test_gemma4_protocol_failures_never_become_content(tmp_path, sample):
+    _gemma_config(tmp_path)
+    config = _tool_config()
+    with pytest.raises(ToolProtocolError):
+        parse_assistant_output(sample, config, str(tmp_path))
+    with pytest.raises(ToolProtocolError):
+        _build_message_body(sample, config, str(tmp_path))
+
+    chunks = [[sample[:split], sample[split:]]
+              for split in range(len(sample) + 1)] + [list(sample)]
+    for pieces in chunks:
+        parser = make_stream_parser(config, str(tmp_path))
+        events = []
+        with pytest.raises(ToolProtocolError) as raised:
+            for piece in pieces:
+                events.extend(parser.feed(piece))
+            events.extend(parser.finish())
+        assert events == [], pieces
+        assert raised.value.to_openai()["code"] == "invalid_tool_call"
+        assert sample not in str(raised.value)
+        with pytest.raises(ToolProtocolError):
+            parser.feed("The operation succeeded.")
+        with pytest.raises(ToolProtocolError):
+            parser.finish()
+
+
+@pytest.mark.parametrize("arguments, expected", [
+    ('{city:<|"|>Berkeley, California<|"|>}', {
+        "city": "Berkeley, California"
+    }),
+    ('{city:"Berkeley, California"}', {
+        "city": "Berkeley, California"
+    }),
+    ('{"city":"Berkeley, California"}', {
+        "city": "Berkeley, California"
+    }),
+    ('{city:"A } comma, quote \\" and slash \\\\"}', {
+        "city": 'A } comma, quote " and slash \\'
+    }),
+    ('{city:<|"|>A } comma, quote " and colon :<|"|>}', {
+        "city": 'A } comma, quote " and colon :'
+    }),
+    ('{nested:{items:[1,true,null,{label:"a,b"}]}}', {
+        "nested": {
+            "items": [1, True, None, {
+                "label": "a,b"
+            }]
+        }
+    }),
+])
+@pytest.mark.parametrize("tagged", [False, True])
+def test_gemma4_quoted_arguments_every_split(tmp_path, arguments, expected,
+                                             tagged):
+    _gemma_config(tmp_path)
+    config = _tool_config()
+    sample = "call:get_weather" + arguments
+    if tagged:
+        sample = "<|tool_call>" + sample + "<tool_call|>"
+    sample += "I already did it."
+    parsed = parse_assistant_output(sample, config, str(tmp_path))
+    assert parsed.content == ""
+    assert json.loads(parsed.tool_calls[0].arguments) == expected
+    chunks = [[sample[:split], sample[split:]]
+              for split in range(len(sample) + 1)] + [list(sample)]
+    for pieces in chunks:
+        parser = make_stream_parser(config, str(tmp_path))
+        events = sum(_feed_all(parser, pieces), [])
+        assert [e["type"] for e in events] == ["tool_call"]
+        assert json.loads(events[0]["tool_call"].arguments) == expected
+
+
+def test_gemma4_forced_tool_rejects_other_declared_name(tmp_path):
+    config = _gemma_config(tmp_path, "set_volume")
+    config.tools.extend(_tools())
+    with pytest.raises(ToolProtocolError) as raised:
+        parse_assistant_output("call:get_weather{city:Paris}", config,
+                               str(tmp_path))
+    assert raised.value.reason == "unauthorized"
+
+
+def test_gemma4_illustrative_mid_prose_call_is_not_protocol(tmp_path):
+    config = _gemma_config(tmp_path)
+    sample = "For example, call:set_volume{percent:40} is tool syntax."
+    assert parse_assistant_output(sample, config,
+                                  str(tmp_path)).content == sample
+    for split in range(len(sample) + 1):
+        parser = make_stream_parser(config, str(tmp_path))
+        events = sum(_feed_all(parser, [sample[:split], sample[split:]]), [])
+        assert "".join(_texts(events)) == sample
+
+
+def test_gemma4_leading_stripped_token_preserves_protocol_classification(
+        tmp_path):
+    config = _gemma_config(tmp_path)
+    sample = " <|im_end|> call:unknown{}Success."
+    for split in range(len(sample) + 1):
+        parser = make_stream_parser(config,
+                                    str(tmp_path),
+                                    strip_tokens=("<|im_end|>", ))
+        events = []
+        with pytest.raises(ToolProtocolError):
+            events.extend(parser.feed(sample[:split]))
+            events.extend(parser.feed(sample[split:]))
+            events.extend(parser.finish())
+        assert events == []
 
 
 class _FakeGemmaLLM:
@@ -610,6 +741,71 @@ def test_tool_stream_sse_forced_bare_call_has_no_content(tmp_path):
     assert [d["tool_calls"][0]["index"] for d in deltas
             if "tool_calls" in d] == [0, 0]
     assert choices[-1]["finish_reason"] == "tool_calls"
+
+
+@pytest.mark.parametrize("sample", _INVALID_GEMMA_TURNS)
+def test_tool_stream_sse_protocol_errors_are_typed_and_private(
+        tmp_path, sample):
+    _gemma_config(tmp_path)
+    config = _tool_config()
+    for split in range(len(sample) + 1):
+        llm = _FakeGemmaLLM(tmp_path, [sample[:split], sample[split:]])
+        chunks = list(
+            _generate_stream_sse(llm, [],
+                                 object(),
+                                 "test",
+                                 False,
+                                 tool_config=config))
+        assert chunks[-1] == "data: [DONE]\n\n"
+        payloads = [json.loads(c.removeprefix("data: ")) for c in chunks[:-1]]
+        errors = [p["error"] for p in payloads if "error" in p]
+        assert len(errors) == 1
+        assert errors[0]["type"] == "tool_protocol_error"
+        assert errors[0]["code"] == "invalid_tool_call"
+        assert errors[0][
+            "message"] == "The model generated an invalid tool call."
+        choices = [p["choices"][0] for p in payloads if "choices" in p]
+        assert not any("content" in c["delta"] or "tool_calls" in c["delta"]
+                       for c in choices)
+        assert choices[-1]["finish_reason"] == "error"
+
+
+def test_tool_stream_sse_preceding_prose_cannot_be_retracted(tmp_path):
+    config = _gemma_config(tmp_path)
+    llm = _FakeGemmaLLM(tmp_path, [
+        "Let me check. ",
+        "<|tool_call>call:set_volume{percent:1,percent:2}<tool_call|>",
+        "Success.",
+    ])
+    chunks = list(
+        _generate_stream_sse(llm, [],
+                             object(),
+                             "test",
+                             False,
+                             tool_config=config))
+    payloads = [json.loads(c.removeprefix("data: ")) for c in chunks[:-1]]
+    choices = [p["choices"][0] for p in payloads if "choices" in p]
+    assert [c["delta"]["content"] for c in choices
+            if "content" in c["delta"]] == ["Let me check. "]
+    assert choices[-1]["finish_reason"] == "error"
+    assert len([p for p in payloads if "error" in p]) == 1
+
+
+def test_tool_stream_sse_error_overrides_prior_tool_finish(tmp_path):
+    config = _gemma_config(tmp_path)
+    llm = _FakeGemmaLLM(tmp_path, [
+        "<|tool_call>call:set_volume{percent:1}<tool_call|>",
+        "<|tool_call>call:unknown{}<tool_call|>",
+    ])
+    chunks = list(
+        _generate_stream_sse(llm, [],
+                             object(),
+                             "test",
+                             False,
+                             tool_config=config))
+    payloads = [json.loads(c.removeprefix("data: ")) for c in chunks[:-1]]
+    assert payloads[-2]["error"]["code"] == "invalid_tool_call"
+    assert payloads[-1]["choices"][0]["finish_reason"] == "error"
 
 
 def test_thinking_state_machine_holds_only_partial_tags():

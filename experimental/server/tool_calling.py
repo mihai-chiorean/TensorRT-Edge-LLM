@@ -62,6 +62,22 @@ class ToolCall:
         }
 
 
+class ToolProtocolError(ValueError):
+    """A recognized tool turn that cannot safely produce an executable call."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__("The model generated an invalid tool call.")
+
+    def to_openai(self) -> Dict[str, str]:
+        return {
+            "message": str(self),
+            "type": "tool_protocol_error",
+            "code": "invalid_tool_call",
+            "reason": self.reason,
+        }
+
+
 @dataclass
 class ParsedAssistantOutput:
     events: List[Dict[str, Any]]
@@ -309,10 +325,6 @@ class _Gemma4ToolParser:
     ) -> "ToolStreamParser":
         return _Gemma4ToolStreamParser(self, tool_config, strip_tokens)
 
-    _BLOCK_RE = re.compile(
-        r"<\|tool_call>(.*?)<tool_call\|>",
-        re.S,
-    )
     _CALL_RE = re.compile(
         r"^call:(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
         r"(?P<arguments>\{.*\})$",
@@ -325,40 +337,8 @@ class _Gemma4ToolParser:
 
     def parse(self, text: str,
               tool_config: ToolConfig) -> Tuple[List[Dict[str, Any]], bool]:
-        events: List[Dict[str, Any]] = []
-        malformed = False
-        pos = 0
-        matched = False
-        for match in self._BLOCK_RE.finditer(text):
-            matched = True
-            if match.start() > pos:
-                events.append({
-                    "type": "content",
-                    "text": text[pos:match.start()]
-                })
-            call = _parse_gemma4_call(match.group(1), tool_config)
-            if call is None:
-                malformed = True
-                events.append({"type": "content", "text": match.group(0)})
-            else:
-                events.append({"type": "tool_call", "tool_call": call})
-            pos = match.end()
-        if pos < len(text):
-            events.append({"type": "content", "text": text[pos:]})
-        if matched:
-            return events, malformed
-
-        call = _parse_gemma4_call(text, tool_config)
-        if call is not None:
-            return [{"type": "tool_call", "tool_call": call}], False
-        call = _parse_gemma4_call_prefix(text, tool_config)
-        if call is not None:
-            # Gemma occasionally continues with a success sentence before the
-            # tool has run.  Once a valid canonical call prefix is present,
-            # expose only the call; the result-grounded continuation is a
-            # separate request.
-            return [{"type": "tool_call", "tool_call": call}], False
-        return [{"type": "content", "text": text}], False
+        stream = self.stream_parser(tool_config)
+        return stream.feed(text) + stream.finish(), False
 
 
 def make_stream_parser(
@@ -435,12 +415,14 @@ class _Gemma4ToolStreamParser(ToolStreamParser):
     """Releases content as soon as it can no longer become a tool call.
 
     Block form (``<|tool_call>...<tool_call|>``) may appear anywhere: content
-    streams up to the opener, the block is buffered to its closer and parsed
-    like the whole-output path (a malformed block is content, verbatim). The
+    streams up to the opener, the block is buffered to its closer. The
     bare form (``call:NAME{...}``) is only recognised at the very start, so
-    nothing is released until the first non-blank text rules it out; once it
-    is seen the rest of the output is buffered and handed to the whole-output
-    parser at ``finish`` so its trailing-prose rule applies unchanged.
+    nothing is released until the first non-blank text rules it out. Once it
+    is seen the output is buffered until generation finishes; only the first
+    complete call is returned, and following prose is dropped. Recognized protocol
+    never returns to content: malformed or incomplete calls raise a typed
+    error, and prose following valid calls is suppressed. Prose emitted before
+    a block opener cannot be retracted without buffering ordinary conversation.
     """
 
     def __init__(self, parser, tool_config: ToolConfig,
@@ -456,26 +438,45 @@ class _Gemma4ToolStreamParser(ToolStreamParser):
         self._at_start = True
         self._in_block = False
         self._bare = False
+        self._done = False
+        self._in_protocol = False
+        self._error: Optional[ToolProtocolError] = None
 
     def feed(self, text: str) -> List[Dict[str, Any]]:
+        if self._error is not None:
+            raise self._error
+        if self._done:
+            return []
         self._buf += text
         events: List[Dict[str, Any]] = []
         if self._bare:
-            return events
+            return []
         while self._buf:
             if self._in_block:
                 idx = self._buf.find(self._closer, len(self._opener))
                 if idx == -1:
                     break
                 end = idx + len(self._closer)
-                events.append(self._block_event(self._buf[:end]))
+                try:
+                    events.append(self._block_event(self._buf[:end]))
+                except ToolProtocolError as exc:
+                    self._fail(exc)
                 self._buf = self._buf[end:]
                 self._in_block = False
                 continue
             if self._at_start:
                 head = self._buf.lstrip()
+                stripped = next((token for token in self._strip_tokens
+                                 if head.startswith(token)), None)
+                if stripped is not None:
+                    self._buf = (self._buf[:len(self._buf) - len(head)] +
+                                 head[len(stripped):])
+                    continue
+                if any(token.startswith(head) for token in self._strip_tokens):
+                    break
                 if head.startswith(self._bare_prefix):
                     self._bare = True
+                    self._in_protocol = True
                     break
                 if self._bare_prefix.startswith(head):
                     break
@@ -484,28 +485,55 @@ class _Gemma4ToolStreamParser(ToolStreamParser):
             if marker is None:
                 hold = partial_marker_len(self._buf, self._scan_markers)
                 release = self._buf[:len(self._buf) - hold]
-                if release:
+                if release and not self._in_protocol:
                     events.append(_content_event(release))
                 self._buf = self._buf[len(release):]
                 break
-            if idx > 0:
+            if idx > 0 and not self._in_protocol:
                 events.append(_content_event(self._buf[:idx]))
             if marker == self._opener:
                 self._buf = self._buf[idx:]
                 self._in_block = True
+                self._in_protocol = True
             else:
                 self._buf = self._buf[idx + len(marker):]
         return events
 
     def finish(self) -> List[Dict[str, Any]]:
+        if self._error is not None:
+            raise self._error
+        if self._bare and not self._done:
+            events = self._bare_progress()
+            if events:
+                return events
         buf, self._buf = self._buf, ""
+        if self._done:
+            return []
         text = _strip_tokens(buf, self._strip_tokens)
-        if self._bare or self._at_start:
-            events, _ = self._parser.parse(text, self._tool_config)
-            return [e for e in events if e["type"] != "content" or e["text"]]
-        # An unterminated block or a held marker prefix is content, which is
-        # what the whole-output parser reports for it too.
+        self._done = True
+        if self._bare or self._in_block:
+            self._fail(ToolProtocolError("incomplete"))
+        if self._in_protocol:
+            return []
         return [_content_event(text)] if text else []
+
+    def _bare_progress(self) -> List[Dict[str, Any]]:
+        try:
+            call = _parse_gemma4_call_prefix(
+                _strip_tokens(self._buf, self._strip_tokens),
+                self._tool_config)
+        except ToolProtocolError as exc:
+            self._fail(exc)
+        if call is None:
+            return []
+        self._done = True
+        self._buf = ""
+        return [{"type": "tool_call", "tool_call": call}]
+
+    def _fail(self, error: ToolProtocolError) -> None:
+        self._error = error
+        self._buf = ""
+        raise error
 
     def _earliest_marker(self) -> Tuple[int, Optional[str]]:
         best_idx, best = -1, None
@@ -519,8 +547,6 @@ class _Gemma4ToolStreamParser(ToolStreamParser):
         block = _strip_tokens(block, self._strip_tokens)
         body = block[len(self._opener):-len(self._closer)]
         call = _parse_gemma4_call(body, self._tool_config)
-        if call is None:
-            return _content_event(block)
         return {"type": "tool_call", "tool_call": call}
 
 
@@ -572,19 +598,18 @@ def _parser_name_for_model(model_dir: str) -> str:
     return "generic"
 
 
-def _parse_gemma4_call(text: str,
-                       tool_config: ToolConfig) -> Optional[ToolCall]:
+def _parse_gemma4_call(text: str, tool_config: ToolConfig) -> ToolCall:
     match = _Gemma4ToolParser._CALL_RE.fullmatch(text.strip())
     if match is None:
-        return None
+        raise ToolProtocolError("malformed")
     name = match.group("name")
     if not _tool_name_allowed(name, tool_config):
-        return None
+        raise ToolProtocolError("unauthorized")
     try:
         arguments = _parse_gemma4_object(match.group("arguments"),
                                          _param_types_for(name, tool_config))
-    except ValueError:
-        return None
+    except (ValueError, RecursionError):
+        raise ToolProtocolError("malformed") from None
     return ToolCall(id=_new_call_id(),
                     name=name,
                     arguments=_arguments_to_json(arguments))
@@ -608,26 +633,44 @@ def _gemma4_object_end(text: str, start: int) -> Optional[int]:
     """Return the end of one balanced Gemma object outside string tokens."""
     if start < 0 or start >= len(text) or text[start] != "{":
         return None
-    delimiter = '<|"|>'
     depth = 0
-    in_string = False
-    index = start
-    while index < len(text):
-        if text.startswith(delimiter, index):
-            in_string = not in_string
-            index += len(delimiter)
-            continue
-        if not in_string:
-            if text[index] == "{":
+    try:
+        for index, char in _gemma4_unquoted_chars(text[start:]):
+            if char == "{":
                 depth += 1
-            elif text[index] == "}":
+            elif char == "}":
                 depth -= 1
                 if depth == 0:
-                    return index + 1
-                if depth < 0:
-                    return None
-        index += 1
+                    return start + index + 1
+    except ValueError:
+        return None
     return None
+
+
+def _gemma4_unquoted_chars(text: str) -> Iterable[Tuple[int, str]]:
+    """Yield syntax outside Gemma-token or JSON strings without decoding it."""
+    delimiter = '<|"|>'
+    quote: Optional[str] = None
+    index = 0
+    while index < len(text):
+        if quote == '"':
+            if text[index] == "\\":
+                index += 2
+                continue
+            if text[index] == '"':
+                quote = None
+        elif text.startswith(delimiter, index):
+            quote = None if quote == delimiter else delimiter
+            index += len(delimiter)
+            continue
+        elif quote is None:
+            if text[index] == '"':
+                quote = '"'
+            else:
+                yield index, text[index]
+        index += 1
+    if quote is not None:
+        raise ValueError("Unterminated Gemma tool string")
 
 
 def _parse_gemma4_object(text: str,
@@ -653,28 +696,17 @@ def _parse_gemma4_object(text: str,
 def _split_gemma4_fields(text: str) -> List[str]:
     fields = []
     start = 0
-    depth = 0
-    in_string = False
-    index = 0
-    delimiter = '<|"|>'
-    while index < len(text):
-        if text.startswith(delimiter, index):
-            in_string = not in_string
-            index += len(delimiter)
-            continue
-        char = text[index]
-        if not in_string:
-            if char in "[{":
-                depth += 1
-            elif char in "]}":
-                depth -= 1
-                if depth < 0:
-                    raise ValueError("Unbalanced Gemma tool arguments")
-            elif char == "," and depth == 0:
-                fields.append(text[start:index].strip())
-                start = index + 1
-        index += 1
-    if in_string or depth != 0:
+    stack = []
+    for index, char in _gemma4_unquoted_chars(text):
+        if char in "[{":
+            stack.append(char)
+        elif char in "]}":
+            if not stack or stack.pop() != {"]": "[", "}": "{"}[char]:
+                raise ValueError("Unbalanced Gemma tool arguments")
+        elif char == "," and not stack:
+            fields.append(text[start:index].strip())
+            start = index + 1
+    if stack:
         raise ValueError("Unbalanced Gemma tool arguments")
     fields.append(text[start:].strip())
     if any(not field for field in fields):
@@ -683,29 +715,17 @@ def _split_gemma4_fields(text: str) -> List[str]:
 
 
 def _split_gemma4_key_value(field: str) -> Tuple[str, str]:
-    depth = 0
-    in_string = False
-    index = 0
-    delimiter = '<|"|>'
-    while index < len(field):
-        if field.startswith(delimiter, index):
-            in_string = not in_string
-            index += len(delimiter)
-            continue
-        char = field[index]
-        if not in_string:
-            if char in "[{":
-                depth += 1
-            elif char in "]}":
-                depth -= 1
-            elif char == ":" and depth == 0:
-                key = field[:index].strip()
-                value = field[index + 1:].strip()
-                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*",
-                                    key) or not value:
-                    break
-                return key, value
-        index += 1
+    for index, char in _gemma4_unquoted_chars(field):
+        if char == ":":
+            key = field[:index].strip()
+            value = field[index + 1:].strip()
+            if key.startswith('"'):
+                key = json.loads(key)
+            elif not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                break
+            if not isinstance(key, str) or not value:
+                break
+            return key, value
     raise ValueError("Invalid Gemma tool argument")
 
 
@@ -713,7 +733,10 @@ def _parse_gemma4_value(text: str, expected_type: Optional[str] = None) -> Any:
     value = text.strip()
     delimiter = '<|"|>'
     if value.startswith(delimiter) and value.endswith(delimiter):
-        return value[len(delimiter):-len(delimiter)]
+        inner = value[len(delimiter):-len(delimiter)]
+        if len(value) < 2 * len(delimiter) or delimiter in inner:
+            raise ValueError("Invalid Gemma tool string")
+        return inner
     if value.startswith("{"):
         return _parse_gemma4_object(value)
     if value.startswith("[") and value.endswith("]"):
@@ -730,7 +753,9 @@ def _parse_gemma4_value(text: str, expected_type: Optional[str] = None) -> Any:
     try:
         return json.loads(value)
     except json.JSONDecodeError:
-        if expected_type == "string":
+        if (expected_type == "string"
+                and not any(char in value for char in '\"\'{}[]:')
+                and delimiter not in value):
             return value
         raise ValueError("Invalid Gemma tool argument value")
 

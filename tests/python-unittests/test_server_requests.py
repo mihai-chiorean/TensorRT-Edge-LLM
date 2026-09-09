@@ -2345,6 +2345,92 @@ def test_tool_stream_usage_chunk_when_requested(client_and_llm):
     assert usage_chunks[0]["usage"]["prompt_tokens"] == 7
 
 
+@pytest.mark.parametrize("output", [
+    "call:weather{location:Berkeley, California}It is sunny.",
+    "call:unknown{}Success.",
+    "<|tool_call>call:unknown{}<tool_call|>Success.",
+    "<|tool_call>call:weather{location:Berkeley}",
+])
+@pytest.mark.parametrize("stream", [False, True])
+def test_tool_protocol_error_http_never_returns_model_content(
+        client_and_llm, output, stream):
+    from experimental.server.engine import StreamDelta
+
+    client, llm = client_and_llm
+    llm.model_dir = "/fake/gemma4"
+    llm._runtime._resp_text = output
+    closed = []
+
+    def fake_stream(messages, params, **kw):
+        handoff = kw["admission_handoff"]
+        handoff.worker_started()
+        try:
+            for char in output:
+                yield StreamDelta(text=char, token_ids=[1], finished=False)
+            yield StreamDelta(text="", finished=True, finish_reason="stop")
+        finally:
+            closed.append(True)
+            handoff.release()
+
+    llm.generate_stream = fake_stream
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Weather?"
+                               }],
+                               "stream":
+                               stream,
+                               "tools": [{
+                                   "type": "function",
+                                   "function": {
+                                       "name": "weather",
+                                       "parameters": {
+                                           "type": "object",
+                                           "properties": {
+                                               "location": {
+                                                   "type": "string"
+                                               }
+                                           }
+                                       }
+                                   }
+                               }],
+                           })
+    if not stream:
+        assert response.status_code == 502
+        payload = response.json()
+        assert set(payload) == {"error"}
+        assert payload["error"]["code"] == "invalid_tool_call"
+    else:
+        assert response.status_code == 200
+        payloads = [
+            json.loads(line[len("data: "):])
+            for line in response.text.splitlines()
+            if line.startswith("data: {")
+        ]
+        assert [p["error"]["code"] for p in payloads
+                if "error" in p] == ["invalid_tool_call"]
+        choices = [p["choices"][0] for p in payloads if "choices" in p]
+        assert not any("content" in c["delta"] or "tool_calls" in c["delta"]
+                       for c in choices)
+        assert choices[-1]["finish_reason"] == "error"
+        assert response.text.endswith("data: [DONE]\n\n")
+    assert output not in response.text
+    assert "Berkeley" not in response.text
+    assert "Success" not in response.text
+    if stream:
+        assert closed == [True]
+    llm._runtime._resp_text = "Okay."
+    following = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{
+            "role": "user",
+            "content": "Hi"
+        }]})
+    assert following.status_code == 200
+    assert following.json()["choices"][0]["message"]["content"] == "Okay."
+
+
 def test_local_media_frames_rejected_when_unset(tmp_path):
     """`{"type": "video", "frames": [...]}` is a local-path entry point too."""
     from experimental.server.api_server import enforce_local_media_policy

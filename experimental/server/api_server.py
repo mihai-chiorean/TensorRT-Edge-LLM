@@ -59,7 +59,7 @@ from .batching import BatcherOverflow, RequestBatcher, resolve_batch_size
 from .engine import (OMNI_AUDIO_SAMPLE_RATE, AudioParams, SamplingParams,
                      _normalize_logit_bias, _validate_logit_bias_spec_decode,
                      finish_reason_name, normalize_greedy_sampling)
-from .tool_calling import (ToolConfig, make_stream_parser,
+from .tool_calling import (ToolConfig, ToolProtocolError, make_stream_parser,
                            parse_assistant_output, partial_marker_len,
                            validate_tool_request)
 from .video_sampling import MAX_SOURCE_BYTES as MAX_VIDEO_SOURCE_BYTES
@@ -1164,16 +1164,20 @@ def _create_app(llm_instance,
         except Exception as exc:
             return _inference_error_response(exc)
 
-        return _build_chat_completion_response(
-            llm_instance,
-            response,
-            response_idx,
-            response_id,
-            tool_config,
-            include_top_logprobs=include_top_logprobs,
-            include_logprobs=num_logprobs > 0,
-            prompt_tokens=prompt_tokens,
-        )
+        try:
+            return _build_chat_completion_response(
+                llm_instance,
+                response,
+                response_idx,
+                response_id,
+                tool_config,
+                include_top_logprobs=include_top_logprobs,
+                include_logprobs=num_logprobs > 0,
+                prompt_tokens=prompt_tokens,
+            )
+        except ToolProtocolError as exc:
+            return JSONResponse(status_code=502,
+                                content={"error": exc.to_openai()})
 
     @app.post("/v1/audio/speech")
     def audio_speech(body: Dict[str, Any]):
@@ -1838,6 +1842,7 @@ def _generate_tool_stream_sse(llm_instance,
     error_message: Optional[str] = None
     completion_tokens = 0
     tool_index = 0
+    protocol_error: Optional[ToolProtocolError] = None
 
     def emit_events(events):
         nonlocal tool_index
@@ -1874,29 +1879,44 @@ def _generate_tool_stream_sse(llm_instance,
                 })
             tool_index += 1
 
+    deltas = llm_instance.generate_stream(messages,
+                                          params,
+                                          prebuilt_request=prebuilt_request,
+                                          admission_handoff=handoff,
+                                          tools=tool_config.tools,
+                                          tool_choice=tool_config.tool_choice)
     try:
-        for delta in llm_instance.generate_stream(
-                messages,
-                params,
-                prebuilt_request=prebuilt_request,
-                admission_handoff=handoff,
-                tools=tool_config.tools,
-                tool_choice=tool_config.tool_choice):
+        for delta in deltas:
             completion_tokens += len(delta.token_ids or [])
             if delta.text:
                 yield from emit_events(stream_parser.feed(delta.text))
             if delta.finished:
                 finish_reason = delta.finish_reason or "stop"
+    except ToolProtocolError as exc:
+        protocol_error = exc
+        finish_reason = "error"
     except Exception as exc:
         logger.exception("Streaming inference failed")
         finish_reason = "error"
         error_message = str(exc)
+    finally:
+        deltas.close()
 
-    yield from emit_events(stream_parser.finish())
-    for field, text in sm.flush():
-        yield emit({field: text})
+    if protocol_error is None:
+        try:
+            yield from emit_events(stream_parser.finish())
+        except ToolProtocolError as exc:
+            protocol_error = exc
+            finish_reason = "error"
+    if protocol_error is not None:
+        yield "data: " + json.dumps({"error": protocol_error.to_openai()
+                                     }) + "\n\n"
+    else:
+        for field, text in sm.flush():
+            yield emit({field: text})
 
-    finish = "tool_calls" if tool_index else finish_reason or "stop"
+    finish = ("error" if protocol_error is not None else
+              "tool_calls" if tool_index else finish_reason or "stop")
     if error_message and "EDGELLM_INPUT_TOO_LONG" in error_message:
         yield _sse_error(error_message)
     yield emit({}, finish_reason=finish)
