@@ -20,12 +20,13 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Dict, Iterable, Optional
 
+from ..parsing.terminal_tokens import ended_on_stop
 from ..parsing.tool_calling import ToolProtocolError
 from ..runtime.engine_client import EngineClient, PreparedRequest
 from . import anthropic_compat as protocol
 from .errors import ServerError, ToolProtocolResponseError
 from .protocol import ChatCompletionRequest
-from .serving_chat import IM_END_TOKEN, OpenAIServingChat, PreparedChatRequest
+from .serving_chat import OpenAIServingChat, PreparedChatRequest
 
 
 @dataclass(frozen=True)
@@ -210,6 +211,7 @@ class AnthropicServingMessages:
         prepared: PreparedAnthropicStream,
     ) -> AsyncGenerator[str, None]:
         parser = self._chat.stream_output_parser(prepared.chat)
+        stripper = self._chat.stream_stripper(prepared.chat)
         blocks = _ContentBlockStream()
         prompt_tokens = None
         completion_tokens = 0
@@ -249,12 +251,10 @@ class AnthropicServingMessages:
                             prompt_tokens):
                         yield chunk
                     started = True
-                    if delta.text:
-                        text = delta.text.replace(IM_END_TOKEN, "")
-                        for chunk in blocks.feed(parser.feed(text)):
-                            yield chunk
-                elif delta.text:
-                    text = delta.text.replace(IM_END_TOKEN, "")
+                text = stripper.feed(delta.text) if delta.text else ""
+                if delta.finished:
+                    text += stripper.flush(ended_on_stop(delta.finish_reason))
+                if text:
                     for chunk in blocks.feed(parser.feed(text)):
                         yield chunk
         except asyncio.CancelledError:

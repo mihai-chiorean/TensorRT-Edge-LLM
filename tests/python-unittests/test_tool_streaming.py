@@ -432,3 +432,49 @@ def test_preconfirm_raw_truncation_flushes_as_content():
     events = _stream_events(list(text), config)  # char-by-char
     assert all(event.kind == "content" for event in events)
     assert "".join(e.text for e in events) == text
+
+
+def test_terminal_token_stripper_holds_only_a_possible_prefix():
+    from experimental.server.parsing.terminal_tokens import \
+        TerminalTokenStripper
+
+    stripper = TerminalTokenStripper(("<turn|>", "<|im_end|>"))
+    assert stripper.feed("Hello <") == "Hello "
+    assert stripper.feed("3 and <tu") == "<3 and "
+    assert stripper.feed("rn|>") == ""
+    # Text after a terminal spelling makes it literal.
+    assert stripper.feed(" tail") == "<turn|> tail"
+    assert stripper.feed("<|im_end|><tu") == ""
+    assert stripper.feed("rn|>") == ""
+    assert stripper.flush() == ""
+
+    stripper = TerminalTokenStripper(("<|im_end|>", ))
+    assert stripper.feed("x<|im") == "x"
+    assert stripper.flush() == "<|im"
+    assert stripper.feed("y<|im_end|>") == "y"
+    assert stripper.flush(stopped=False) == "<|im_end|>"
+    assert TerminalTokenStripper(()).feed("<turn|>") == "<turn|>"
+
+
+def test_strip_terminal_tokens_removes_only_the_trailing_run():
+    from experimental.server.parsing.terminal_tokens import \
+        strip_terminal_tokens
+
+    tokens = ("<turn|>", "<eos>")
+    assert strip_terminal_tokens("a<eos>b<turn|><eos>", tokens) == "a<eos>b"
+    assert strip_terminal_tokens("<turn|>", tokens) == ""
+    assert strip_terminal_tokens("plain", tokens) == "plain"
+
+
+def test_terminal_special_tokens_reads_tokenizer_config(tmp_path):
+    from experimental.server.parsing.terminal_tokens import \
+        terminal_special_tokens
+
+    (tmp_path / "tokenizer_config.json").write_text(
+        '{"eos_token": "<turn|>", "eot_token": {"content": "<eot>"}}')
+    terminal_special_tokens.cache_clear()
+    tokens = terminal_special_tokens(str(tmp_path))
+    assert set(tokens) == {"<|im_end|>", "<turn|>", "<eot>"}
+    assert tokens[0] == "<|im_end|>"
+    assert terminal_special_tokens(str(tmp_path /
+                                       "missing")) == ("<|im_end|>", )
