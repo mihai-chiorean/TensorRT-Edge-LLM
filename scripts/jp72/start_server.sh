@@ -30,6 +30,6 @@ sudo systemd-run --unit=trt-llm --service-type=exec \
     --host 127.0.0.1 --port "$PORT" \
     --max-input-len 8192 --max-kv-cache-capacity 16384 --max-batch-size 1 \
     --enable-context-reuse --context-cache-max-records 1024 \
-    --enable-auto-tool-choice
+    --enable-auto-tool-choice --served-model-name gemma
 
 # Stop with: sudo systemctl stop trt-llm.service
