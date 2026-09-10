@@ -294,6 +294,14 @@ class ToolChatTemplateFormatter:
                 "Use tokenize=False-compatible tokenizer/processor templates.")
         return prompt
 
+    def decode_tokens(self, token_ids: Sequence[int]) -> str:
+        """Decode generated IDs without discarding model protocol delimiters."""
+        owner = self._load_template_owner()
+        tokenizer = getattr(owner, "tokenizer", owner)
+        return tokenizer.decode(list(token_ids),
+                                skip_special_tokens=False,
+                                clean_up_tokenization_spaces=False)
+
     def count_tokens(self, text: str) -> Optional[int]:
         """Count tokens of a rendered prompt (no special-token wrapper — the
         rendered text already carries them). None if encoding unavailable."""

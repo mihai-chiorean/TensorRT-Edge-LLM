@@ -1810,17 +1810,24 @@ def _gemma_tool():
     }
 
 
-def _gemma_client(tmp_path):
+def _gemma_client(tmp_path, eos_token=""):
     """A client whose model directory identifies a Gemma 4 runtime bundle."""
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
+
+    from experimental.server.parsing.terminal_tokens import (
+        terminal_special_tokens)
 
     llm = _FakeLLM(tmp_path)
     model_dir = tmp_path / "gemma-4-e4b"
     model_dir.mkdir()
     (model_dir / "config.json").write_text('{"model": "gemma4_text"}',
                                            encoding="utf-8")
+    if eos_token:
+        (model_dir / "tokenizer_config.json").write_text(
+            json.dumps({"eos_token": eos_token}), encoding="utf-8")
+    terminal_special_tokens.cache_clear()
     llm.model_dir = str(model_dir)
     config = ApiConfig(enable_auto_tool_choice=True)
     return TestClient(_create_app(llm, config)), llm
@@ -1940,3 +1947,45 @@ def test_gemma_tool_stream_emits_call_and_drops_trailing_prose(tmp_path):
         if p.get("choices") and p["choices"][0].get("finish_reason")
     ]
     assert finish == ["tool_calls"]
+
+
+def test_chat_response_strips_model_terminal_token(tmp_path):
+    client, llm = _gemma_client(tmp_path, eos_token="<turn|>")
+    llm.next_text = "Moo.<turn|>"
+    response = client.post("/v1/chat/completions",
+                           json={"messages": [{
+                               "role": "user",
+                               "content": "Cow?"
+                           }]})
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "Moo."
+
+
+def test_tool_stream_removes_split_terminal_token(tmp_path):
+    client, llm = _gemma_client(tmp_path, eos_token="<turn|>")
+    pieces = ["The cow ", "says moo<", "turn", "|>"]
+
+    def stream(_messages, _params, **_kwargs):
+        for i, piece in enumerate(pieces):
+            yield StreamDelta(text=piece, token_ids=[i], prompt_tokens=7)
+        yield StreamDelta(text="", finished=True, finish_reason="stop")
+
+    llm.generate_stream = stream
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Cow?"
+                               }],
+                               "tools": [_gemma_tool()],
+                               "stream": True,
+                           })
+    assert response.status_code == 200
+    payloads = _sse_payloads(response)
+    contents = [
+        p["choices"][0]["delta"].get("content") for p in payloads
+        if p.get("choices") and p["choices"][0]["delta"].get("content")
+    ]
+    assert "".join(contents) == "The cow says moo"
+    assert len(contents) >= 2
+    assert "<turn|>" not in response.text

@@ -47,8 +47,11 @@ from typing import (TYPE_CHECKING, Any, Dict, Iterator, List, Mapping,
                     Optional, Sequence, Union)
 
 from ..config import ContextCacheConfig
-from ..parsing.tool_calling import (ToolConfig, parse_assistant_output,
+from ..parsing.tool_calling import (ToolConfig, ToolProtocolError,
+                                    _parser_name_for_model,
+                                    parse_assistant_output,
                                     validate_tool_request)
+from ..parsing.terminal_tokens import terminal_special_tokens
 from ..parsing.tool_chat_template import (ToolChatTemplateFormatter,
                                           needs_tool_chat_template)
 from .engine_layout import BundleLayout, EngineType, inspect_bundle
@@ -1131,6 +1134,53 @@ class LLM:
             reasoning=parsed.reasoning or None,
         )
 
+    def decode_tool_output(
+            self,
+            text: str,
+            token_ids: Sequence[int],
+            tool_config: ToolConfig,
+            stop_strings: Sequence[str] = (),
+            tool_parser: str = "auto",
+    ) -> str:
+        """Restore Gemma tool syntax removed by native non-stream decoding.
+
+        The runtime decodes non-streamed output with special tokens skipped,
+        which deletes the ``<|tool_call>`` and ``<|"|>`` delimiters the Gemma
+        grammar depends on. Re-decode the token ids with the template
+        tokenizer, re-apply stop-string truncation (the ids run past it) and
+        drop the terminal pieces so the parser sees the model's protocol.
+        """
+        if not tool_config.parse_output:
+            return text
+        if tool_parser == "auto":
+            tool_parser = _parser_name_for_model(self.model_dir)
+        if tool_parser != "gemma4":
+            return text
+        if not token_ids:
+            if text:
+                raise ToolProtocolError("decode_failed")
+            return ""
+        try:
+            decoded = self._get_tool_template_formatter().decode_tokens(
+                token_ids)
+        except Exception:
+            raise ToolProtocolError("decode_failed") from None
+        if not isinstance(decoded, str):
+            raise ToolProtocolError("decode_failed")
+        stops = [decoded.find(stop) for stop in stop_strings if stop]
+        matched = [position for position in stops if position >= 0]
+        if matched:
+            decoded = decoded[:min(matched)]
+        terminals = terminal_special_tokens(self.model_dir)
+        while True:
+            stripped = decoded.rstrip()
+            terminal = next(
+                (token for token in terminals if stripped.endswith(token)),
+                None)
+            if terminal is None:
+                return decoded
+            decoded = stripped[:-len(terminal)]
+
     def _complete_prepared_request(
         self,
         request,
@@ -1143,6 +1193,11 @@ class LLM:
         response = self._handle_request(request)
         text = response.output_texts[0] if response.output_texts else ""
         token_ids = response.output_ids[0] if response.output_ids else []
+        text = self.decode_tool_output(text,
+                                       token_ids,
+                                       tool_config,
+                                       stop_strings=params.stop,
+                                       tool_parser=tool_parser)
         prompt_tokens = (response.prompt_token_counts[0]
                          if response.prompt_token_counts else None)
         finish_reason = (finish_reason_name(self._rt,

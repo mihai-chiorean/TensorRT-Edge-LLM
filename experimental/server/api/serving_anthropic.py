@@ -22,9 +22,10 @@ from typing import Any, AsyncGenerator, Dict, Iterable, Optional
 
 from ..runtime.engine_client import EngineClient, PreparedRequest
 from . import anthropic_compat as protocol
-from .errors import ServerError
+from ..parsing.tool_calling import ToolProtocolError
+from .errors import ServerError, ToolProtocolResponseError
 from .protocol import ChatCompletionRequest
-from .serving_chat import IM_END_TOKEN, OpenAIServingChat, PreparedChatRequest
+from .serving_chat import OpenAIServingChat, PreparedChatRequest
 
 
 @dataclass(frozen=True)
@@ -209,6 +210,7 @@ class AnthropicServingMessages:
         prepared: PreparedAnthropicStream,
     ) -> AsyncGenerator[str, None]:
         parser = self._chat.stream_output_parser(prepared.chat)
+        stripper = self._chat.stream_stripper(prepared.chat)
         blocks = _ContentBlockStream()
         prompt_tokens = None
         completion_tokens = 0
@@ -248,16 +250,19 @@ class AnthropicServingMessages:
                             prompt_tokens):
                         yield chunk
                     started = True
-                    if delta.text:
-                        text = delta.text.replace(IM_END_TOKEN, "")
-                        for chunk in blocks.feed(parser.feed(text)):
-                            yield chunk
-                elif delta.text:
-                    text = delta.text.replace(IM_END_TOKEN, "")
+                text = stripper.feed(delta.text) if delta.text else ""
+                if delta.finished:
+                    text += stripper.flush()
+                if text:
                     for chunk in blocks.feed(parser.feed(text)):
                         yield chunk
         except asyncio.CancelledError:
             raise
+        except ToolProtocolError as exc:
+            error = ToolProtocolResponseError(exc.reason)
+            yield protocol.event(
+                "error", protocol.error_payload(error.status_code, str(error)))
+            return
         except ServerError as exc:
             status = 529 if exc.status_code == 429 else exc.status_code
             yield protocol.event("error",
@@ -280,7 +285,14 @@ class AnthropicServingMessages:
                                                        self._client.model_name,
                                                        prompt_tokens):
                 yield chunk
-        for chunk in blocks.feed(parser.flush()):
+        try:
+            flushed = list(parser.flush())
+        except ToolProtocolError as exc:
+            error = ToolProtocolResponseError(exc.reason)
+            yield protocol.event(
+                "error", protocol.error_payload(error.status_code, str(error)))
+            return
+        for chunk in blocks.feed(flushed):
             yield chunk
         for chunk in blocks.finish():
             yield chunk
