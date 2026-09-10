@@ -290,3 +290,44 @@ conventional location, but setting them explicitly is what was validated.
   the main session's call, not this build's.
 - `-j$(nproc)` saturates all 8 cores and audibly degrades live speech. `-j6`
   is the tested compromise.
+
+## Addendum: upstream 0.10.1 (`e8b2952`)
+
+Branch `feat/jp72-sm87-0.10.1` rebases the fork line onto TensorRT Edge-LLM
+0.10.1. The recipe above still applies with these changes, verified on a
+Jetson AGX Orin 32 GB (JetPack 7.2 / CUDA 13.2 / TensorRT 10.16.2):
+
+1. **NVRTC is a build requirement.** 0.10.1 JIT-compiles the XQA decode
+   kernels with NVRTC at engine-build time and `cmake/FindNVRTC.cmake` is fatal
+   without `nvrtc.h` and `libnvrtc.so`, which JetPack does not install:
+
+   ```bash
+   sudo apt-get install -y cuda-nvrtc-dev-13-2   # 13.2.86-1, stock apt source
+   ```
+
+   `libNvInfer_edgellm_plugin.so` then links `libnvrtc.so.13` at runtime.
+
+2. **Unit tests build into per-area binaries** (`unittests/unitTest*`) when
+   configured with `-DBUILD_UNIT_TESTS=ON`; there is no single `unitTest`.
+
+3. **Engines must be rebuilt.** `AttentionPlugin` now serialises its XQA
+   kernels into the engine and `Int4GroupwiseGemmPluginV2` gained a
+   serialised `max_lock_workspace_bytes`; an engine built by 0.10.0 loads
+   (the version mismatch is a warning) and then fails in
+   `pluginV3Runner.cpp::onShapeChange` on the first prefill. Re-run
+   `scripts/jp72/build_engines.sh` against the existing ONNX export; the
+   0.10.0 `--int8-embedding` ONNX builds unchanged (E4B: 269 s for
+   `llm_build`, 8192/16384/1).
+
+4. **Server launch changed.** The server no longer takes `--model` and
+   `--multimodal-engine-dir`: pass the engine tree (the directory holding
+   `llm/` and `visual/`) as the positional argument, enable context reuse with
+   `--enable-context-reuse`, and allow `tool_choice=auto/required` with
+   `--enable-auto-tool-choice`. Remote `http(s)` media is refused unless
+   `--allow-remote-media` is given. The Gemma 4 tool parser is selected
+   automatically from the engine's `config.json`. See
+   `scripts/jp72/start_server.sh`.
+
+5. **Python runtime dependencies** are `requirements-server.txt` plus the
+   `server-tools` extra (`transformers`, `jinja2`) for tool chat templates; the
+   venv from the 0.10.0 recipe already satisfies both.
