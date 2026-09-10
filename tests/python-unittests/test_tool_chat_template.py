@@ -145,8 +145,12 @@ def test_formats_tool_template():
     )
 
     formatted = json.loads(prompt)
-    tool_call = formatted["messages"][0]["tool_calls"][0]
-    tool_message = formatted["messages"][1]
+    # A forced choice is stated at system priority for templates that
+    # ignore the tool_choice variable.
+    assert formatted["messages"][0]["role"] == "system"
+    assert "get_weather exactly once" in formatted["messages"][0]["content"]
+    tool_call = formatted["messages"][1]["tool_calls"][0]
+    tool_message = formatted["messages"][2]
     assert formatted["tools"] == tools
     assert formatted["tool_choice"] == {
         "type": "function",
@@ -157,6 +161,42 @@ def test_formats_tool_template():
     assert formatted["add_generation_prompt"] is True
     assert tool_call["function"]["arguments"] == {"city": "Paris"}
     assert tool_message["content"] == '{"temperature": 22}'
+
+
+def test_required_tool_instruction_extends_existing_system_turn():
+    owner = _RecordingTemplateOwner()
+    formatter = ToolChatTemplateFormatter([], template_owner=owner)
+    formatter.format(
+        [{
+            "role": "system",
+            "content": "trusted boundary"
+        }, {
+            "role": "user",
+            "content": "do it"
+        }],
+        tools=[{
+            "type": "function",
+            "function": {
+                "name": "set_volume",
+                "parameters": {}
+            },
+        }],
+        tool_choice="required",
+    )
+
+    assert owner.messages[0]["role"] == "system"
+    assert owner.messages[0]["content"].startswith("trusted boundary\n\n")
+    assert "must call exactly one of the declared tools" in (
+        owner.messages[0]["content"])
+    assert owner.messages[1] == {"role": "user", "content": "do it"}
+
+
+def test_auto_tool_choice_leaves_messages_alone():
+    owner = _RecordingTemplateOwner()
+    formatter = ToolChatTemplateFormatter([], template_owner=owner)
+    messages = [{"role": "user", "content": "do it"}]
+    formatter.format(messages, tools=[], tool_choice="auto")
+    assert owner.messages == messages
 
 
 def test_computes_context_reuse_replay_tail_from_tokenized_template():

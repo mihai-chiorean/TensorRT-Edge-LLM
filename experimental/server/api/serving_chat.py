@@ -26,15 +26,15 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 from ..config import ApiConfig
 from ..parsing.reasoning import REASONING_PARSERS
 from ..parsing.tool_calling import (StreamingAssistantOutputParser, ToolConfig,
-                                    _select_parser, list_tool_parsers,
-                                    parse_assistant_output,
+                                    ToolProtocolError, _select_parser,
+                                    list_tool_parsers, parse_assistant_output,
                                     stream_assistant_output,
                                     validate_tool_request)
 from ..runtime.engine import (OMNI_AUDIO_SAMPLE_RATE, AudioParams,
                               SamplingParams)
 from ..runtime.engine_client import EngineClient, PreparedRequest
 from .errors import (InvalidRequestError, ModelNotFoundError, ServerError,
-                     UnsupportedFeatureError)
+                     ToolProtocolResponseError, UnsupportedFeatureError)
 from .protocol import (ChatCompletionChoice, ChatCompletionMessage,
                        ChatCompletionRequest, ChatCompletionResponse,
                        ChatCompletionStreamChoice,
@@ -277,6 +277,10 @@ class OpenAIServingChat:
                 reasoning_parser=prepared.reasoning_parser,
                 prepared=engine_request,
             )
+        except ToolProtocolError as exc:
+            logger.warning("Tool protocol violation (%s); no content returned",
+                           exc.reason)
+            raise ToolProtocolResponseError(exc.reason) from exc
         except (KeyError, TypeError, ValueError) as exc:
             raise InvalidRequestError(str(exc)) from exc
 
@@ -672,6 +676,11 @@ class OpenAIServingChat:
                     finish_reason = delta.finish_reason or "stop"
         except asyncio.CancelledError:
             raise
+        except ToolProtocolError as exc:
+            for chunk in self._tool_protocol_failure(response_id, created,
+                                                     exc):
+                yield chunk
+            return
         except ServerError as exc:
             logger.warning("Streaming tool request failed: %s", exc)
             yield _sse_error(exc)
@@ -684,7 +693,14 @@ class OpenAIServingChat:
             yield "data: [DONE]\n\n"
             return
 
-        for message in messages_for(parser.flush()):
+        try:
+            flushed = list(messages_for(parser.flush()))
+        except ToolProtocolError as exc:
+            for chunk in self._tool_protocol_failure(response_id, created,
+                                                     exc):
+                yield chunk
+            return
+        for message in flushed:
             yield self._chunk(response_id, created, message)
         if reasoning_stream is not None:
             for parsed in reasoning_stream.flush():
@@ -709,6 +725,24 @@ class OpenAIServingChat:
             )
             yield _sse(usage_chunk)
         yield "data: [DONE]\n\n"
+
+    def _tool_protocol_failure(self, response_id: str, created: int,
+                               exc: ToolProtocolError) -> List[str]:
+        """Terminate a tool stream that produced unusable protocol.
+
+        Content already streamed cannot be retracted; the typed error and a
+        final ``finish_reason: "error"`` chunk tell the client that no tool
+        call may be executed from this turn.
+        """
+        logger.warning("Tool protocol violation (%s) in stream", exc.reason)
+        return [
+            _sse_error(ToolProtocolResponseError(exc.reason)),
+            self._chunk(response_id,
+                        created,
+                        DeltaMessage(),
+                        finish_reason="error"),
+            "data: [DONE]\n\n",
+        ]
 
     def _chunk(
         self,
