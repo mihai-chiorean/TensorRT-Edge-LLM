@@ -47,7 +47,8 @@ from typing import (TYPE_CHECKING, Any, Dict, Iterator, List, Mapping,
                     Optional, Sequence, Tuple, Union)
 
 from ..config import DEFAULT_MAX_QUEUED_REQUESTS, ContextCacheConfig
-from ..parsing.tool_calling import (ToolConfig, parse_assistant_output,
+from ..parsing.tool_calling import (ToolConfig, inject_tool_requirement,
+                                    parse_assistant_output,
                                     validate_tool_request)
 from .engine_layout import BundleLayout, EngineType, inspect_bundle
 
@@ -1307,6 +1308,9 @@ class LLM:
                               and self.has_draft_model and apply_chat_template
                               and add_generation_prompt)
         replay_tail_length = -1 if derive_replay_tail else 0
+        if apply_chat_template:
+            messages = inject_tool_requirement(messages,
+                                               tool_config.tool_choice)
         cpp_messages, image_buffers = self._prepare_messages_for_runtime(
             messages)
 
