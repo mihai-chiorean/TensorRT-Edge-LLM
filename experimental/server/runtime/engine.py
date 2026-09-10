@@ -73,6 +73,25 @@ _DEFAULT_VERIFY_TREE_SIZE = 60
 # Public data classes
 # ---------------------------------------------------------------------------
 
+#: Temperatures below this are greedy for the native sampler
+#: (cpp/sampler/samplingUtils.cpp).
+GREEDY_TEMPERATURE_EPSILON = 1e-3
+GREEDY_TOP_P = 1.0
+GREEDY_TOP_K = 1
+
+
+def normalize_greedy_sampling(temperature: float, top_p: float,
+                              top_k: int) -> Tuple[float, int]:
+    """Pin ``(top_p, top_k)`` to the greedy tuple for a greedy temperature.
+
+    OpenAI clients spell greedy decoding as ``temperature=0`` alone; the
+    native sampler otherwise rewrites the inconsistent triple and warns on
+    every request. Negative temperatures are left for the native range check.
+    """
+    if 0.0 <= temperature < GREEDY_TEMPERATURE_EPSILON:
+        return GREEDY_TOP_P, GREEDY_TOP_K
+    return top_p, top_k
+
 
 @dataclass
 class SamplingParams:
@@ -95,6 +114,10 @@ class SamplingParams:
     skip_special_tokens: bool = True
     reuse_context: bool = True
     cache_generated_tokens: bool = True
+
+    def __post_init__(self) -> None:
+        self.top_p, self.top_k = normalize_greedy_sampling(
+            self.temperature, self.top_p, self.top_k)
 
 
 @dataclass
@@ -166,6 +189,10 @@ class AudioParams:
     max_audio_length: int = 4096
     codec_chunk_frames: int = 10
     talker_prefill_threshold: int = 4
+
+    def __post_init__(self) -> None:
+        self.talker_top_p, self.talker_top_k = normalize_greedy_sampling(
+            self.talker_temperature, self.talker_top_p, self.talker_top_k)
 
 
 #: Sample rate of Omni Code2Wav PCM output.
@@ -2027,6 +2054,28 @@ class LLM:
             self._ensure_open()
             return self._runtime.get_context_cache_metrics()
 
+    def context_cache_metrics(self) -> Optional[Dict[str, Any]]:
+        """Cumulative context-cache counters as plain values, or None."""
+        if not self.context_cache_enabled:
+            return None
+        metrics = self.get_context_cache_metrics()
+        if metrics is None:
+            return None
+        result: Dict[str, Any] = {}
+        for name in dir(metrics):
+            if name.startswith("_"):
+                continue
+            value = getattr(metrics, name)
+            if callable(value):
+                continue
+            if hasattr(value, "free") and hasattr(value, "capacity"):
+                value = {
+                    "free": int(value.free),
+                    "capacity": int(value.capacity)
+                }
+            result[name] = value
+        return result
+
     @property
     def bundle_layout(self) -> BundleLayout:
         """Immutable component contract for the selected model bundle."""
@@ -2425,17 +2474,28 @@ def _load_image_buffers(rt_module,
     # Phase 1: reserve every image up front so the video sampler's budget is
     # order-independent ([image, video] and [video, image] behave identically).
     if budget is not None:
-        from ..media.video_sampling import estimate_image_tokens
+        from ..media.image_preflight import probe_image_dimensions
+        from ..media.video_sampling import (estimate_image_tokens,
+                                            estimate_image_tokens_for_size)
         for item in items:
             if item.get("type") not in ("image", "image_url"):
                 continue
             source = image_sources[id(item)]
+            do_resize = bool(item.get("do_resize", True))
             if isinstance(source, str) and os.path.isfile(source):
                 est = estimate_image_tokens(source,
                                             family,
                                             limits,
-                                            do_resize=bool(
-                                                item.get("do_resize", True)))
+                                            do_resize=do_resize)
+            elif isinstance(source, bytes):
+                # In-memory images were bounded by the preflight probe; the
+                # same header gives the size the C++ resize will see.
+                width, height = probe_image_dimensions(source)
+                est = estimate_image_tokens_for_size(width,
+                                                     height,
+                                                     family,
+                                                     limits,
+                                                     do_resize=do_resize)
             else:
                 est = int(limits.get("max_image_tokens_per_image", 0))
             image_upper += est
