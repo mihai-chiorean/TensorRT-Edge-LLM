@@ -471,7 +471,7 @@ _DEFAULT_CONTEXT_CACHE_MAX_RECORDS = 1024
 
 
 def _env_flag(name: str, default: bool) -> bool:
-    """Read a boolean environment override; unset or unparseable keeps `default`."""
+    """Read a boolean environment override; unset or unparsable keeps `default`."""
     raw = os.environ.get(name)
     if raw is None:
         return default
@@ -480,7 +480,7 @@ def _env_flag(name: str, default: bool) -> bool:
         return True
     if value in ("0", "false", "no", "off"):
         return False
-    logger.warning("Ignoring unparseable %s=%r; using default %s", name, raw,
+    logger.warning("Ignoring unparsable %s=%r; using default %s", name, raw,
                    default)
     return default
 
@@ -1683,6 +1683,7 @@ class LLM:
         *,
         tools: Optional[Sequence[Dict[str, Any]]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        tool_config: Optional[ToolConfig] = None,
         prebuilt_request: Optional[Any] = None,
         admission_handoff: Optional[Any] = None,
     ) -> Generator[StreamDelta, None, None]:
@@ -1690,12 +1691,15 @@ class LLM:
 
         Runs ``handleRequest`` in a background thread with a
         ``StreamChannel`` attached, yielding ``StreamDelta`` objects as
-        tokens are produced.
+        tokens are produced. A caller that already validated the request
+        passes ``tool_config``; ``tool_choice`` is the raw OpenAI value, and
+        a normalised choice such as ``"function"`` must not be re-validated.
         """
         params = sampling_params or SamplingParams()
 
         channel = self._rt.StreamChannel.create()
-        tool_config = validate_tool_request(messages, tools, tool_choice)
+        if tool_config is None:
+            tool_config = validate_tool_request(messages, tools, tool_choice)
         preserve_tool_tokens = (tool_config.parse_output
                                 and _parser_name_for_model(
                                     self.model_dir) == "gemma4")
@@ -1719,8 +1723,9 @@ class LLM:
                 request = self._make_generation_request(
                     messages,
                     params,
-                    tools=tools,
-                    tool_choice=tool_choice,
+                    tools=tool_config.tools,
+                    tool_choice=tool_config.tool_choice,
+                    tool_config=tool_config,
                     stream_channel=channel,
                 )
         except BaseException:

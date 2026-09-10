@@ -228,6 +228,7 @@ class _FakeLLM:
                         *,
                         tools=None,
                         tool_choice=None,
+                        tool_config=None,
                         prebuilt_request=None,
                         admission_handoff=None):
         yield StreamDelta(text="<think>plan</think>", finished=False)
@@ -291,6 +292,7 @@ class _FakeTokenLLM:
                         *,
                         tools=None,
                         tool_choice=None,
+                        tool_config=None,
                         prebuilt_request=None,
                         admission_handoff=None):
         yield StreamDelta(text="Hello ", token_ids=[1, 2, 3], finished=False)

@@ -348,6 +348,7 @@ def stream_run(llm_instance,
                 params,
                 tools=tool_config.tools,
                 tool_choice=tool_config.tool_choice,
+                tool_config=tool_config,
                 prebuilt_request=prebuilt_request,
                 admission_handoff=handoff):
             completion_tokens += len(delta.token_ids or [])

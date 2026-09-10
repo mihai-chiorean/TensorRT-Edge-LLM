@@ -259,3 +259,50 @@ def test_direct_generate_restores_tokens_before_tool_parsing():
     assert json.loads(output.tool_calls[0]["function"]["arguments"]) == {
         "city": "Berkeley, California"
     }
+
+
+def test_stream_accepts_prevalidated_forced_tool_choice():
+    """The HTTP layer hands generate_stream a ToolConfig whose tool_choice is
+    already normalised to "function"; re-validating that string used to fail
+    every streamed forced-tool request."""
+    llm, config, _, _ = _gemma_tool_fixture()
+    name = sorted(config.names)[0]
+    forced = validate_tool_request([], config.tools, {
+        "type": "function",
+        "function": {
+            "name": name
+        }
+    })
+    assert forced.tool_choice == "function" and forced.forced_name == name
+
+    class _Channel:
+        skip = None
+
+        def set_skip_special_tokens(self, flag):
+            self.skip = flag
+
+        def wait_pop(self, timeout_ms):
+            return None
+
+        def is_finished(self):
+            return True
+
+        def is_cancelled(self):
+            return False
+
+        def cancel(self):
+            raise AssertionError("Completed channel must not be cancelled")
+
+    channel = _Channel()
+    llm._rt = SimpleNamespace(StreamChannel=SimpleNamespace(
+        create=lambda: channel))
+    llm._handle_request = lambda request: None
+    deltas = list(
+        llm.generate_stream(
+            [],
+            tools=forced.tools,
+            tool_choice=forced.tool_choice,
+            tool_config=forced,
+            prebuilt_request=SimpleNamespace(stream_channels=[])))
+    assert deltas == []
+    assert channel.skip is False

@@ -1745,6 +1745,7 @@ def _generate_stream_sse_inner(llm_instance,
             params,
             tools=stream_tools,
             tool_choice=stream_tool_choice,
+            tool_config=tool_config,
             prebuilt_request=prebuilt_request,
             admission_handoff=handoff)
     try:
@@ -1892,7 +1893,8 @@ def _generate_tool_stream_sse(llm_instance,
                                           prebuilt_request=prebuilt_request,
                                           admission_handoff=handoff,
                                           tools=tool_config.tools,
-                                          tool_choice=tool_config.tool_choice)
+                                          tool_choice=tool_config.tool_choice,
+                                          tool_config=tool_config)
     try:
         for delta in deltas:
             completion_tokens += len(delta.token_ids or [])
