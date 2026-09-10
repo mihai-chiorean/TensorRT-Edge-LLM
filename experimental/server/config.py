@@ -268,7 +268,9 @@ def create_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "model",
-        help="Hugging Face model ID or local checkpoint directory",
+        help=("Hugging Face model ID, local checkpoint directory, or a "
+              "directory of pre-built engines (a builder bundle, or the "
+              "llm/ + visual/ tree written by llm_build and visual_build)"),
     )
 
     api = parser.add_argument_group("HTTP server")

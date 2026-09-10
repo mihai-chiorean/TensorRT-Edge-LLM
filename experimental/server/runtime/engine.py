@@ -743,6 +743,9 @@ class LLM:
         self._cache_dir = cache_root(cache_dir)
         self._model_dir = prepared.model_dir
         self._draft_model_dir = prepared.draft_model_dir
+        self._checkpoint_dir = "" if prepared.prebuilt else prepared.model_dir
+        self._draft_checkpoint_dir = ("" if prepared.prebuilt else
+                                      prepared.draft_model_dir)
         runtime_options = _resolve_spec_decode_runtime_options(
             prepared.bundle_dir,
             spec_method,
@@ -772,7 +775,8 @@ class LLM:
                              f"{self._layout.root!r}")
 
         self._bundle_dir = self._layout.root
-        builder_config = _read_bundle_builder_config(self._bundle_dir)
+        self._engine_dir = self._layout.engine_dir
+        builder_config = _read_bundle_builder_config(self._engine_dir)
         self._max_input_len = _engine_config_value(builder_config,
                                                    "max_input_len",
                                                    self._max_input_len)
@@ -784,7 +788,7 @@ class LLM:
             self._max_kv_cache_capacity)
 
         self._media_dir = self._layout.media_dir
-        logger.info("Using cached engine bundle: %s", self._bundle_dir)
+        logger.info("Using engine bundle: %s", self._bundle_dir)
 
     def _load_runtime(self) -> None:
         """Load checkpoint-backed weights once, then initialize the runtime."""
@@ -802,23 +806,23 @@ class LLM:
                 self._dflash_block_size,
             )
             self._runtime = self._rt.LLMRuntime(
-                self._bundle_dir,
+                self._engine_dir,
                 self._media_dir,
                 {},
                 self._draft_top_k,
                 self._draft_step,
                 self._verify_tree_size,
-                self._model_dir,
-                self._draft_model_dir,
+                self._checkpoint_dir,
+                self._draft_checkpoint_dir,
                 context_cache_config,
                 self._dflash_block_size,
             )
         else:
             self._runtime = self._rt.LLMRuntime(
-                self._bundle_dir,
+                self._engine_dir,
                 self._media_dir,
                 {},
-                self._model_dir,
+                self._checkpoint_dir,
                 context_cache_config,
             )
         self._runtime.capture_decoding_cuda_graph()
@@ -834,8 +838,8 @@ class LLM:
 
         self._runtime.load_omni(self._layout.talker_dir,
                                 self._layout.code_predictor_dir,
-                                self._layout.code2wav_dir, self._bundle_dir,
-                                self._model_dir)
+                                self._layout.code2wav_dir, self._engine_dir,
+                                self._checkpoint_dir)
         logger.info("Omni audio output ready.")
 
     def _tool_template_dirs(self) -> List[str]:
@@ -1777,10 +1781,15 @@ class TTS:
 
 def load_model(**kwargs):
     """Select the model-specific runtime from provider checkpoint metadata."""
-    from .engine_build import resolve_model_dir
+    from .engine_build import prebuilt_bundle_layout, resolve_model_dir
 
     original_model = kwargs["model"]
-    resolved = resolve_model_dir(original_model, kwargs.get("cache_dir", ""))
+    prebuilt = prebuilt_bundle_layout(original_model)
+    if prebuilt is not None:
+        resolved = prebuilt.engine_dir
+    else:
+        resolved = resolve_model_dir(original_model,
+                                     kwargs.get("cache_dir", ""))
     with open(os.path.join(resolved, "config.json"), encoding="utf-8") as file:
         model_type = json.load(file).get("model_type")
     if model_type == "qwen3_tts":
@@ -1799,7 +1808,10 @@ def load_model(**kwargs):
                 "standalone TTS models do not use a KV context cache")
     else:
         runtime_class = LLM
-    runtime = runtime_class(**{**kwargs, "model": resolved})
+    # A pre-built tree is addressed by its root (llm/ next to visual/); the
+    # resolved llm dir only served the model-type lookup above.
+    model_arg = original_model if prebuilt is not None else resolved
+    runtime = runtime_class(**{**kwargs, "model": model_arg})
     runtime._model_id = _derive_model_id(original_model)
     return runtime
 

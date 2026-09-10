@@ -79,6 +79,25 @@ def test_complete_bundle_layout(tmp_path):
     assert layout.has_speech
 
 
+def test_exported_engine_tree_layout(tmp_path):
+    (tmp_path / "llm").mkdir()
+    (tmp_path / "llm" / "llm.engine").touch()
+    _write_json(tmp_path / "llm" / "config.json", _engine_config())
+    (tmp_path / "visual").mkdir()
+    (tmp_path / "visual" / "visual.engine").touch()
+
+    layout = inspect_bundle(str(tmp_path))
+    assert layout.engine_type == EngineType.LLM
+    assert layout.engine_dir == str(tmp_path / "llm")
+    assert layout.media_dir == str(tmp_path)
+    assert layout.visual_dir == str(tmp_path / "visual")
+
+    text_only = inspect_bundle(str(tmp_path / "llm"))
+    assert text_only.engine_type == EngineType.LLM
+    assert text_only.engine_dir == str(tmp_path / "llm")
+    assert text_only.media_dir == ""
+
+
 def test_spec_bundle_layout(tmp_path):
     (tmp_path / "spec_base.engine").touch()
     (tmp_path / "spec_draft.engine").touch()
@@ -230,6 +249,30 @@ def test_model_source_rejects_cache_artifacts_and_onnx(tmp_path):
         engine_build.resolve_model_dir(str(bundle))
 
 
+def test_prepare_model_serves_prebuilt_bundle_without_building(
+        tmp_path, monkeypatch):
+    bundle = tmp_path / "engines"
+    (bundle / "llm").mkdir(parents=True)
+    (bundle / "llm" / "llm.engine").touch()
+    _write_json(bundle / "llm" / "config.json", _engine_config())
+
+    def _fail(*_args, **_kwargs):
+        raise AssertionError("the builder must not run for a prebuilt bundle")
+
+    monkeypatch.setattr("experimental.builder.cli.main", _fail, raising=False)
+    prepared = engine_build.prepare_model(str(bundle), str(tmp_path / "cache"))
+    assert prepared.prebuilt
+    assert not prepared.built
+    assert prepared.bundle_dir == str(bundle)
+    assert prepared.model_dir == str(bundle / "llm")
+    assert not (tmp_path / "cache").exists()
+
+    with pytest.raises(ValueError, match="draft"):
+        engine_build.prepare_model(
+            str(bundle), str(tmp_path / "cache"),
+            BuildOptions(spec_type="eagle3", draft_model_dir="draft"))
+
+
 class _FakeRuntime:
 
     def __init__(self, *args):
@@ -298,3 +341,49 @@ def test_llm_pairs_cached_bundle_with_resolved_checkpoints(
     assert llm._runtime.args[-4:-2] == (str(base), str(draft))
     assert not llm._runtime.args[-2].enabled
     assert llm._runtime.args[-1] == 0
+
+
+def test_llm_loads_prebuilt_engine_tree_without_checkpoint(
+        tmp_path, monkeypatch):
+    bundle = tmp_path / "engines"
+    (bundle / "llm").mkdir(parents=True)
+    (bundle / "llm" / "llm.engine").touch()
+    _write_json(
+        bundle / "llm" / "config.json",
+        _engine_config() | {
+            "builder_config": {
+                "max_input_len": 8192,
+                "max_batch_size": 1,
+                "max_kv_cache_capacity": 16384,
+            }
+        })
+    (bundle / "visual").mkdir()
+    (bundle / "visual" / "visual.engine").touch()
+
+    monkeypatch.setattr("experimental.server.runtime.engine._import_runtime",
+                        lambda: _FakeBindings)
+    llm = LLM(model=str(bundle), cache_dir=str(tmp_path / "cache"))
+    assert llm.model_id == "engines"
+    assert llm.model_dir == str(bundle / "llm")
+    assert llm.bundle_dir == str(bundle)
+    assert llm._runtime.args[:4] == (str(bundle / "llm"), str(bundle), {}, "")
+    assert llm._max_input_len == 8192
+    assert llm._max_kv_cache_capacity == 16384
+
+
+def test_load_model_keeps_prebuilt_tree_root(tmp_path, monkeypatch):
+    from experimental.server.runtime.engine import load_model
+
+    bundle = tmp_path / "engines"
+    (bundle / "llm").mkdir(parents=True)
+    (bundle / "llm" / "llm.engine").touch()
+    _write_json(bundle / "llm" / "config.json", _engine_config())
+    (bundle / "visual").mkdir()
+    (bundle / "visual" / "visual.engine").touch()
+
+    monkeypatch.setattr("experimental.server.runtime.engine._import_runtime",
+                        lambda: _FakeBindings)
+    llm = load_model(model=str(bundle), cache_dir=str(tmp_path / "cache"))
+    assert llm.bundle_dir == str(bundle)
+    assert llm.bundle_layout.visual_dir == str(bundle / "visual")
+    assert llm._runtime.args[:2] == (str(bundle / "llm"), str(bundle))

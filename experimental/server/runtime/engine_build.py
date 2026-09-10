@@ -102,12 +102,25 @@ class PreparedModel:
     model_dir: str
     draft_model_dir: str = ""
     built: bool = False
+    #: The bundle was supplied by the user instead of built from a checkpoint.
+    #: Its weights are self-contained, so no checkpoint dir reaches the runtime.
+    prebuilt: bool = False
 
 
 def cache_root(cache_dir: str = "") -> str:
     """Return the one user-controlled artifact root."""
     root = Path(cache_dir).expanduser() if cache_dir else _DEFAULT_CACHE_DIR
     return str(root.resolve())
+
+
+def prebuilt_bundle_layout(model: str) -> Optional[engine_layout.BundleLayout]:
+    """Return the layout when ``model`` is a directory of built engines."""
+    if not os.path.isdir(model):
+        return None
+    layout = engine_layout.inspect_bundle(model)
+    if layout.engine_type == engine_layout.EngineType.UNKNOWN:
+        return None
+    return layout
 
 
 def resolve_model_dir(model: str, cache_dir: str = "") -> str:
@@ -410,8 +423,23 @@ def prepare_model(model: str,
                   *,
                   max_cache_size_bytes: int = _DEFAULT_ENGINE_CACHE_MAX_BYTES,
                   clear_cache: bool = False) -> PreparedModel:
-    """Resolve a model and build every component on a cache miss."""
+    """Resolve a model and build every component on a cache miss.
+
+    A directory that already holds engines (a builder bundle, or the
+    ``llm/`` + ``visual/`` tree written by ``llm_build``/``visual_build``) is
+    served as-is; the engine cache is bypassed and nothing is built.
+    """
     options = options or BuildOptions()
+    prebuilt = prebuilt_bundle_layout(model)
+    if prebuilt is not None:
+        if options.draft_model_dir:
+            raise ValueError(
+                "a pre-built engine bundle cannot be combined with a draft "
+                "model; its draft engine must be part of the bundle")
+        return PreparedModel(prebuilt.root,
+                             prebuilt.engine_dir,
+                             built=False,
+                             prebuilt=True)
     model_dir = resolve_model_dir(model, cache_dir)
     draft_model_dir = ""
     if options.draft_model_dir:
