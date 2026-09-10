@@ -408,6 +408,7 @@ def test_context_cache_config_maps_to_native_runtime_value():
             self.max_records = 0
             self.recurrent_snapshot_pool_bytes = 0
             self.partial_kv_snapshot_pool_bytes = 0
+            self.encoder_embedding_cache_budget_bytes = -1
 
     native = _native_context_cache_config(
         SimpleNamespace(ContextCacheConfig=NativeConfig),
@@ -416,6 +417,7 @@ def test_context_cache_config_maps_to_native_runtime_value():
             max_records=17,
             recurrent_snapshot_pool_bytes=1024,
             partial_kv_snapshot_pool_bytes=2048,
+            encoder_embedding_cache_budget_bytes=4096,
         ),
     )
 
@@ -423,6 +425,14 @@ def test_context_cache_config_maps_to_native_runtime_value():
     assert native.max_records == 17
     assert native.recurrent_snapshot_pool_bytes == 1024
     assert native.partial_kv_snapshot_pool_bytes == 2048
+    assert native.encoder_embedding_cache_budget_bytes == 4096
+
+    disabled = _native_context_cache_config(
+        SimpleNamespace(ContextCacheConfig=NativeConfig),
+        ContextCacheConfig(encoder_embedding_cache_budget_bytes=0),
+    )
+    assert not disabled.enabled
+    assert disabled.encoder_embedding_cache_budget_bytes == 0
 
 
 @pytest.mark.parametrize(
@@ -470,6 +480,7 @@ def test_runtime_load_forwards_context_cache_config(monkeypatch, engine_type):
             self.max_records = 0
             self.recurrent_snapshot_pool_bytes = 0
             self.partial_kv_snapshot_pool_bytes = 0
+            self.encoder_embedding_cache_budget_bytes = -1
 
     class Runtime:
 
@@ -498,8 +509,8 @@ def test_runtime_load_forwards_context_cache_config(monkeypatch, engine_type):
     llm._draft_step = 3
     llm._verify_tree_size = 8
     llm._dflash_block_size = 0
-    llm._context_cache_config = ContextCacheConfig(enabled=True,
-                                                   max_records=23)
+    llm._context_cache_config = ContextCacheConfig(
+        enabled=True, max_records=23, encoder_embedding_cache_budget_bytes=512)
 
     llm._load_runtime()
 
@@ -507,6 +518,7 @@ def test_runtime_load_forwards_context_cache_config(monkeypatch, engine_type):
                               EngineType.SPEC_DECODE else -1]
     assert native.enabled
     assert native.max_records == 23
+    assert native.encoder_embedding_cache_budget_bytes == 512
     if engine_type == EngineType.SPEC_DECODE:
         assert captured["args"][-1] == 0
 
