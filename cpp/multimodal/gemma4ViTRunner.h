@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "multimodal/encoderEmbeddingCache.h"
 #include "multimodalRunner.h"
 #include <cuda_fp16.h>
 #include <tuple>
@@ -90,22 +91,40 @@ private:
     void generatePoolingWeights(
         std::vector<ImageGrid> const& imageGrids, int64_t totalPatches, int64_t totalSoftTokens, cudaStream_t stream);
 
-    Gemma4ViTConfig mConfig{};           //!< Gemma4 vision configuration
-    rt::Tensor mVitInput{};              //!< Vision encoder input patches
-    rt::Tensor mPixelPositionIds{};      //!< Pixel position IDs device tensor
-    rt::Tensor mPixelPositionIdsHost{};  //!< Pixel position IDs host tensor
-    rt::Tensor mRotaryPosEmb{};          //!< Gemma4 visual RoPE angle tensor
-    rt::Tensor mPoolingWeights{};        //!< Dense pooling weights device tensor
-    rt::Tensor mCuSeqlens{};             //!< Cumulative sequence lengths tensor
-    rt::Tensor mCuSeqlensHost{};         //!< Cumulative sequence lengths host tensor
-    rt::Tensor mKvLengths{};             //!< KV lengths for TRT-native attention
-    rt::Tensor mMaxSeqLenCarrier{};      //!< Shape-only max sequence length carrier
-    rt::Tensor mImageMean{};             //!< Image mean tensor
-    rt::Tensor mImageStd{};              //!< Image standard deviation tensor
-    rt::Tensor mImageDevice{};           //!< Temporary image buffer (holds the GPU-resized image)
-    rt::Tensor mNormalizedImageDevice{}; //!< Temporary normalized image buffer
-    rt::Tensor mRawImageDevice{};        //!< Raw (pre-resize) image device buffer for the GPU resize path
-    rt::Tensor mResizeTmpDevice{};       //!< Float scratch (horizontal pass) for the GPU resize
+    //! Encoder rows to cache once the current engine run has been enqueued.
+    struct PendingCacheInsert
+    {
+        Hash128 key;
+        int64_t rowOffset{0};
+        int64_t rows{0};
+    };
+
+    //! Cache identity of one still image, or nullopt for inputs the cache does not cover (video).
+    std::optional<Hash128> embeddingCacheKey(rt::imageUtils::ImageData const& image) const;
+
+    //! When every image of the request is cached, copy its rows into mOutputEmbedding, fill the
+    //! per-image token lengths and leave the engine input empty so infer() is a no-op.
+    bool assembleFromEmbeddingCache(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
+        std::vector<int64_t>& numImages, cudaStream_t stream);
+
+    Gemma4ViTConfig mConfig{};                            //!< Gemma4 vision configuration
+    EncoderEmbeddingCache mEmbeddingCache;                //!< Per-image encoder rows keyed by content
+    std::vector<PendingCacheInsert> mPendingCacheInserts; //!< Filled by imagePreprocess, drained by infer()
+    rt::Tensor mVitInput{};                               //!< Vision encoder input patches
+    rt::Tensor mPixelPositionIds{};                       //!< Pixel position IDs device tensor
+    rt::Tensor mPixelPositionIdsHost{};                   //!< Pixel position IDs host tensor
+    rt::Tensor mRotaryPosEmb{};                           //!< Gemma4 visual RoPE angle tensor
+    rt::Tensor mPoolingWeights{};                         //!< Dense pooling weights device tensor
+    rt::Tensor mCuSeqlens{};                              //!< Cumulative sequence lengths tensor
+    rt::Tensor mCuSeqlensHost{};                          //!< Cumulative sequence lengths host tensor
+    rt::Tensor mKvLengths{};                              //!< KV lengths for TRT-native attention
+    rt::Tensor mMaxSeqLenCarrier{};                       //!< Shape-only max sequence length carrier
+    rt::Tensor mImageMean{};                              //!< Image mean tensor
+    rt::Tensor mImageStd{};                               //!< Image standard deviation tensor
+    rt::Tensor mImageDevice{};                            //!< Temporary image buffer (holds the GPU-resized image)
+    rt::Tensor mNormalizedImageDevice{};                  //!< Temporary normalized image buffer
+    rt::Tensor mRawImageDevice{};  //!< Raw (pre-resize) image device buffer for the GPU resize path
+    rt::Tensor mResizeTmpDevice{}; //!< Float scratch (horizontal pass) for the GPU resize
 
     bool mUseTrtNativeVitAttn{false}; //!< Use TRT IAttentionV2 instead of ViTAttentionPlugin
     bool mHasMaxSeqLenCarrier{false}; //!< Whether the visual engine has max_seqlen_carrier binding
