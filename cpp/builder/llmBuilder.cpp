@@ -1853,7 +1853,7 @@ bool LLMBuilder::copyTokenizerFiles()
     }
 
     std::vector<std::string> tokenizerFiles
-        = {"tokenizer_config.json", "tokenizer.json", "processed_chat_template.json"};
+        = {"tokenizer_config.json", "tokenizer.json", "processed_chat_template.json", "chat_template.jinja"};
     bool allSuccess = true;
 
     for (auto const& filename : tokenizerFiles)
@@ -1861,6 +1861,12 @@ bool LLMBuilder::copyTokenizerFiles()
         std::string const srcPath = (mOnnxDir / filename).string();
         std::string const dstPath = (mEngineDir / filename).string();
 
+        // Tool-aware chat templates read chat_template.jinja from the engine directory; exports of models
+        // without one are still complete.
+        if (filename == "chat_template.jinja" && !std::filesystem::exists(srcPath))
+        {
+            continue;
+        }
         if (file_io::copyFile(srcPath, dstPath))
         {
             LOG_INFO("Copied tokenizer file: %s", filename.c_str());
