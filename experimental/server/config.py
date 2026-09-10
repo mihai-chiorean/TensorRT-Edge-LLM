@@ -216,6 +216,7 @@ class ApiConfig:
     max_queued_requests: int = 16
     queue_timeout: float = 600.0
     allowed_local_media_path: str = ""
+    allow_remote_media: bool = False
     log_level: str = "info"
 
     def __post_init__(self) -> None:
@@ -293,6 +294,12 @@ def create_argument_parser() -> argparse.ArgumentParser:
     api.add_argument("--max-queued-requests", type=int, default=16)
     api.add_argument("--queue-timeout", type=float, default=600.0)
     api.add_argument("--allowed-local-media-path", default="")
+    api.add_argument(
+        "--allow-remote-media",
+        action="store_true",
+        help="Fetch http(s) media URLs on the server; off by default so an "
+        "unauthenticated request cannot make the device reach the network",
+    )
     api.add_argument(
         "--log-level",
         choices=("debug", "info", "warning", "error"),
@@ -393,6 +400,7 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
         max_queued_requests=args.max_queued_requests,
         queue_timeout=args.queue_timeout,
         allowed_local_media_path=args.allowed_local_media_path,
+        allow_remote_media=args.allow_remote_media,
         log_level=args.log_level,
     )
     return ServerConfig(model=model, api=api)

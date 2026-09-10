@@ -118,6 +118,23 @@ class OpenAIServingChat:
             raise ValueError(
                 f"unknown tool parser {config.tool_call_parser!r}; "
                 f"available: {available}")
+        if config.enable_auto_tool_choice:
+            self._warm_tool_template()
+
+    def _warm_tool_template(self) -> None:
+        """Load the tool chat template before the first tool request.
+
+        The transformers import behind it costs several seconds on an edge
+        device and would otherwise land on the first tool call's latency.
+        """
+        get_formatter = getattr(self._client.llm,
+                                "_get_tool_template_formatter", None)
+        if get_formatter is None:
+            return
+        try:
+            get_formatter()._load_template_owner()
+        except Exception as exc:
+            logger.warning("Tool chat template warm-up skipped: %s", exc)
 
     def prepare_request(self,
                         request: ChatCompletionRequest) -> PreparedChatRequest:
@@ -146,6 +163,7 @@ class OpenAIServingChat:
             enforce_local_media_policy(
                 request.messages,
                 self._config.allowed_local_media_path,
+                allow_remote=self._config.allow_remote_media,
             )
         except PermissionError as exc:
             raise ServerError(str(exc), status_code=403) from exc
@@ -224,11 +242,10 @@ class OpenAIServingChat:
         num_logprobs = 0
         if request.logprobs:
             num_logprobs = max(1, request.top_logprobs or 0)
-        greedy = request.temperature == 0
         sampling = SamplingParams(
             temperature=request.temperature,
-            top_p=1.0 if greedy else request.top_p,
-            top_k=1 if greedy else request.top_k,
+            top_p=request.top_p,
+            top_k=request.top_k,
             max_tokens=request.effective_max_tokens,
             enable_thinking=request.enable_thinking,
             disable_spec_decode=request.disable_spec_decode,

@@ -17,6 +17,7 @@
 import asyncio
 import base64
 import json
+import struct
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,8 +25,14 @@ import pytest
 
 from experimental.server.api.errors import ServerOverloadedError
 from experimental.server.config import ApiConfig
-from experimental.server.runtime.engine import (CompletionOutput, LogprobEntry,
-                                                SamplingParams, StreamDelta)
+from experimental.server.runtime.engine import (AudioParams, CompletionOutput,
+                                                LogprobEntry, SamplingParams,
+                                                StreamDelta)
+
+
+def _png_bytes(width, height):
+    return (b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" +
+            struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
 
 
 def _create_app(llm, config=None):
@@ -1748,7 +1755,7 @@ def test_remote_media_fetch_is_size_bounded(monkeypatch):
             return "https://example.com/image.png"
 
         def read(self, _limit):
-            return b"oversized"
+            return _png_bytes(8, 8) + b"oversized"
 
     monkeypatch.setattr(media_source.urllib.request, "urlopen",
                         lambda *_args, **_kwargs: Response())
@@ -1758,7 +1765,8 @@ def test_remote_media_fetch_is_size_bounded(monkeypatch):
             "url": "https://example.com/image.png"
         },
     }
-    assert media_source.resolve_image_message(item) == b"oversized"
+    assert media_source.resolve_image_message(item) == (_png_bytes(8, 8) +
+                                                        b"oversized")
     with pytest.raises(ValueError, match="supported maximum"):
         media_source.fetch_remote_media("https://example.com/image.png",
                                         "image", 4)
@@ -1778,7 +1786,7 @@ def test_image_data_url_reaches_bytes_loader():
             cls.loaded = data
             return Image()
 
-    payload = base64.b64encode(b"encoded-image").decode()
+    payload = base64.b64encode(_png_bytes(64, 48)).decode()
     buffers = _load_image_buffers(Runtime, [{
         "role":
         "user",
@@ -1790,7 +1798,7 @@ def test_image_data_url_reaches_bytes_loader():
         }],
     }])
     assert len(buffers) == 1
-    assert Runtime.loaded == b"encoded-image"
+    assert Runtime.loaded == _png_bytes(64, 48)
 
 
 def _gemma_tool():
@@ -1989,3 +1997,355 @@ def test_tool_stream_removes_split_terminal_token(tmp_path):
     assert "".join(contents) == "The cow says moo"
     assert len(contents) >= 2
     assert "<turn|>" not in response.text
+
+
+# ---------------------------------------------------------------------------
+# data: image preflight (dimension / size / format bounds)
+# ---------------------------------------------------------------------------
+
+
+def _jpeg_bytes(width, height):
+    """SOI + a skipped APP0 + SOF0 carrying the dimensions + SOS."""
+    app0 = b"\xff\xe0" + struct.pack(">H", 4) + b"\x00\x00"
+    sof0 = (b"\xff\xc0" + struct.pack(">H", 11) + b"\x08" +
+            struct.pack(">HH", height, width) + b"\x01\x01\x11\x00")
+    return b"\xff\xd8" + app0 + sof0 + b"\xff\xda"
+
+
+def _gif_bytes(width, height):
+    return b"GIF89a" + struct.pack("<HH", width, height) + b"\x00\x00\x00"
+
+
+def _bmp_bytes(width, height):
+    # Negative height marks a top-down bitmap; the probe takes the magnitude.
+    return (b"BM" + b"\x00" * 12 + struct.pack("<I", 40) +
+            struct.pack("<ii", width, -height) + b"\x00" * 4)
+
+
+def _bmp_core_bytes(width, height):
+    return (b"BM" + b"\x00" * 12 + struct.pack("<I", 12) +
+            struct.pack("<HH", width, height) + b"\x00" * 4)
+
+
+def _image_data_url(payload, media_type="image/png"):
+    encoded = base64.b64encode(payload).decode("ascii")
+    return f"data:{media_type};base64,{encoded}"
+
+
+def _preflight():
+    from experimental.server.media import image_preflight
+    return image_preflight
+
+
+@pytest.mark.parametrize("payload_fn,media_type", [
+    (_png_bytes, "image/png"),
+    (_jpeg_bytes, "image/jpeg"),
+    (_gif_bytes, "image/gif"),
+    (_bmp_bytes, "image/bmp"),
+])
+def test_preflight_probes_every_supported_container(payload_fn, media_type):
+    pf = _preflight()
+    data, size = pf.preflight_image_data_url(
+        _image_data_url(payload_fn(640, 480), media_type))
+    assert size == (640, 480)
+    assert data == payload_fn(640, 480)
+
+
+def test_preflight_rejects_oversized_dimension_without_decoding():
+    """A ~50-byte PNG declaring a 60000x60000 canvas must never reach
+    stb_image, which would allocate ~10 GB for it."""
+    pf = _preflight()
+    bomb = _png_bytes(60000, 60000)
+    assert len(bomb) < 100
+    with pytest.raises(ValueError, match="per side"):
+        pf.preflight_image_data_url(_image_data_url(bomb))
+
+
+def test_preflight_does_not_wrap_unsigned_bmp_core_dimensions():
+    pf = _preflight()
+    with pytest.raises(ValueError, match="per side"):
+        pf.preflight_image_data_url(
+            _image_data_url(_bmp_core_bytes(65535, 1), "image/bmp"))
+
+
+@pytest.mark.parametrize("payload", [
+    b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 12) + b"IHDR" +
+    struct.pack(">II", 1, 1),
+    b"\xff\xd8\xff\xc0\x00\x02" + b"\x00" * 8,
+])
+def test_preflight_rejects_malformed_dimension_headers(payload):
+    pf = _preflight()
+    with pytest.raises(ValueError, match="malformed"):
+        pf.preflight_image_data_url(_image_data_url(payload))
+
+
+def test_preflight_rejects_oversized_pixel_area():
+    pf = _preflight()
+    side = pf.MAX_IMAGE_DIMENSION
+    assert side * side > pf.MAX_IMAGE_PIXELS
+    with pytest.raises(ValueError, match="decoded pixels"):
+        pf.preflight_image_data_url(_image_data_url(_png_bytes(side, side)))
+
+
+def test_preflight_accepts_dimensions_on_the_limit():
+    pf = _preflight()
+    side = pf.MAX_IMAGE_DIMENSION
+    height = pf.MAX_IMAGE_PIXELS // side
+    _, size = pf.preflight_image_data_url(
+        _image_data_url(_png_bytes(side, height)))
+    assert size == (side, height)
+
+
+def test_preflight_rejects_oversized_payload():
+    pf = _preflight()
+    oversized = "A" * (-(-pf.MAX_IMAGE_SOURCE_BYTES // 3) * 4 + 4)
+    with pytest.raises(ValueError, match="exceeds the supported maximum"):
+        pf.preflight_image_data_url(f"data:image/png;base64,{oversized}")
+
+
+@pytest.mark.parametrize("payload", [
+    b"RIFF\x00\x00\x00\x00WEBPVP8 ",
+    b"\x00\x01\x02\x03",
+    b"P6\n60000 60000\n255\n",
+])
+def test_preflight_rejects_unmeasurable_formats(payload):
+    """Anything the probe cannot measure is refused rather than passed to the
+    decoder unbounded; a PNM header in particular is a one-line bomb."""
+    pf = _preflight()
+    with pytest.raises(ValueError, match="unsupported image format"):
+        pf.preflight_image_data_url(_image_data_url(payload))
+
+
+@pytest.mark.parametrize("payload", [
+    b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHD",
+    b"GIF89a\x10",
+    b"BM" + b"\x00" * 8,
+    b"\xff\xd8\xff\xc0\x00\x0b",
+])
+def test_preflight_rejects_truncated_headers(payload):
+    pf = _preflight()
+    with pytest.raises(ValueError):
+        pf.preflight_image_data_url(_image_data_url(payload))
+
+
+def test_preflight_rejects_empty_canvas():
+    pf = _preflight()
+    with pytest.raises(ValueError, match="empty canvas"):
+        pf.preflight_image_data_url(_image_data_url(_png_bytes(0, 32)))
+
+
+def test_preflight_errors_never_echo_the_payload():
+    """Error text reaches the client verbatim in a 400 body, so it must carry
+    only measured integers: no media type, no slice of the base64."""
+    pf = _preflight()
+    secret = "SECRETMARKER"
+    urls = [
+        _image_data_url(_png_bytes(60000, 60000), f"image/{secret}"),
+        f"data:image/{secret};base64," + "A" * 40 + secret,
+        _image_data_url(b"\x00\x01" + secret.encode(), f"image/{secret}"),
+    ]
+    for url in urls:
+        with pytest.raises(ValueError) as excinfo:
+            pf.preflight_image_data_url(url)
+        assert secret not in str(excinfo.value)
+
+
+def test_data_url_image_is_charged_to_the_visual_token_budget(monkeypatch):
+    """A data: image is invisible to file probing, so a video in the same
+    request could otherwise claim the whole engine budget."""
+    from experimental.server.media import video_sampling as vs_mod
+    from experimental.server.runtime.engine import _load_image_buffers
+
+    limits = {
+        "model_type": "qwen2_5_vl",
+        "min_image_tokens": 4,
+        "max_image_tokens": 4096,
+        "max_image_tokens_per_image": 4096,
+        "patch_size": 14,
+        "merge_size": 2,
+        "temporal_patch_size": 2,
+    }
+    image_est = vs_mod.estimate_image_tokens_for_size(640, 480, "qwen", limits)
+    assert 0 < image_est < 4096
+    seen = []
+
+    def fake_load_video_buffer(rt, item, family, **kwargs):
+        seen.append(kwargs["budget"])
+        return "video", 0, 0, 0
+
+    monkeypatch.setattr(vs_mod, "load_video_buffer", fake_load_video_buffer)
+
+    class Runtime:
+
+        @staticmethod
+        def load_image_from_bytes(data):
+            return SimpleNamespace(do_resize=True)
+
+    messages = [{
+        "role":
+        "user",
+        "content": [{
+            "type": "image_url",
+            "image_url": {
+                "url": _image_data_url(_png_bytes(640, 480))
+            },
+        }, {
+            "type": "video",
+            "video": "clip.mp4"
+        }],
+    }]
+    _load_image_buffers(Runtime, messages, lambda: "qwen", lambda: limits)
+    assert seen == [4096 - image_est]
+
+
+def test_remote_media_is_refused_unless_enabled(tmp_path):
+    from experimental.server.media.media_source import \
+        enforce_local_media_policy
+
+    messages = [{
+        "role":
+        "user",
+        "content": [{
+            "type": "image_url",
+            "image_url": {
+                "url": "https://example.com/image.png"
+            },
+        }],
+    }]
+    with pytest.raises(PermissionError, match="remote media"):
+        enforce_local_media_policy(messages, "", allow_remote=False)
+    enforce_local_media_policy(messages, "", allow_remote=True)
+
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    llm = _FakeLLM(tmp_path)
+    client = TestClient(_create_app(llm, ApiConfig()))
+    response = client.post("/v1/chat/completions",
+                           json={"messages": messages})
+    assert response.status_code == 403
+    assert "remote media" in response.json()["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# Greedy sampling normalization
+# ---------------------------------------------------------------------------
+
+
+def test_greedy_temperature_pins_top_p_and_top_k():
+    params = SamplingParams(temperature=0.0, top_p=0.3, top_k=7)
+    assert (params.top_p, params.top_k) == (1.0, 1)
+    params = SamplingParams(temperature=0.0005, top_p=0.3, top_k=7)
+    assert (params.top_p, params.top_k) == (1.0, 1)
+
+
+def test_sampling_temperature_leaves_top_p_and_top_k_alone():
+    params = SamplingParams(temperature=0.7, top_p=0.3, top_k=7)
+    assert (params.top_p, params.top_k) == (0.3, 7)
+    params = SamplingParams(temperature=-1.0, top_p=0.3, top_k=7)
+    assert (params.top_p, params.top_k) == (0.3, 7)
+
+
+def test_audio_params_normalize_greedy_talker_temperature():
+    params = AudioParams(talker_temperature=0.0, talker_top_p=0.5,
+                         talker_top_k=20)
+    assert (params.talker_top_p, params.talker_top_k) == (1.0, 1)
+
+
+def test_chat_temperature_zero_reaches_the_runtime_as_greedy(client_and_llm):
+    client, llm = client_and_llm
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "hi"
+                               }],
+                               "temperature": 0,
+                               "top_p": 0.4,
+                               "top_k": 9,
+                           })
+    assert response.status_code == 200
+    assert llm.last_sampling_params.top_p == 1.0
+    assert llm.last_sampling_params.top_k == 1
+
+
+# ---------------------------------------------------------------------------
+# /health context-cache metrics
+# ---------------------------------------------------------------------------
+
+
+def test_health_exposes_context_cache_metrics(client_and_llm):
+    client, llm = client_and_llm
+    expected = {
+        "hit_sequences": 3,
+        "reused_tokens": 768,
+        "media_aware_sequences": 4,
+        "base_kv_pages": {
+            "free": 100,
+            "capacity": 128
+        },
+    }
+    llm.context_cache_metrics = lambda: expected
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["context_cache"] == expected
+
+
+def test_health_allows_runtimes_without_context_cache_metrics(client_and_llm):
+    client, _ = client_and_llm
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["context_cache"] is None
+
+
+def test_context_cache_metrics_dict_flattens_native_pools():
+    from experimental.server.runtime.engine import LLM
+
+    class Pool:
+        free = 100
+        capacity = 128
+
+    class Native:
+        hit_sequences = 3
+        reused_tokens = 768
+        base_kv_pages = Pool()
+
+        def method(self):
+            return 1
+
+    llm = LLM.__new__(LLM)
+    llm._context_cache_config = SimpleNamespace(enabled=True)
+    llm.get_context_cache_metrics = lambda: Native()
+    assert llm.context_cache_metrics() == {
+        "hit_sequences": 3,
+        "reused_tokens": 768,
+        "base_kv_pages": {
+            "free": 100,
+            "capacity": 128
+        },
+    }
+    llm._context_cache_config = SimpleNamespace(enabled=False)
+    assert llm.context_cache_metrics() is None
+
+
+def test_tool_template_is_warmed_at_startup(tmp_path):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    llm = _FakeLLM(tmp_path)
+    loaded = []
+
+    class Formatter:
+
+        def _load_template_owner(self):
+            loaded.append(True)
+
+    llm._get_tool_template_formatter = lambda: Formatter()
+    TestClient(_create_app(llm, ApiConfig(enable_auto_tool_choice=True)))
+    assert loaded == [True]
+    TestClient(_create_app(llm, ApiConfig()))
+    assert loaded == [True]

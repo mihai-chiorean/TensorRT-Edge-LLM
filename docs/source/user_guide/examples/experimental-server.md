@@ -253,9 +253,13 @@ tensorrt-edgellm-serve Qwen/Qwen3-VL-2B-Instruct \
 OpenAI content blocks accept `image_url`, `video_url`, `input_audio`, and
 `audio_url` forms described in [Input Format](../format/input-format.md). Data
 URLs and files under `--allowed-local-media-path` are supported. Remote HTTP
-and HTTPS sources are downloaded with per-modality size limits and a bounded
-timeout. Local paths remain disabled unless they are under the configured
-allowed path.
+and HTTPS sources are refused unless the server is launched with
+`--allow-remote-media`; when enabled they are downloaded with per-modality
+size limits and a bounded timeout. Local paths remain disabled unless they are
+under the configured allowed path. Images are bounded before they are decoded:
+the container header (PNG, JPEG, GIF, BMP) must declare at most 16384 pixels
+per side and 64 M pixels in total, and formats the probe cannot measure are
+refused.
 
 Nemotron Omni video uses its checkpoint's video patch embedder and dynamic
 aspect-preserving frame grids:

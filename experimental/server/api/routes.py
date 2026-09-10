@@ -65,6 +65,7 @@ async def health(request: Request):
             "speculative_method": caps.speculative_method,
             "context_reuse": caps.context_reuse,
         },
+        "context_cache": await client.context_cache_metrics(),
     }
 
 

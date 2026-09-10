@@ -374,16 +374,32 @@ def estimate_image_tokens(path: str,
                           family: str,
                           limits: dict,
                           do_resize: bool = True) -> int:
-    """Visual tokens a single image will consume after the C++ resize, for
-    request-level budget accounting. Falls back to the per-media cap when the
-    image cannot be probed."""
+    """Visual tokens a single image file will consume after the C++ resize,
+    for request-level budget accounting. Falls back to the per-media cap when
+    the image cannot be probed."""
     if not limits:
         return 0
-    per_image = limits.get("max_image_tokens_per_image", 0)
     try:
         width, height = _probe_image_size(path)
     except ValueError:
-        return per_image
+        return limits.get("max_image_tokens_per_image", 0)
+    return estimate_image_tokens_for_size(width,
+                                          height,
+                                          family,
+                                          limits,
+                                          do_resize=do_resize)
+
+
+def estimate_image_tokens_for_size(width: int,
+                                   height: int,
+                                   family: str,
+                                   limits: dict,
+                                   do_resize: bool = True) -> int:
+    """``estimate_image_tokens`` for an image whose dimensions are already
+    known, such as a ``data:`` payload that has no file to probe."""
+    if not limits:
+        return 0
+    per_image = limits.get("max_image_tokens_per_image", 0)
     if width <= 0 or height <= 0:
         return per_image
     if family == "internvl":

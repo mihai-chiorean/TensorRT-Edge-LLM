@@ -171,19 +171,26 @@ def resolve_image_message(item: dict):
     if not isinstance(url, str) or not url:
         raise ValueError(f"{key} must contain a non-empty URL or path")
     if url.startswith(("http://", "https://")):
-        return fetch_remote_media(url, "image", MAX_IMAGE_SOURCE_BYTES)
+        from .image_preflight import preflight_image_bytes
+
+        data = fetch_remote_media(url, "image", MAX_IMAGE_SOURCE_BYTES)
+        preflight_image_bytes(data)
+        return data
     if url.startswith("data:"):
-        return decode_base64_data_url(url,
-                                      "image",
-                                      strict=True,
-                                      max_bytes=MAX_IMAGE_SOURCE_BYTES)
+        from .image_preflight import preflight_image_data_url
+
+        data, _ = preflight_image_data_url(url)
+        return data
     if url.startswith("file:"):
         return resolve_file_url(url)
     return url
 
 
-def enforce_local_media_policy(messages, allowed_root: str) -> None:
-    """Permit server-local media only below an explicitly allowed root."""
+def enforce_local_media_policy(messages,
+                               allowed_root: str,
+                               allow_remote: bool = True) -> None:
+    """Permit server-local media only below an explicitly allowed root, and
+    remote http(s) media only when the deployment opted into fetching it."""
     root = Path(allowed_root).resolve() if allowed_root else None
     for message in messages or []:
         content = message.get("content") if isinstance(message, dict) else None
@@ -191,7 +198,13 @@ def enforce_local_media_policy(messages, allowed_root: str) -> None:
             continue
         for item in content:
             for ref in iter_item_media_refs(item):
-                if ref.startswith(("data:", "http://", "https://")):
+                if ref.startswith("data:"):
+                    continue
+                if ref.startswith(("http://", "https://")):
+                    if not allow_remote:
+                        raise PermissionError(
+                            "remote media URLs are disabled; send base64 data "
+                            "URLs or launch with --allow-remote-media")
                     continue
                 if root is None:
                     raise PermissionError(

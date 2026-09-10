@@ -278,6 +278,13 @@ class EngineClient:
     def capabilities(self) -> EngineCapabilities:
         return self._capabilities
 
+    async def context_cache_metrics(self) -> Optional[Dict[str, Any]]:
+        """Context-cache counters for /health; None when reuse is off."""
+        getter = getattr(self._llm, "context_cache_metrics", None)
+        if getter is None:
+            return None
+        return await asyncio.to_thread(getter)
+
     @property
     def active_requests(self) -> int:
         return self._admission.active
