@@ -2515,3 +2515,34 @@ def test_context_cache_metrics_dict_flattens_native_pools():
     }
     llm._context_cache_config = SimpleNamespace(enabled=False)
     assert llm.context_cache_metrics() is None
+
+
+def test_seed_is_accepted_and_ignored(client_and_llm):
+    client, llm = client_and_llm
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "hi"
+                               }],
+                               "seed": 1234,
+                               "temperature": 0,
+                           })
+    assert response.status_code == 200
+    assert llm.last_sampling_params.top_k == 1
+
+
+def test_unknown_request_fields_are_ignored(client_and_llm):
+    client, _ = client_and_llm
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "hi"
+                               }],
+                               "timings_per_token": True,
+                               "chat_template_kwargs": {
+                                   "enable_thinking": False
+                               },
+                           })
+    assert response.status_code == 200
