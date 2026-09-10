@@ -31,7 +31,10 @@ _UNSUPPORTED_SAMPLING_DEFAULTS = {
 
 
 class OpenAIBaseModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # OpenAI-compatible clients send vendor fields (llama.cpp's
+    # timings_per_token, vLLM extras); the OpenAI contract ignores unknown
+    # request fields rather than rejecting the request.
+    model_config = ConfigDict(extra="ignore")
 
 
 class StreamOptions(OpenAIBaseModel):
