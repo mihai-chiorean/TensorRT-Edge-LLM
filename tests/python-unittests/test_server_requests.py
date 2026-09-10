@@ -2366,3 +2366,19 @@ def test_seed_is_accepted_and_ignored(client_and_llm):
                            })
     assert response.status_code == 200
     assert llm.last_sampling_params.top_k == 1
+
+
+def test_unknown_request_fields_are_ignored(client_and_llm):
+    client, _ = client_and_llm
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "hi"
+                               }],
+                               "timings_per_token": True,
+                               "chat_template_kwargs": {
+                                   "enable_thinking": False
+                               },
+                           })
+    assert response.status_code == 200
