@@ -1824,8 +1824,8 @@ def _gemma_client(tmp_path, eos_token=""):
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
 
-    from experimental.server.parsing.terminal_tokens import (
-        terminal_special_tokens)
+    from experimental.server.parsing.terminal_tokens import \
+        terminal_special_tokens
 
     llm = _FakeLLM(tmp_path)
     model_dir = tmp_path / "gemma-4-e4b"
@@ -1833,8 +1833,9 @@ def _gemma_client(tmp_path, eos_token=""):
     (model_dir / "config.json").write_text('{"model": "gemma4_text"}',
                                            encoding="utf-8")
     if eos_token:
-        (model_dir / "tokenizer_config.json").write_text(
-            json.dumps({"eos_token": eos_token}), encoding="utf-8")
+        (model_dir / "tokenizer_config.json").write_text(json.dumps(
+            {"eos_token": eos_token}),
+                                                         encoding="utf-8")
     terminal_special_tokens.cache_clear()
     llm.model_dir = str(model_dir)
     config = ApiConfig(enable_auto_tool_choice=True)
@@ -1960,11 +1961,12 @@ def test_gemma_tool_stream_emits_call_and_drops_trailing_prose(tmp_path):
 def test_chat_response_strips_model_terminal_token(tmp_path):
     client, llm = _gemma_client(tmp_path, eos_token="<turn|>")
     llm.next_text = "Moo.<turn|>"
-    response = client.post("/v1/chat/completions",
-                           json={"messages": [{
-                               "role": "user",
-                               "content": "Cow?"
-                           }]})
+    response = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{
+            "role": "user",
+            "content": "Cow?"
+        }]})
     assert response.status_code == 200
     assert response.json()["choices"][0]["message"]["content"] == "Moo."
 
@@ -2221,8 +2223,7 @@ def test_remote_media_is_refused_unless_enabled(tmp_path):
 
     llm = _FakeLLM(tmp_path)
     client = TestClient(_create_app(llm, ApiConfig()))
-    response = client.post("/v1/chat/completions",
-                           json={"messages": messages})
+    response = client.post("/v1/chat/completions", json={"messages": messages})
     assert response.status_code == 403
     assert "remote media" in response.json()["error"]["message"]
 
@@ -2247,7 +2248,8 @@ def test_sampling_temperature_leaves_top_p_and_top_k_alone():
 
 
 def test_audio_params_normalize_greedy_talker_temperature():
-    params = AudioParams(talker_temperature=0.0, talker_top_p=0.5,
+    params = AudioParams(talker_temperature=0.0,
+                         talker_top_p=0.5,
                          talker_top_k=20)
     assert (params.talker_top_p, params.talker_top_k) == (1.0, 1)
 
@@ -2349,3 +2351,18 @@ def test_tool_template_is_warmed_at_startup(tmp_path):
     assert loaded == [True]
     TestClient(_create_app(llm, ApiConfig()))
     assert loaded == [True]
+
+
+def test_seed_is_accepted_and_ignored(client_and_llm):
+    client, llm = client_and_llm
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "hi"
+                               }],
+                               "seed": 1234,
+                               "temperature": 0,
+                           })
+    assert response.status_code == 200
+    assert llm.last_sampling_params.top_k == 1

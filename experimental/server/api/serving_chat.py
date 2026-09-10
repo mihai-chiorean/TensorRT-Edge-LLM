@@ -175,8 +175,9 @@ class OpenAIServingChat:
                 "presence_penalty is not supported by the Edge-LLM runtime",
                 param="presence_penalty")
         if request.seed is not None:
-            raise UnsupportedFeatureError(
-                "seed is not supported by the Edge-LLM runtime", param="seed")
+            # Greedy decoding is deterministic without it and the sampler has
+            # no per-request seed; clients that always send one keep working.
+            logger.debug("ignoring unsupported 'seed' request field")
         if request.response_format is not None:
             raise UnsupportedFeatureError(
                 "response_format requires structured decoding, which is not "
