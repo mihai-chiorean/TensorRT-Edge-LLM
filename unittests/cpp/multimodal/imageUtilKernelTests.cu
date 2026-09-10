@@ -1150,6 +1150,29 @@ TEST(CopyImageToDeviceAndResize, IdentitySkip)
               << std::endl;
 }
 
+TEST(CopyImageToDeviceAndResize, GrowsScratchForActualGeometry)
+{
+    cudaStream_t stream{nullptr};
+    rt::Tensor rawScratch;
+    rt::Tensor tmpScratch;
+
+    int64_t const rawHeight = 320;
+    int64_t const rawWidth = 480;
+    int64_t const channels = 3;
+    int64_t const outWidth = 224;
+    kernel::ensureResizeScratchCapacity(rawHeight, rawWidth, channels, outWidth, rawScratch, tmpScratch, stream);
+
+    EXPECT_EQ(rawScratch.getMemoryCapacity(), rawHeight * rawWidth * channels);
+    EXPECT_EQ(tmpScratch.getMemoryCapacity(), rawHeight * outWidth * channels * sizeof(float));
+    void* const rawPointer = rawScratch.rawPointer();
+    void* const tmpPointer = tmpScratch.rawPointer();
+
+    kernel::ensureResizeScratchCapacity(
+        rawHeight / 2, rawWidth / 2, channels, outWidth / 2, rawScratch, tmpScratch, stream);
+    EXPECT_EQ(rawScratch.rawPointer(), rawPointer);
+    EXPECT_EQ(tmpScratch.rawPointer(), tmpPointer);
+}
+
 // Raw-side cap: each raw dimension must be <= kGpuResizeMaxRawDim. The check is per-dimension, not on the
 // pixel product, so a tall/thin image that fits the pixel budget but whose long side exceeds the cap is rejected.
 TEST(CopyImageToDeviceAndResize, PerDimensionCap)

@@ -898,6 +898,44 @@ void allocateResizeScratch(int64_t const channels, int64_t const tmpElems, rt::T
     tmp = rt::Tensor({tmpElems}, rt::DeviceType::kGPU, DataType::kFLOAT, "kernel::resizeScratch.tmp");
 }
 
+void ensureResizeScratchCapacity(int64_t const rawHeight, int64_t const rawWidth, int64_t const channels,
+    int64_t const outWidth, rt::Tensor& rawScratch, rt::Tensor& tmp, cudaStream_t stream)
+{
+    ELLM_CHECK(rawHeight > 0 && rawWidth > 0 && channels > 0 && outWidth > 0,
+        "ensureResizeScratchCapacity: image dimensions and channels shall be positive.");
+    ELLM_CHECK(rawHeight <= kGpuResizeMaxRawDim && rawWidth <= kGpuResizeMaxRawDim,
+        "ensureResizeScratchCapacity: raw image exceeds the GPU-resize dimension limit.");
+    ELLM_CHECK(rawScratch.isEmpty()
+            || (rawScratch.getDeviceType() == rt::DeviceType::kGPU && rawScratch.getDataType() == DataType::kUINT8),
+        "ensureResizeScratchCapacity: raw scratch shall be an empty tensor or GPU UINT8.");
+    ELLM_CHECK(tmp.isEmpty() || (tmp.getDeviceType() == rt::DeviceType::kGPU && tmp.getDataType() == DataType::kFLOAT),
+        "ensureResizeScratchCapacity: temporary scratch shall be an empty tensor or GPU FLOAT.");
+
+    int64_t const rawElems = rawHeight * rawWidth * channels;
+    int64_t const tmpElems = rawHeight * outWidth * channels;
+    bool const growRaw = rawScratch.getMemoryCapacity() < rawElems;
+    bool const growTmp = tmp.getMemoryCapacity() < tmpElems * static_cast<int64_t>(sizeof(float));
+    if (!growRaw && !growTmp)
+    {
+        return;
+    }
+
+    if (!rawScratch.isEmpty() || !tmp.isEmpty())
+    {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    if (growRaw)
+    {
+        rawScratch = rt::Tensor{};
+        rawScratch = rt::Tensor({rawElems}, rt::DeviceType::kGPU, DataType::kUINT8, "kernel::resizeScratch.rawImage");
+    }
+    if (growTmp)
+    {
+        tmp = rt::Tensor{};
+        tmp = rt::Tensor({tmpElems}, rt::DeviceType::kGPU, DataType::kFLOAT, "kernel::resizeScratch.tmp");
+    }
+}
+
 __global__ void transposeToPatchNemotronKernel(half const* blockPixels, half* inputPatches, int64_t const T,
     int64_t const C, int64_t const H, int64_t const W, int64_t const P, int64_t const totalElements)
 {

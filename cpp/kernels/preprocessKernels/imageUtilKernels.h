@@ -108,6 +108,11 @@ void copyImageToDeviceAndResize(unsigned char const* rawHostImage, int64_t const
 //!     tmp [GPU, Float]: horizontal-pass buffer, capacity tmpElems.
 void allocateResizeScratch(int64_t const channels, int64_t const tmpElems, rt::Tensor& rawScratch, rt::Tensor& tmp);
 
+//! Grow the resize scratch pair to fit one request's actual geometry. Existing allocations are reused when large
+//! enough; growth synchronizes the stream before replacing a buffer that may still be in use.
+void ensureResizeScratchCapacity(int64_t rawHeight, int64_t rawWidth, int64_t channels, int64_t outWidth,
+    rt::Tensor& rawScratch, rt::Tensor& tmp, cudaStream_t stream);
+
 //! The kernel will initialize the rotary position embeddings for Qwen2.5-VL VIT
 //! Inputs:
 //!     gridTHW: Image grid dimensions [T, H, W] (Temporal, Height, Width)
