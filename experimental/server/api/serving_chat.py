@@ -189,6 +189,7 @@ class OpenAIServingChat:
             enforce_local_media_policy(
                 request.messages,
                 self._config.allowed_local_media_path,
+                allow_remote=self._config.allow_remote_media,
             )
         except PermissionError as exc:
             raise ServerError(str(exc), status_code=403) from exc
@@ -267,11 +268,10 @@ class OpenAIServingChat:
         num_logprobs = 0
         if request.logprobs:
             num_logprobs = max(1, request.top_logprobs or 0)
-        greedy = request.temperature == 0
         sampling = SamplingParams(
             temperature=request.temperature,
-            top_p=1.0 if greedy else request.top_p,
-            top_k=1 if greedy else request.top_k,
+            top_p=request.top_p,
+            top_k=request.top_k,
             seed=request.seed,
             max_tokens=request.effective_max_tokens,
             enable_thinking=request.enable_thinking,

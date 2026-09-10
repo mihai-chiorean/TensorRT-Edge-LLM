@@ -71,6 +71,7 @@ async def health(request: Request):
             "context_reuse": caps.context_reuse,
             "in_flight_batching": caps.in_flight_batching,
         },
+        "context_cache": await client.context_cache_metrics(),
     }
 
 
