@@ -414,6 +414,7 @@ class EngineClient:
         *,
         tools: Optional[Sequence[Dict[str, Any]]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        tool_config: Optional[ToolConfig] = None,
         prepared: Optional[PreparedRequest] = None,
     ) -> AsyncGenerator[StreamDelta, None]:
         iterator = None
@@ -422,6 +423,7 @@ class EngineClient:
             sampling_params,
             tools=tools,
             tool_choice=tool_choice,
+            tool_config=tool_config,
         )
         try:
             iterator = self._llm.generate_stream(
@@ -429,6 +431,7 @@ class EngineClient:
                 sampling_params,
                 tools=tools,
                 tool_choice=tool_choice,
+                tool_config=tool_config,
                 prebuilt_request=owned.request,
             )
             async for item in _iterate_sync(iterator):

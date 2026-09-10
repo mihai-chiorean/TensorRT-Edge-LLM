@@ -25,7 +25,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from ..config import ApiConfig
 from ..parsing.reasoning import REASONING_PARSERS
-from ..parsing.terminal_tokens import (IM_END_TOKEN, TerminalTokenStripper,
+from ..parsing.terminal_tokens import (TerminalTokenStripper,
                                        strip_terminal_tokens,
                                        terminal_special_tokens)
 from ..parsing.tool_calling import (StreamingAssistantOutputParser, ToolConfig,
@@ -44,7 +44,6 @@ from .protocol import (ChatCompletionChoice, ChatCompletionMessage,
                        ChatCompletionStreamResponse, DeltaMessage, UsageInfo)
 
 logger = logging.getLogger("edgellm.server.chat")
-
 
 
 @dataclass(frozen=True)
@@ -304,8 +303,7 @@ class OpenAIServingChat:
         except (KeyError, TypeError, ValueError) as exc:
             raise InvalidRequestError(str(exc)) from exc
 
-        output.text = strip_terminal_tokens(output.text,
-                                            self._terminal_tokens)
+        output.text = strip_terminal_tokens(output.text, self._terminal_tokens)
         message = ChatCompletionMessage(
             content=(output.text or None)
             if output.tool_calls else output.text,
@@ -450,6 +448,7 @@ class OpenAIServingChat:
                     prepared.sampling,
                     tools=prepared.tool_config.tools,
                     tool_choice=prepared.tool_config.tool_choice,
+                    tool_config=prepared.tool_config,
                     prepared=engine_stream):
                 completion_tokens += len(delta.token_ids)
                 if delta.prompt_tokens is not None:
@@ -675,6 +674,7 @@ class OpenAIServingChat:
                     prepared.sampling,
                     tools=prepared.tool_config.tools,
                     tool_choice=prepared.tool_config.tool_choice,
+                    tool_config=prepared.tool_config,
                     prepared=engine_stream):
                 completion_tokens += len(delta.token_ids)
                 if delta.prompt_tokens is not None:
@@ -755,8 +755,8 @@ class OpenAIServingChat:
             yield _sse(usage_chunk)
         yield "data: [DONE]\n\n"
 
-    def stream_stripper(self,
-                        prepared: PreparedChatRequest) -> TerminalTokenStripper:
+    def stream_stripper(
+            self, prepared: PreparedChatRequest) -> TerminalTokenStripper:
         """Terminal pieces only appear when special tokens are preserved."""
         tokens = (() if prepared.sampling.skip_special_tokens else
                   self._terminal_tokens)

@@ -14,17 +14,22 @@
 # limitations under the License.
 
 import asyncio
+import json
 import threading
 import time
 from types import SimpleNamespace
-
-import json
 
 import pytest
 
 from experimental.server.api.errors import (ServerOverloadedError,
                                             ServerUnavailableError)
 from experimental.server.config import ContextCacheConfig
+from experimental.server.parsing.tool_calling import (ToolConfig,
+                                                      ToolProtocolError,
+                                                      parse_assistant_output,
+                                                      validate_tool_request)
+from experimental.server.parsing.tool_chat_template import \
+    ToolChatTemplateFormatter
 from experimental.server.runtime.engine import (
     LLM, SamplingParams, _native_context_cache_config,
     _set_context_cache_request_policies)
@@ -530,10 +535,6 @@ class _GemmaTokenDecoder:
 
 
 def _gemma_tool_fixture(tmp_path):
-    from experimental.server.parsing.tool_calling import (
-        validate_tool_request)
-    from experimental.server.parsing.tool_chat_template import (
-        ToolChatTemplateFormatter)
 
     tools = [{
         "type": "function",
@@ -555,8 +556,8 @@ def _gemma_tool_fixture(tmp_path):
     model_dir = tmp_path / "gemma-4-e4b"
     model_dir.mkdir()
     (model_dir / "config.json").write_text('{"model": "gemma4_text"}')
-    (model_dir / "tokenizer_config.json").write_text(
-        '{"eos_token": "<turn|>"}')
+    (model_dir /
+     "tokenizer_config.json").write_text('{"eos_token": "<turn|>"}')
     llm = LLM.__new__(LLM)
     llm._model_dir = str(model_dir)
     llm._get_tool_template_formatter = lambda: formatter
@@ -565,8 +566,6 @@ def _gemma_tool_fixture(tmp_path):
 
 
 def test_gemma_nonstream_restores_native_stripped_protocol(tmp_path):
-    from experimental.server.parsing.tool_calling import (ToolProtocolError,
-                                                          parse_assistant_output)
 
     llm, config, tokenizer, ids = _gemma_tool_fixture(tmp_path)
     stripped = tokenizer.decode(ids,
@@ -586,11 +585,10 @@ def test_gemma_nonstream_restores_native_stripped_protocol(tmp_path):
     }
 
 
-def test_gemma_restoration_keeps_channel_markers_and_stop_truncation(
-        tmp_path):
+def test_gemma_restoration_keeps_channel_markers_and_stop_truncation(tmp_path):
     llm, config, _, _ = _gemma_tool_fixture(tmp_path)
-    assert llm.decode_tool_output("stripped", [5, 6, 4],
-                                  config) == "<|channel>analysisUnverified prose."
+    assert llm.decode_tool_output(
+        "stripped", [5, 6, 4], config) == "<|channel>analysisUnverified prose."
     assert llm.decode_tool_output("stripped", [6, 7, 4],
                                   config,
                                   stop_strings=("ignored",
@@ -598,8 +596,6 @@ def test_gemma_restoration_keeps_channel_markers_and_stop_truncation(
 
 
 def test_gemma_restoration_only_applies_to_gemma_tool_turns(tmp_path):
-    from experimental.server.parsing.tool_calling import (ToolProtocolError,
-                                                          validate_tool_request)
 
     llm, config, _, ids = _gemma_tool_fixture(tmp_path)
     assert llm.decode_tool_output("plain", ids,
@@ -609,3 +605,48 @@ def test_gemma_restoration_only_applies_to_gemma_tool_turns(tmp_path):
     with pytest.raises(ToolProtocolError) as raised:
         llm.decode_tool_output("text without ids", [], config)
     assert raised.value.reason == "decode_failed"
+
+
+def test_stream_accepts_prevalidated_forced_tool_choice(monkeypatch):
+    """A normalized forced choice ("function") must not be re-validated as a
+    tool name when the stream builds its own request."""
+
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "lookup",
+            "parameters": {
+                "type": "object"
+            }
+        }
+    }]
+    config = validate_tool_request([], tools, {
+        "type": "function",
+        "function": {
+            "name": "lookup"
+        }
+    })
+    assert config.tool_choice == "function"
+
+    llm = LLM.__new__(LLM)
+    seen = {}
+
+    def make_request(messages, params, **kwargs):
+        seen.update(kwargs)
+        raise RuntimeError("stop here")
+
+    llm._ensure_open = lambda: None
+    llm._admission = lambda: None
+    llm._rt = SimpleNamespace(StreamChannel=SimpleNamespace(
+        create=lambda: SimpleNamespace(set_skip_special_tokens=lambda _v: None,
+                                       cancel=lambda: None)))
+    llm._make_generation_request = make_request
+    stream = llm.generate_stream([],
+                                 SamplingParams(),
+                                 tools=config.tools,
+                                 tool_choice=config.tool_choice,
+                                 tool_config=config)
+    with pytest.raises(RuntimeError, match="stop here"):
+        next(iter(stream))
+    assert isinstance(seen.get("tool_config"), ToolConfig)
+    assert seen["tool_config"].forced_name == "lookup"

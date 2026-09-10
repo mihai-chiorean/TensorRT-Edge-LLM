@@ -20,9 +20,9 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Dict, Iterable, Optional
 
+from ..parsing.tool_calling import ToolProtocolError
 from ..runtime.engine_client import EngineClient, PreparedRequest
 from . import anthropic_compat as protocol
-from ..parsing.tool_calling import ToolProtocolError
 from .errors import ServerError, ToolProtocolResponseError
 from .protocol import ChatCompletionRequest
 from .serving_chat import OpenAIServingChat, PreparedChatRequest
@@ -221,6 +221,7 @@ class AnthropicServingMessages:
             prepared.chat.sampling,
             tools=prepared.chat.tool_config.tools,
             tool_choice=prepared.chat.tool_config.tool_choice,
+            tool_config=prepared.chat.tool_config,
             prepared=prepared.engine,
         )
         next_delta = None

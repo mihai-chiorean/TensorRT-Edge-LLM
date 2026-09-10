@@ -47,11 +47,11 @@ from typing import (TYPE_CHECKING, Any, Dict, Iterator, List, Mapping,
                     Optional, Sequence, Tuple, Union)
 
 from ..config import ContextCacheConfig
+from ..parsing.terminal_tokens import terminal_special_tokens
 from ..parsing.tool_calling import (ToolConfig, ToolProtocolError,
                                     _parser_name_for_model,
                                     parse_assistant_output,
                                     validate_tool_request)
-from ..parsing.terminal_tokens import terminal_special_tokens
 from ..parsing.tool_chat_template import (ToolChatTemplateFormatter,
                                           needs_tool_chat_template)
 from .engine_layout import BundleLayout, EngineType, inspect_bundle
@@ -76,7 +76,6 @@ _DEFAULT_VERIFY_TREE_SIZE = 60
 # ---------------------------------------------------------------------------
 # Public data classes
 # ---------------------------------------------------------------------------
-
 
 #: Temperatures below this are greedy for the native sampler
 #: (cpp/sampler/samplingUtils.cpp).
@@ -1434,9 +1433,14 @@ class LLM:
         *,
         tools: Optional[Sequence[Dict[str, Any]]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        tool_config: Optional[ToolConfig] = None,
         prebuilt_request: Optional[Any] = None,
     ) -> Iterator[StreamDelta]:
         """Stream generation deltas for a single message list.
+
+        ``tool_config`` carries an already validated tool request; without it
+        ``tools``/``tool_choice`` are validated here, so a normalized
+        ``tool_choice`` such as ``"function"`` must travel as ``tool_config``.
 
         Runs ``handleRequest`` in a background thread with a
         ``StreamChannel`` attached, yielding ``StreamDelta`` objects as
@@ -1472,6 +1476,7 @@ class LLM:
                         params,
                         tools=tools,
                         tool_choice=tool_choice,
+                        tool_config=tool_config,
                         stream_channel=channel,
                     )
             except BaseException:
@@ -1734,7 +1739,10 @@ class LLM:
             if callable(value):
                 continue
             if hasattr(value, "free") and hasattr(value, "capacity"):
-                value = {"free": int(value.free), "capacity": int(value.capacity)}
+                value = {
+                    "free": int(value.free),
+                    "capacity": int(value.capacity)
+                }
             result[name] = value
         return result
 
