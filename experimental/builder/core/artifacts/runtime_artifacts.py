@@ -61,6 +61,18 @@ def _load_root_config(model_dir: str) -> Dict[str, Any]:
         return json.load(config_file)
 
 
+def _eos_token_ids(value: Any, source: str) -> "list[int]":
+    """Validate one ``eos_token_id`` entry: an id or a nonempty list of ids."""
+    if value is None:
+        return []
+    tokens = value if isinstance(value, list) else [value]
+    if tokens and all(type(token) is int and token >= 0 for token in tokens):
+        return list(tokens)
+    raise ValueError(
+        f"Invalid eos_token_id in {source}: {value!r}; expected a "
+        "nonnegative integer or a nonempty list of nonnegative integers")
+
+
 def _apply_generic_token_ids(config: Dict[str, Any], root: Dict[str, Any],
                              runtime_model_dir: str) -> None:
     thinker = root.get("thinker_config") or {}
@@ -83,25 +95,22 @@ def _apply_generic_token_ids(config: Dict[str, Any], root: Dict[str, Any],
 
     # Union the EOS sets from config.json and generation_config.json: HF
     # generate stops on the generation_config set, which may extend the model
-    # config's single EOS (e.g. HunYuan adds <|extra_5|> alongside <|eos|>).
-    def _eos_ids(value) -> "list[int]":
-        if isinstance(value, list):
-            return [int(item) for item in value]
-        if isinstance(value, int):
-            return [value]
-        return []
-
-    eos_ids = _eos_ids(root.get("eos_token_id"))
+    # config's single EOS (e.g. HunYuan adds <|extra_5|> alongside <|eos|>,
+    # Gemma 4 adds <|tool_response>). A malformed value fails the build.
+    eos_ids = _eos_token_ids(root.get("eos_token_id"), "config.json")
     if not eos_ids:
         runtime_config_path = os.path.join(runtime_model_dir, "config.json")
         if os.path.isfile(runtime_config_path):
             with open(runtime_config_path) as runtime_config_file:
-                eos_ids = _eos_ids(
-                    json.load(runtime_config_file).get("eos_token_id"))
+                eos_ids = _eos_token_ids(
+                    json.load(runtime_config_file).get("eos_token_id"),
+                    runtime_config_path)
     generation_path = os.path.join(runtime_model_dir, "generation_config.json")
     if os.path.isfile(generation_path):
         with open(generation_path) as generation_file:
-            eos_ids += _eos_ids(json.load(generation_file).get("eos_token_id"))
+            eos_ids += _eos_token_ids(
+                json.load(generation_file).get("eos_token_id"),
+                "generation_config.json")
     if eos_ids:
         config["eos_token_id"] = list(dict.fromkeys(eos_ids))
 
