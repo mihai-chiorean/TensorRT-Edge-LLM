@@ -331,3 +331,55 @@ Jetson AGX Orin 32 GB (JetPack 7.2 / CUDA 13.2 / TensorRT 10.16.2):
 5. **Python runtime dependencies** are `requirements-server.txt` plus the
    `server-tools` extra (`transformers`, `jinja2`) for tool chat templates; the
    venv from the 0.10.0 recipe already satisfies both.
+
+## Addendum: upstream 0.11.0 (`95515c2`)
+
+Branch `feat/jp72-sm87-0.11.0` rebases the fork line onto TensorRT Edge-LLM
+0.11.0. The recipe above still applies with these changes, verified on a
+Jetson AGX Orin 32 GB (JetPack 7.2 / CUDA 13.2 / TensorRT 10.16.2):
+
+1. **Recursive submodules are mandatory.** XGrammar guided decoding is a new
+   `3rdParty/xgrammar` submodule that is always built (there is no option to
+   disable it), and `cmake/GuidedDecoding.cmake` stops configure unless its
+   nested `3rdparty/dlpack` submodule is present. The `--recursive` flag in
+   step 1 covers it. No new apt packages are needed; `cuda-nvrtc-dev-13-2`
+   from the 0.10.1 addendum is still required. The C++ chat-template
+   renderer vendors Inja under `3rdParty/inja` (not a submodule).
+
+2. **CuTe DSL artifact.** Still the in-tree
+   `kernelSrcs/cuteDSLPrebuilt/cutedsl_aarch64_sm_87_cuda13.tar.gz`, no
+   download; 0.11.0 regenerated it (100 kernel variants, adds `layernorm`).
+   `EMBEDDED_TARGET=jetson-orin` selects it as before.
+
+3. **The ONNX export must be redone, not only the engines.** 0.11.0 changed
+   the decoder interface to token-major ragged inputs (`positions`, rank-2
+   `inputs_embeds`); `llm_build` refuses a 0.10.x ONNX directory with
+   "Re-export the model". The runtime also refuses a 0.10.x engine three
+   ways: `builder_config.ragged_backend` is required in `config.json`, the
+   engine must expose `context_sequence_count_carrier`, and the serialised
+   XQA JIT blob moved to version 2. Re-run the Stage 3 export in
+   `docs/JP72-ARTIFACTS.md` with the 0.11.0 package on the x86 host (same
+   command, `--int8-embedding`, about four minutes on CPU), stage `llm/` and
+   `visual/` on the device, and build with `scripts/jp72/build_engines.sh`
+   (E4B, 8192/16384/1: `llm_build` 128 s at 12.0 GiB peak RSS, `visual_build` 428 s; `llm.engine` 3,432,615,972 B, `visual.engine` 344,560,044 B). The export now
+   writes `eos_token_id` as the union of `config.json` and
+   `generation_config.json` (`[1, 106, 50]` for Gemma 4 E4B), so the
+   `config.json` edit from the 0.10.1 addendum is no longer needed.
+
+4. **Chat templates are rendered in C++.** The runtime loads
+   `llm/chat_template.jinja` from the engine directory (the export writes it
+   and `llm_build` copies it); `processed_chat_template.json` is ignored. The
+   `server-tools` extra (`transformers`, `jinja2`) is no longer needed for
+   tool requests and nothing is imported lazily on the first tool call.
+   Required and forced `tool_choice` are stated in the system turn by the
+   server because the Gemma 4 template ignores the `tool_choice` variable.
+
+5. **Server flags.** `--context-cache-encoder-embedding-budget-bytes` bounds
+   the ViT embedding cache (C++ default 256 MiB, 0 disables); the deployed
+   value is 32 MiB. Guided decoding needs no flag: `response_format`
+   (`json_object`, `json_schema`) or `guided_decoding` on the request.
+   `--enable-in-flight-batching` exists but gains nothing at batch size 1.
+
+6. **Unit tests** gain `unittests/unitTestScheduler`; the INT8 sidecar tests
+   are in `unitTestKernelsMisc` and the media-boundary reuse test in
+   `unitTestContextCache`.

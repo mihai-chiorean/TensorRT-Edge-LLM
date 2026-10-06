@@ -9,7 +9,7 @@
 set -euo pipefail
 
 B=${B:-$HOME/workspace/TensorRT-Edge-LLM-port-0.11/build-0.11.0}
-R=${R:-$HOME/workspace/TensorRT-Edge-LLM-gemma-sidecars}
+R=${R:-$HOME/workspace/TensorRT-Edge-LLM-port-0.11}
 E=${E:-$HOME/tensorrt-edgellm-workspace/gemma-4-E4B/engines-int8-16384}
 V=${V:-$HOME/.venvs/tensorrt-edge-llm}
 LOG=${LOG:-$HOME/trtbench/server.log}
