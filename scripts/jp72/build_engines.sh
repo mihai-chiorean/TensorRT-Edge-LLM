@@ -8,8 +8,8 @@
 # saving. See docs/JP72-ARTIFACTS.md.
 set -euo pipefail
 
-B=${B:-$HOME/workspace/TensorRT-Edge-LLM-gemma-sidecars/build-jp72-sm87}
-O=${O:-$HOME/tensorrt-edgellm-workspace/gemma-4-E4B/onnx-int8emb}
+B=${B:-$HOME/workspace/TensorRT-Edge-LLM-port-0.11/build-0.11.0}
+O=${O:-$HOME/tensorrt-edgellm-workspace/gemma-4-E4B/onnx-int8emb-0.11}
 E=${E:-$HOME/tensorrt-edgellm-workspace/gemma-4-E4B/engines-int8-16384}
 
 export EDGELLM_PLUGIN_PATH=$B/libNvInfer_edgellm_plugin.so
