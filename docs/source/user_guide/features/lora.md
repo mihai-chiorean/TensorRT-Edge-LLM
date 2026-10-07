@@ -137,8 +137,26 @@ Processes HuggingFace LoRA adapter weights for runtime use.
 |----------|----------|-------------|
 | `--input_dir` | Yes | Directory with `adapter_config.json` and `adapter_model.safetensors` |
 | `--output_dir` | Yes | Output directory for processed weights |
+| `--onnx_dir` | No | Directory with `lora_model.onnx`; validates the adapter against the engine's LoRA bindings |
+| `--max_lora_rank` | No | The engine's `--maxLoraRank`; processing fails if the adapter rank exceeds it |
 
-The output contains `processed_adapter_model.safetensors` and `config.json`.
+The output contains `processed_adapter_model.safetensors` and `config.json`
+(the adapter config plus an `edgellm_lora_processing` record with the source
+adapter digest, the key mapping, the bound, dropped and unbound module lists
+and, with `--onnx_dir`, the export and sidecar digests).
+
+Adapter contract. Every tensor must be a `lora_A`/`lora_B` pair of a linear
+module; names are mapped onto the engine's `model.layers.N...` stems,
+including the `model.language_model.` wrapper prefix of multimodal
+checkpoints such as Gemma 4 or Qwen3-VL. Adapters that set `use_rslora`,
+`use_dora`, `rank_pattern`, `alpha_pattern`, `modules_to_save`,
+`layers_to_transform`, `layers_pattern` or `bias != "none"`, and adapters that
+update embeddings, `lm_head` or the vision/audio towers, are refused. With
+`--onnx_dir`, each kept pair must match its binding's dimensions exactly,
+values must be finite in FP16, every binding inside the adapter's
+`target_modules` must be covered, and pairs for modules the engine does not
+have (for example `k_proj`/`v_proj` on the KV-shared layers of Gemma 4) are
+dropped and listed. Nothing is written when a check fails.
 
 ### `tensorrt-edgellm-merge-lora`
 
