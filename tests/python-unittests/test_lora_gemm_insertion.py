@@ -139,6 +139,50 @@ def test_fp16_gemm_match_skips_noncanonical_weight_initializer():
     assert _match_fp16_gemm(_gemm_graph(weight_name="weight")) == []
 
 
+def _matmul_graph(weight_name, node_name="node_linear"):
+    hidden = gs.Variable("hidden", dtype=np.float16, shape=["tokens", 16])
+    weight = gs.Constant(weight_name,
+                         values=np.zeros((16, 32), dtype=np.float16))
+    output = gs.Variable("logits", dtype=np.float16, shape=["tokens", 32])
+    node = gs.Node(op="MatMul",
+                   name=node_name,
+                   inputs=[hidden, weight],
+                   outputs=[output])
+    return gs.Graph(nodes=[node], inputs=[hidden], outputs=[output])
+
+
+def test_fp16_matmul_match_uses_weight_initializer_stem():
+    matches = _match_fp16_gemm(
+        _matmul_graph("_model.layers.0.mlp.up_proj.weight", "node_MatMul_3"))
+
+    assert len(matches) == 1
+    assert matches[0].name == "/layers/0/mlp/up_proj/MatMul"
+    assert matches[0].weight_shape == (16, 32)
+
+
+def test_fp16_matmul_with_anonymous_weight_gets_no_lora_inputs(tmp_path):
+    """The dynamo exporter emits a tied lm_head as ``MatMul(x, val_N)`` named
+    ``node_linear``; a node-name stem would bypass the lm_head filter."""
+    graph = _matmul_graph("val_2631")
+
+    assert _match_fp16_gemm(graph) == []
+
+    onnx.save(gs.export_onnx(graph), tmp_path / "model.onnx")
+    with pytest.raises(ValueError, match="no eligible linear layers"):
+        insert_lora_and_save(str(tmp_path))
+    assert not (tmp_path / "lora_model.onnx").exists()
+
+
+def test_fp16_matmul_named_lm_head_is_excluded(tmp_path):
+    graph = _matmul_graph("_model.lm_head.weight")
+    assert [match.name
+            for match in _match_fp16_gemm(graph)] == ["/lm_head/MatMul"]
+    onnx.save(gs.export_onnx(graph), tmp_path / "model.onnx")
+
+    with pytest.raises(ValueError, match="no eligible linear layers"):
+        insert_lora_and_save(str(tmp_path))
+
+
 def test_canonical_lm_head_is_excluded_actionably(tmp_path):
     graph = _gemm_graph(weight_name="_model.lm_head.weight")
     assert [match.name

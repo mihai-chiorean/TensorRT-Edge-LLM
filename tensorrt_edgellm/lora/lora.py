@@ -370,6 +370,13 @@ def _match_mxfp8_gemm(graph: gs.Graph):
 def _match_fp16_gemm(graph: gs.Graph):
     """
     Match FP16 MatMul and Gemm nodes in the graph.
+
+    Both ops take their binding stem from a ``_model.<stem>.weight``
+    initializer. A linear whose weight is an anonymous constant is skipped:
+    the dynamo exporter emits the tied lm_head as ``MatMul(x, val_N)`` named
+    ``node_linear``, and a node-name stem would bypass the ``lm_head``
+    exclusion and bind a ``[hidden, r]`` x ``[r, vocab]`` branch on the
+    logits under a garbage name.
     """
     fp16_gemm_infos = []
     fp16_gemm_nodes = [
@@ -387,15 +394,16 @@ def _match_fp16_gemm(graph: gs.Graph):
                 continue
             if int(attrs.get("transB", 0)) != 0:
                 weight_shape = (weight_shape[1], weight_shape[0])
-            stem = _stem_from_init_name(node.inputs[1].name)
-            if not stem:
-                continue
-            name = _synth_gemm_name(stem, node.name)
-        else:
-            name = node.name
+        stem = _stem_from_init_name(node.inputs[1].name)
+        if not stem:
+            logger.info(
+                "Skipping LoRA insertion for %s %s: weight %r is not a "
+                "_model.<stem>.weight initializer", node.op, node.name,
+                node.inputs[1].name)
+            continue
         gemm_info = GEMMInfo(input=input_node,
                              output=node.outputs[0],
-                             name=name,
+                             name=_synth_gemm_name(stem, node.name),
                              weight_shape=weight_shape)
         fp16_gemm_infos.append(gemm_info)
     return fp16_gemm_infos
