@@ -1,0 +1,1 @@
+deb [arch=arm64 signed-by=/usr/share/keyrings/nvidia-jetson-ota.gpg] https://repo.download.nvidia.com/jetson/common r39.2 main
