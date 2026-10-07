@@ -1,0 +1,1 @@
+      4 arch=compute_87,code=[compute_87,sm_87]
