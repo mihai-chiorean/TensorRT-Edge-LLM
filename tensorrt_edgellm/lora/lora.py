@@ -232,6 +232,61 @@ def _match_nvfp4_gemm(graph: gs.Graph):
     return nvfp4_gemm_infos
 
 
+_PRE_QUANT_SCALE_SUFFIX = ".pre_quant_scale"
+
+
+def _unsmoothed_int4_activation(node: gs.Node) -> gs.Tensor:
+    """Return the activation the LoRA branch of an INT4 plugin must consume.
+
+    ModelOpt AWQ stores ``Q(W / s)`` per input channel and the exported graph
+    feeds the plugin ``Mul(x, s)``, so the base GEMM computes ``x * s * W / s
+    = x * W``. A PEFT adapter is trained as ``x * A * B`` on the unsmoothed
+    model, so its branch must read ``x``, the operand of that ``Mul`` that is
+    not the ``*.pre_quant_scale`` constant (either operand order). Legacy
+    ModelOpt-traced exports smooth through ``Cast <- Mul(*input_quantizer*)``.
+    Exports without activation smoothing in the graph (GPTQ, column-packed
+    AWQ, or a plugin fed by a graph input such as
+    ``per_layer_model_projection`` on ``inputs_embeds``) use the plugin input
+    directly. A scaling op that cannot be classified is an error: taking the
+    scaled tensor would silently bind the adapter to the wrong activation.
+    """
+    activation = node.inputs[0]
+    if not activation.inputs:
+        return activation
+    producer = activation.inputs[0]
+    if producer.op == "Mul":
+        constants = [
+            operand for operand in producer.inputs
+            if isinstance(operand, gs.Constant)
+        ]
+        if not constants:
+            return activation
+        if len(producer.inputs) == 2 and len(constants) == 1 and (
+                constants[0].name or "").endswith(_PRE_QUANT_SCALE_SUFFIX):
+            scale = constants[0]
+            return next(operand for operand in producer.inputs
+                        if operand is not scale)
+        raise ValueError(
+            f"INT4 GEMM {node.name} is fed by Mul {producer.name} with "
+            f"constant operand(s) {[c.name for c in constants]} that are not "
+            "a *.pre_quant_scale; cannot locate the unsmoothed activation "
+            "for the LoRA branch")
+    if producer.op == "Cast":
+        cast_input = producer.inputs[0]
+        if "input_quantizer" in (cast_input.name or "") and cast_input.inputs:
+            mul_node = cast_input.inputs[0]
+            if mul_node.op == "Mul":
+                return mul_node.inputs[0]
+        if cast_input.inputs and cast_input.inputs[0].op == "Mul" and any(
+                isinstance(operand, gs.Constant)
+                for operand in cast_input.inputs[0].inputs):
+            raise ValueError(
+                f"INT4 GEMM {node.name} is fed by Cast {producer.name} over "
+                f"an unrecognized scaling Mul {cast_input.inputs[0].name}; "
+                "cannot locate the unsmoothed activation for the LoRA branch")
+    return activation
+
+
 def _match_int4_gemm(graph: gs.Graph):
     """
     Match INT4 GEMM nodes in the graph.
@@ -242,6 +297,8 @@ def _match_int4_gemm(graph: gs.Graph):
     ``gemm_k``/``gemm_n`` attributes, so the stem can be derived in one step
     for either. V2 must be matched too; otherwise the default INT4 backend's
     GEMMs get no LoRA inputs and adapters are silently dropped at runtime.
+    The LoRA input is the activation before any AWQ smoothing scale; see
+    :func:`_unsmoothed_int4_activation`.
     """
     int4_gemm_infos = []
     int4_gemm_nodes = [
@@ -249,16 +306,7 @@ def _match_int4_gemm(graph: gs.Graph):
         if node.op in ("Int4GroupwiseGemmPlugin", "Int4GroupwiseGemmPluginV2")
     ]
     for node in int4_gemm_nodes:
-        # For AWQ, the input is smoothed by a Mul and a Cast node.
-        if node.inputs[0].inputs[
-                0].op == "Cast" and "input_quantizer" in node.inputs[0].inputs[
-                    0].inputs[0].name:
-            cast_node = node.inputs[0].inputs[0]
-            mul_node = cast_node.inputs[0].inputs[0]
-            input_node = mul_node.inputs[0]
-        # For GPTQ, no smoothing is applied.
-        else:
-            input_node = node.inputs[0]
+        input_node = _unsmoothed_int4_activation(node)
         weight_shape = (node.attrs["gemm_k"], node.attrs["gemm_n"])
         weight_init_name = getattr(node.inputs[1], "name", "") or ""
         stem = _stem_from_init_name(weight_init_name)
@@ -453,6 +501,23 @@ def _process_tensor(tensor: torch.Tensor, key: str, lora_alpha: float,
     return tensor
 
 
+def _check_lora_add_precedes_consumers(gemm_name: str,
+                                       output_tensor: gs.Tensor,
+                                       final_output: gs.Tensor,
+                                       gemm_consumers) -> None:
+    """Every former consumer of the GEMM output must now read the LoRA sum.
+    This keeps the Add ahead of architectural output scales that follow a
+    GEMM (the Gemma 4 PLE model projection feeds a ``hidden_size**-0.5``
+    Mul), so the adapter delta is scaled exactly like the base output."""
+    for out_node in gemm_consumers:
+        reads_sum = any(inp is final_output for inp in out_node.inputs)
+        reads_raw = any(inp is output_tensor for inp in out_node.inputs)
+        if reads_raw or not reads_sum:
+            raise RuntimeError(
+                f"LoRA Add for {gemm_name} was not wired before consumer "
+                f"{out_node.op} {out_node.name}")
+
+
 # Main functions for external use
 def insert_lora_and_save(onnx_dir: str):
     """
@@ -533,7 +598,8 @@ def insert_lora_and_save(onnx_dir: str):
             for idx, inp in enumerate(out_node.inputs):
                 if inp is output_tensor:
                     out_node.inputs[idx] = final_output
-                    break
+        _check_lora_add_precedes_consumers(gemm_name, output_tensor,
+                                           final_output, gemm_consumers)
 
     graph.cleanup().toposort().fold_constants().cleanup()
 
