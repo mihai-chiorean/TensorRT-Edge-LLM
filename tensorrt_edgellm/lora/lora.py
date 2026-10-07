@@ -13,14 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
+import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import time
 from collections import namedtuple
 from pathlib import Path
-from typing import Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import onnx
@@ -29,6 +32,7 @@ import torch
 from safetensors import safe_open
 
 from tensorrt_edgellm._safetensors_io import save_file
+from tensorrt_edgellm.checkpoint import loader as checkpoint_loader
 
 from .phi4mm_utils import load_phi4mm_model
 
@@ -424,53 +428,234 @@ def _match_gemm_infos(graph: gs.Graph):
 
 
 # Helper functions for LoRA weight processing
-def _load_adapter_config(config_path: str) -> Tuple[float, int]:
-    """
-    Load adapter config and return lora_alpha and r values.
+_BASE_MODEL_PREFIX = "base_model.model."
+_LORA_KEY_RE = re.compile(r"^(?P<stem>.+)\.lora_(?P<factor>[AB])\.weight$")
 
-    Args:
-        config_path (str): Path to adapter_config.json
+# PEFT features the runtime does not implement. Processing folds one global
+# lora_alpha / r into B and binds plain lora_A / lora_B factors, so an adapter
+# that sets any of these would load and silently compute something else.
+_UNSUPPORTED_ADAPTER_FEATURES = {
+    "use_rslora":
+    "rsLoRA scaling (lora_alpha / sqrt(r)) is not applied",
+    "use_dora":
+    "DoRA magnitude vectors have no engine binding",
+    "rank_pattern":
+    "per-module ranks; the runtime assumes one global r",
+    "alpha_pattern":
+    "per-module alphas; the runtime assumes one global "
+    "lora_alpha",
+    "modules_to_save":
+    "full-weight module copies have no engine binding",
+    "layers_to_transform":
+    "layer subsets; declared-target coverage cannot "
+    "be checked",
+    "layers_pattern":
+    "layer subsets; declared-target coverage cannot be "
+    "checked",
+}
 
-    Returns:
-        Tuple[float, int]: (lora_alpha, r)
-    """
+# Modules that are never LoRA-inserted: embeddings and the LM head live
+# outside the inserted GEMM set (sidecars and the lm_head filter) and the
+# vision/audio towers run in separate engines.
+_UNSUPPORTED_MODULE_PARTS = frozenset({
+    "embed_tokens",
+    "embed_tokens_per_layer",
+    "lm_head",
+    "vision_tower",
+    "audio_tower",
+    "visual",
+    "multi_modal_projector",
+})
+
+_EXPORT_CONFIG_PROVENANCE_KEYS = ("model", "edgellm_version", "hidden_size",
+                                  "num_hidden_layers", "vocab_size",
+                                  "quantization", "quant_method")
+
+_SIDECAR_FILES = ("embedding.safetensors", "ple_embedding.safetensors")
+
+
+@dataclasses.dataclass
+class LoraProcessingReport:
+    """What ``process_lora_weights_and_save`` wrote and what it left out."""
+    output_path: str
+    rank: int
+    lora_scale: float
+    key_prefix: Tuple[str, str]
+    bound: List[str]
+    """Adapter modules written to the processed file."""
+    unused: List[str]
+    """Adapter modules dropped because the engine has no such module (for
+    example k/v_proj of the KV-shared Gemma 4 layers)."""
+    unbound_untargeted: List[str]
+    """Engine LoRA bindings outside the adapter's declared targets; the
+    runtime binds rank-1 zeros for them."""
+
+
+def _read_adapter_config(config_path: str) -> dict:
     with open(config_path, 'r') as f:
-        config = json.load(f)
-    return config['lora_alpha'], config['r']
+        return json.load(f)
 
 
-def _process_tensor_name(key: str) -> str:
-    """
-    Process tensor name by removing 'base_model.model' prefix and ensuring it starts with 'model'.
+def _check_adapter_config(config: dict) -> Tuple[float, int]:
+    """Return ``(lora_alpha, r)`` after refusing adapter features the runtime
+    does not implement."""
+    unsupported = [
+        f"{key} ({reason})"
+        for key, reason in _UNSUPPORTED_ADAPTER_FEATURES.items()
+        if config.get(key)
+    ]
+    if config.get("bias", "none") != "none":
+        unsupported.append(
+            "bias != none (bias updates have no engine binding)")
+    if unsupported:
+        raise ValueError("adapter_config.json uses unsupported features: " +
+                         "; ".join(unsupported))
+    r = int(config["r"])
+    if r <= 0:
+        raise ValueError(f"adapter_config.json has non-positive rank r={r}")
+    return float(config["lora_alpha"]), r
 
-    Args:
-        key (str): Original tensor name
 
-    Returns:
-        str: Processed tensor name
-    """
-    if key.startswith('base_model.model.'):
-        key = key[len('base_model.model.'):]
+def _process_tensor_name(key: str,
+                         strip_prefix: str = "",
+                         insert_prefix: str = "") -> str:
+    """Map a PEFT tensor name onto the engine binding stem: drop
+    ``base_model.model.``, apply the checkpoint loader's wrapper-prefix rule
+    (``model.language_model.`` -> ``model.`` for Gemma 4 / Qwen3-VL style
+    checkpoints), and ensure the ``model.`` root."""
+    if key.startswith(_BASE_MODEL_PREFIX):
+        key = key[len(_BASE_MODEL_PREFIX):]
+    if strip_prefix and key.startswith(strip_prefix):
+        key = insert_prefix + key[len(strip_prefix):]
     if not key.startswith('model.'):
         key = 'model.' + key
     return key
 
 
-def _should_keep_tensor(key: str) -> bool:
-    """
-    Check if tensor should be kept (exclude norm and lm_head tensors).
+def _normalize_adapter_keys(keys) -> Tuple[Dict[str, str], Tuple[str, str]]:
+    """Return ``{source key: engine key}`` and the detected prefix pair,
+    rejecting two source keys that collapse onto one engine key."""
+    stripped = [
+        key[len(_BASE_MODEL_PREFIX):]
+        if key.startswith(_BASE_MODEL_PREFIX) else key for key in keys
+    ]
+    prefix = checkpoint_loader._detect_key_prefix(stripped)
+    mapping: Dict[str, str] = {}
+    owners: Dict[str, str] = {}
+    for key in keys:
+        new_key = _process_tensor_name(key, *prefix)
+        if new_key in owners:
+            raise ValueError(f"adapter tensors {owners[new_key]!r} and "
+                             f"{key!r} both map to {new_key!r}")
+        owners[new_key] = key
+        mapping[key] = new_key
+    return mapping, prefix
 
-    Args:
-        key (str): Tensor name
 
-    Returns:
-        bool: True if tensor should be kept
-    """
-    parts = key.split('.')
-    is_norm_tensor = any(
-        part == 'norm' or part.endswith('_norm') or part.endswith('layernorm')
-        for part in parts)
-    return not is_norm_tensor and 'lm_head' not in parts
+def _hf_module_name(stem: str, key_prefix: Tuple[str, str]) -> str:
+    """Inverse of the prefix mapping, so regex ``target_modules`` written
+    against HF module paths can be matched against engine stems."""
+    strip_prefix, insert_prefix = key_prefix
+    if stem.startswith(insert_prefix):
+        return strip_prefix + stem[len(insert_prefix):]
+    return stem
+
+
+def _matches_module_spec(spec, stem: str, hf_name: str) -> bool:
+    """PEFT target semantics: a string is a full-match regex, a list matches
+    a module path exactly or by ``.<suffix>``."""
+    if not spec:
+        return False
+    names = (stem, hf_name)
+    if isinstance(spec, str):
+        return any(re.fullmatch(spec, name) for name in names)
+    return any(name == target or name.endswith("." + target) for name in names
+               for target in spec)
+
+
+def _is_declared_target(stem: str, config: dict, key_prefix: Tuple[str, str],
+                        adapter_suffixes: Set[str]) -> bool:
+    hf_name = _hf_module_name(stem, key_prefix)
+    if _matches_module_spec(config.get("exclude_modules"), stem, hf_name):
+        return False
+    target_modules = config.get("target_modules")
+    if target_modules:
+        return _matches_module_spec(target_modules, stem, hf_name)
+    return stem.rsplit(".", 1)[-1] in adapter_suffixes
+
+
+def _read_lora_bindings(
+        onnx_dir: str) -> Tuple[Dict[str, Tuple[int, int]], Set[str]]:
+    """Return ``{stem: (k, n)}`` for the ``<stem>.lora_A/B.weight`` inputs of
+    ``lora_model.onnx`` and the set of module stems that own a
+    ``_model.<stem>.weight`` initializer (modules the engine has, whether or
+    not LoRA was inserted on them)."""
+    lora_model_path = os.path.join(onnx_dir, "lora_model.onnx")
+    model = onnx.load(lora_model_path, load_external_data=False)
+    dims_a: Dict[str, int] = {}
+    dims_b: Dict[str, int] = {}
+    for graph_input in model.graph.input:
+        match = _LORA_KEY_RE.match(graph_input.name)
+        if not match:
+            continue
+        dims = graph_input.type.tensor_type.shape.dim
+        if len(dims) != 2:
+            raise ValueError(f"LoRA input {graph_input.name} is not rank-2")
+        if match["factor"] == "A":
+            dims_a[match["stem"]] = dims[0].dim_value
+        else:
+            dims_b[match["stem"]] = dims[1].dim_value
+    if set(dims_a) != set(dims_b):
+        raise ValueError(f"{lora_model_path} has unpaired LoRA inputs: "
+                         f"{sorted(set(dims_a) ^ set(dims_b))}")
+    if not dims_a:
+        raise ValueError(f"{lora_model_path} declares no LoRA inputs; run "
+                         "tensorrt-edgellm-insert-lora first")
+    bindings = {stem: (dims_a[stem], dims_b[stem]) for stem in dims_a}
+    for stem, (k, n) in bindings.items():
+        if k <= 0 or n <= 0:
+            raise ValueError(f"LoRA binding {stem} has invalid dims {(k, n)}")
+    engine_modules = {
+        _stem_from_init_name(init.name)
+        for init in model.graph.initializer
+    }
+    engine_modules.discard("")
+    return bindings, engine_modules
+
+
+def _sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(16 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _engine_provenance(onnx_dir: str) -> dict:
+    provenance = {
+        "onnx_dir": os.path.abspath(onnx_dir),
+        "lora_model_sha256": _sha256(os.path.join(onnx_dir,
+                                                  "lora_model.onnx")),
+    }
+    data_path = os.path.join(onnx_dir, "model.onnx.data")
+    if os.path.exists(data_path):
+        provenance["model_data_sha256"] = _sha256(data_path)
+    config_path = os.path.join(onnx_dir, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            export_config = json.load(f)
+        provenance["export_config"] = {
+            key: export_config[key]
+            for key in _EXPORT_CONFIG_PROVENANCE_KEYS if key in export_config
+        }
+    sidecars = {}
+    for name in _SIDECAR_FILES:
+        path = os.path.join(onnx_dir, name)
+        if os.path.exists(path):
+            sidecars[name] = _sha256(path)
+    if sidecars:
+        provenance["sidecar_sha256"] = sidecars
+    return provenance
 
 
 def _process_tensor(tensor: torch.Tensor, key: str, lora_alpha: float,
@@ -737,56 +922,172 @@ def merge_lora_and_save(model_dir: str,
     logger.info("Merged LoRA adapter %s into %s", lora_dir, output_dir)
 
 
-def process_lora_weights_and_save(input_dir: str, output_dir: str):
-    """
-    Process LoRA weights according to specified requirements.
+def process_lora_weights_and_save(
+        input_dir: str,
+        output_dir: str,
+        onnx_dir: Optional[str] = None,
+        max_lora_rank: Optional[int] = None) -> LoraProcessingReport:
+    """Convert a PEFT LoRA adapter into the runtime's binding layout.
+
+    Every tensor must be a ``lora_A`` / ``lora_B`` weight pair of one module;
+    names are mapped onto the engine stems (``model.layers.N...``) including
+    multimodal wrapper prefixes; B is scaled by ``lora_alpha / r``; both
+    factors are stored FP16 as ``[k, r]`` and ``[r, n]``. Adapter features
+    the runtime does not implement are refused (see
+    ``_UNSUPPORTED_ADAPTER_FEATURES``), as are embedding, lm_head and
+    vision/audio updates.
+
+    With ``onnx_dir`` (the directory holding ``lora_model.onnx``) the adapter
+    is validated against the engine's LoRA inputs: each kept pair must match
+    its binding's ``(k, n)`` exactly; pairs for modules the engine does not
+    have are dropped and reported; a pair for a module the engine has but
+    never LoRA-inserted is an error; every binding inside the adapter's
+    declared ``target_modules`` must be covered. Nothing is written when any
+    check fails.
 
     Args:
-        input_dir (str): Directory containing input adapter files
-        output_dir (str): Directory where processed files will be saved
+        input_dir: Directory with ``adapter_config.json`` and
+            ``adapter_model.safetensors``.
+        output_dir: Destination of ``processed_adapter_model.safetensors``
+            and ``config.json`` (the adapter config plus an
+            ``edgellm_lora_processing`` provenance record).
+        onnx_dir: Optional directory with ``lora_model.onnx``.
+        max_lora_rank: Optional engine ``--maxLoraRank``; the adapter rank
+            must not exceed it.
+
+    Returns:
+        LoraProcessingReport: bound, unused and unbound module lists.
     """
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Load adapter config
     config_path = os.path.join(input_dir, 'adapter_config.json')
-    lora_alpha, r = _load_adapter_config(config_path)
+    config = _read_adapter_config(config_path)
+    lora_alpha, r = _check_adapter_config(config)
+    if max_lora_rank is not None:
+        if max_lora_rank <= 0:
+            raise ValueError(f"max_lora_rank must be positive, got "
+                             f"{max_lora_rank}")
+        if r > max_lora_rank:
+            raise ValueError(f"adapter rank r={r} exceeds the engine's "
+                             f"max_lora_rank={max_lora_rank}")
 
-    # Copy config file to output directory
-    shutil.copy2(config_path, os.path.join(output_dir, 'config.json'))
-
-    # Load safetensors
     safetensor_path = os.path.join(input_dir, 'adapter_model.safetensors')
-    processed_tensors = {}
+    with safe_open(safetensor_path, framework="pt") as f:
+        keys = list(f.keys())
+        mapping, key_prefix = _normalize_adapter_keys(keys)
 
-    try:
-        with safe_open(safetensor_path, framework="pt") as f:
-            for key in f.keys():
-                # Skip unwanted tensors
-                if not _should_keep_tensor(key):
+        pairs: Dict[str, Dict[str, str]] = {}
+        for key, new_key in mapping.items():
+            match = _LORA_KEY_RE.match(new_key)
+            if not match:
+                raise ValueError(
+                    f"unsupported adapter tensor {key!r}: only lora_A/lora_B "
+                    "weights of linear modules can be bound")
+            stem = match["stem"]
+            unsupported = _UNSUPPORTED_MODULE_PARTS.intersection(
+                stem.split("."))
+            if unsupported:
+                raise ValueError(
+                    f"adapter tensor {key!r} updates {sorted(unsupported)}, "
+                    "which the engine cannot adapt")
+            pairs.setdefault(stem, {})[match["factor"]] = key
+        unpaired = sorted(stem for stem, factors in pairs.items()
+                          if set(factors) != {"A", "B"})
+        if unpaired:
+            raise ValueError(f"adapter modules without both lora_A and "
+                             f"lora_B: {unpaired}")
+
+        bindings: Optional[Dict[str, Tuple[int, int]]] = None
+        unused: List[str] = []
+        unbound_untargeted: List[str] = []
+        if onnx_dir is not None:
+            bindings, engine_modules = _read_lora_bindings(onnx_dir)
+            not_inserted = sorted(
+                stem for stem in pairs
+                if stem not in bindings and stem in engine_modules)
+            if not_inserted:
+                raise ValueError(
+                    "adapter targets modules the engine has but did not "
+                    f"LoRA-insert: {not_inserted}")
+            unused = sorted(stem for stem in pairs if stem not in bindings)
+            bound = sorted(stem for stem in pairs if stem in bindings)
+            if not bound:
+                raise ValueError(
+                    "no adapter module matches an engine LoRA binding "
+                    f"(adapter stems look like {sorted(pairs)[:3]}, bindings "
+                    f"like {sorted(bindings)[:3]})")
+            adapter_suffixes = {stem.rsplit(".", 1)[-1] for stem in pairs}
+            missing = []
+            for stem in bindings:
+                if stem in pairs:
                     continue
+                if _is_declared_target(stem, config, key_prefix,
+                                       adapter_suffixes):
+                    missing.append(stem)
+                else:
+                    unbound_untargeted.append(stem)
+            if missing:
+                raise ValueError(
+                    f"{len(missing)} engine binding(s) inside the adapter's "
+                    f"declared targets have no adapter tensors: "
+                    f"{sorted(missing)[:10]}")
+        else:
+            bound = sorted(pairs)
+            if not bound:
+                raise ValueError("adapter has no lora_A/lora_B pairs")
 
-                # Process tensor name
-                new_key = _process_tensor_name(key)
+        processed_tensors = {}
+        for stem in bound:
+            tensors = {}
+            for factor in ("A", "B"):
+                key = pairs[stem][factor]
+                tensor = _process_tensor(f.get_tensor(key), key, lora_alpha, r)
+                if not torch.isfinite(tensor).all():
+                    raise ValueError(f"adapter tensor {key!r} has non-finite "
+                                     "values after FP16 conversion")
+                tensors[factor] = tensor
+            k, n = bindings[stem] if bindings else (tensors["A"].shape[0],
+                                                    tensors["B"].shape[1])
+            if tuple(tensors["A"].shape) != (k, r) or tuple(
+                    tensors["B"].shape) != (r, n):
+                raise ValueError(
+                    f"adapter module {stem} has lora_A {tuple(tensors['A'].shape)} "
+                    f"and lora_B {tuple(tensors['B'].shape)}; expected "
+                    f"[{k}, {r}] and [{r}, {n}]")
+            processed_tensors[f"{stem}.lora_A.weight"] = tensors["A"]
+            processed_tensors[f"{stem}.lora_B.weight"] = tensors["B"]
 
-                # Load and process tensor
-                tensor = f.get_tensor(key)
-                processed_tensor = _process_tensor(tensor, key, lora_alpha, r)
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir,
+                               'processed_adapter_model.safetensors')
+    save_file(processed_tensors, output_path)
 
-                # Store processed tensor
-                processed_tensors[new_key] = processed_tensor
+    provenance = {
+        "source_adapter_dir": os.path.abspath(input_dir),
+        "adapter_model_sha256": _sha256(safetensor_path),
+        "base_model_name_or_path": config.get("base_model_name_or_path"),
+        "key_prefix": {
+            "strip": key_prefix[0],
+            "insert": key_prefix[1]
+        },
+        "rank": r,
+        "lora_scale": lora_alpha / r,
+        "max_lora_rank": max_lora_rank,
+        "bound_modules": bound,
+        "unused_adapter_modules": unused,
+        "unbound_untargeted_bindings": sorted(unbound_untargeted),
+    }
+    if onnx_dir is not None:
+        provenance["engine"] = _engine_provenance(onnx_dir)
+    output_config = dict(config)
+    output_config["edgellm_lora_processing"] = provenance
+    with open(os.path.join(output_dir, 'config.json'), 'w') as out:
+        json.dump(output_config, out, indent=2)
 
-                logger.info("Processed tensor %s shape=%s dtype=%s", new_key,
-                            tuple(processed_tensor.shape),
-                            processed_tensor.dtype)
-
-        # Save processed tensors
-        output_path = os.path.join(output_dir,
-                                   'processed_adapter_model.safetensors')
-        save_file(processed_tensors, output_path)
-        logger.info("Processed tensors saved to: %s", output_path)
-        logger.info("Config file copied to: %s",
-                    os.path.join(output_dir, 'config.json'))
-
-    except Exception as e:
-        raise RuntimeError(f"Error processing safetensor file: {e}") from e
+    logger.info("Processed %d LoRA modules to %s (rank %d, scale %.4f)",
+                len(bound), output_path, r, lora_alpha / r)
+    return LoraProcessingReport(output_path=output_path,
+                                rank=r,
+                                lora_scale=lora_alpha / r,
+                                key_prefix=key_prefix,
+                                bound=bound,
+                                unused=unused,
+                                unbound_untargeted=sorted(unbound_untargeted))
