@@ -345,6 +345,73 @@ void launchGemma4PleGather(int32_t const* inputIds, T const* pleTable, T* output
         seqLen, vocabSize, numLayers, pleHiddenSize, imageTokenId, audioTokenId);
 }
 
+//! \brief Gathers one PLE layer slice per block from a signed INT8 table and dequantizes it to FP16 with the
+//! row's per-layer scale. Zero-fills the same positions as gemma4PleGatherKernel.
+__global__ void gemma4PleGatherInt8Kernel(int32_t const* inputIds, int8_t const* pleTable, float const* scales,
+    half* outputBuffer, int64_t layerOutputCapacity, int64_t batchSize, int64_t seqLen, int32_t vocabSize,
+    int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId)
+{
+    int64_t const seqIdx = blockIdx.x;
+    int64_t const batchIdx = blockIdx.y;
+    int32_t const layerIdx = blockIdx.z;
+
+    if (batchIdx >= batchSize || seqIdx >= seqLen || layerIdx >= numLayers)
+    {
+        return;
+    }
+
+    int64_t const tokenOffset = batchIdx * seqLen + seqIdx;
+    int32_t const tokenId = inputIds[tokenOffset];
+    bool const zeroFill = tokenId < 0 || tokenId >= vocabSize || (imageTokenId >= 0 && tokenId == imageTokenId)
+        || (audioTokenId >= 0 && tokenId == audioTokenId);
+
+    int64_t const outputOffset = static_cast<int64_t>(layerIdx) * layerOutputCapacity + tokenOffset * pleHiddenSize;
+    int64_t const tableOffset = (static_cast<int64_t>(tokenId) * numLayers + layerIdx) * pleHiddenSize;
+
+    constexpr uint32_t kVecSize = DVec<half>::vec_size;
+    for (int32_t hiddenIdx = threadIdx.x * kVecSize; hiddenIdx < pleHiddenSize; hiddenIdx += blockDim.x * kVecSize)
+    {
+        DVec<half> valueVec;
+        if (zeroFill)
+        {
+#pragma unroll
+            for (uint32_t i = 0; i < kVecSize; ++i)
+            {
+                valueVec[i] = half{};
+            }
+        }
+        else
+        {
+            int2 const packed = *reinterpret_cast<int2 const*>(pleTable + tableOffset + hiddenIdx);
+            int8_t const* values = reinterpret_cast<int8_t const*>(&packed);
+            float const scale = scales[static_cast<int64_t>(tokenId) * numLayers + layerIdx];
+#pragma unroll
+            for (uint32_t i = 0; i < kVecSize; ++i)
+            {
+                valueVec[i] = __float2half(static_cast<float>(values[i]) * scale);
+            }
+        }
+        valueVec.store(outputBuffer + outputOffset + hiddenIdx);
+    }
+}
+
+void launchGemma4PleGatherInt8(int32_t const* inputIds, int8_t const* pleTable, float const* scales, half* outputBuffer,
+    int64_t layerOutputCapacity, int64_t batchSize, int64_t seqLen, int32_t vocabSize, int32_t numLayers,
+    int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, cudaStream_t stream)
+{
+    constexpr uint32_t kVecSize = DVec<half>::vec_size;
+    check::check(pleHiddenSize % kVecSize == 0,
+        format::fmtstr("pleHiddenSize must be a multiple of %d for vectorized INT8 dequantization", kVecSize));
+
+    // One block per (token, layer) slice; a slice is pleHiddenSize / 8 vectors, so size the block to it (whole
+    // warps, at most 256 threads) instead of leaving most of a fixed 256-thread block idle.
+    dim3 const grid(seqLen, batchSize, numLayers);
+    uint32_t const sliceThreads = (pleHiddenSize / kVecSize + 31) / 32 * 32;
+    dim3 const block(sliceThreads < 256 ? sliceThreads : 256);
+    gemma4PleGatherInt8Kernel<<<grid, block, 0, stream>>>(inputIds, pleTable, scales, outputBuffer, layerOutputCapacity,
+        batchSize, seqLen, vocabSize, numLayers, pleHiddenSize, imageTokenId, audioTokenId);
+}
+
 constexpr int32_t kMetadataScanThreads{256};
 
 template <bool PerBatchOffsets>
@@ -776,7 +843,8 @@ void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTabl
 }
 
 void gemma4PleGather(rt::Tensor const& inputIds, rt::Tensor const& pleTable, rt::Tensor& outputBuffer,
-    int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, cudaStream_t stream)
+    int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, cudaStream_t stream,
+    rt::OptionalInputTensor scales)
 {
     auto const inputShape = inputIds.getShape();
     auto const tableShape = pleTable.getShape();
@@ -787,7 +855,25 @@ void gemma4PleGather(rt::Tensor const& inputIds, rt::Tensor const& pleTable, rt:
     check::check(outputShape.getNumDims() == 4,
         "outputBuffer must be 4D tensor [numLayers, maxBatchSize, maxSeqLen, pleHiddenSize]");
     check::check(inputIds.getDataType() == nvinfer1::DataType::kINT32, "inputIds must be INT32");
-    check::check(outputBuffer.getDataType() == pleTable.getDataType(), "outputBuffer dtype must match pleTable dtype");
+    bool const isInt8Ple = pleTable.getDataType() == nvinfer1::DataType::kINT8;
+    if (isInt8Ple)
+    {
+        check::check(
+            outputBuffer.getDataType() == nvinfer1::DataType::kHALF, "INT8 pleTable requires an FP16 outputBuffer");
+        check::check(scales.has_value(), "scales must be provided for INT8 pleTable");
+        auto const& scalesTensor = scales.value().get();
+        auto const scaleShape = scalesTensor.getShape();
+        check::check(scaleShape.getNumDims() == 2, "INT8 PLE scales must be 2D [vocabSize, numLayers]");
+        check::check(scaleShape[0] == tableShape[0], "INT8 PLE scale rows must match pleTable vocab size");
+        check::check(scaleShape[1] == numLayers, "INT8 PLE scale columns must match numLayers");
+        check::check(scalesTensor.getDataType() == nvinfer1::DataType::kFLOAT, "INT8 PLE scales must be FP32");
+    }
+    else
+    {
+        check::check(!scales.has_value(), "scales must not be provided for an FP16 or BF16 pleTable");
+        check::check(
+            outputBuffer.getDataType() == pleTable.getDataType(), "outputBuffer dtype must match pleTable dtype");
+    }
     check::check(numLayers > 0, "numLayers must be positive");
     check::check(pleHiddenSize > 0, "pleHiddenSize must be positive");
     check::check(outputShape[0] == numLayers, "outputBuffer first dimension must match numLayers");
@@ -795,9 +881,9 @@ void gemma4PleGather(rt::Tensor const& inputIds, rt::Tensor const& pleTable, rt:
     check::check(tableShape[1] == static_cast<int64_t>(numLayers) * pleHiddenSize,
         "pleTable second dimension must match numLayers * pleHiddenSize");
     check::check(tableShape[0] <= std::numeric_limits<int32_t>::max(), "pleTable vocab dimension exceeds int32 range");
-    check::check(
-        pleTable.getDataType() == nvinfer1::DataType::kHALF || pleTable.getDataType() == nvinfer1::DataType::kBF16,
-        "pleTable must be FP16 or BF16");
+    check::check(pleTable.getDataType() == nvinfer1::DataType::kHALF
+            || pleTable.getDataType() == nvinfer1::DataType::kBF16 || isInt8Ple,
+        "pleTable must be FP16, BF16, or INT8");
 
     int64_t const batchSize = inputShape[0];
     int64_t const seqLen = inputShape[1];
@@ -808,7 +894,13 @@ void gemma4PleGather(rt::Tensor const& inputIds, rt::Tensor const& pleTable, rt:
     int32_t const vocabSize = static_cast<int32_t>(tableShape[0]);
     int32_t const* inputIdsPtr = inputIds.dataPointer<int32_t>();
 
-    if (pleTable.getDataType() == nvinfer1::DataType::kHALF)
+    if (isInt8Ple)
+    {
+        launchGemma4PleGatherInt8(inputIdsPtr, pleTable.dataPointer<int8_t>(),
+            scales.value().get().dataPointer<float>(), outputBuffer.dataPointer<half>(), layerOutputCapacity, batchSize,
+            seqLen, vocabSize, numLayers, pleHiddenSize, imageTokenId, audioTokenId, stream);
+    }
+    else if (pleTable.getDataType() == nvinfer1::DataType::kHALF)
     {
         launchGemma4PleGather(inputIdsPtr, pleTable.dataPointer<half>(), outputBuffer.dataPointer<half>(),
             layerOutputCapacity, batchSize, seqLen, vocabSize, numLayers, pleHiddenSize, imageTokenId, audioTokenId,
