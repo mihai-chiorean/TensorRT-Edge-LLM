@@ -1210,9 +1210,28 @@ def write_runtime_artifacts(model: "CausalLM",
             if ple_weight.dtype in (torch.float32, torch.bfloat16):
                 ple_weight = ple_weight.to(torch.float16)
             ple_path = os.path.join(out_dir, "ple_embedding.safetensors")
-            save_file({"weight": ple_weight.contiguous()}, ple_path)
-            logger.info("Wrote ple_embedding.safetensors (%s)",
-                        list(ple_weight.shape))
+            if int8_embedding:
+                from . import embedding_quantization
+                num_layers = model.config.num_hidden_layers
+                ple_int8, scales = embedding_quantization.quantize_embedding_to_int8(
+                    ple_weight, num_groups=num_layers)
+                # The runtime expects one scale row per vocabulary entry and
+                # one column per layer, also when there is a single layer.
+                scales = scales.reshape(ple_weight.shape[0], num_layers)
+                save_file(
+                    {
+                        "weight": ple_int8,
+                        "weight_scale": scales
+                    },
+                    ple_path,
+                    metadata=embedding_quantization.int8_sidecar_metadata(
+                        "ple_embedding"))
+                logger.info("Wrote INT8 ple_embedding.safetensors (%s)",
+                            list(ple_weight.shape))
+            else:
+                save_file({"weight": ple_weight.contiguous()}, ple_path)
+                logger.info("Wrote ple_embedding.safetensors (%s)",
+                            list(ple_weight.shape))
 
     # Alpamayo-R1: tokenizer lives in the VLM checkpoint, not in model_dir.
     # Build it first so that tokenizer files exist before the copy loop

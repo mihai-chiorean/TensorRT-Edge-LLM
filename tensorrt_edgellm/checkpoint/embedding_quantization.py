@@ -29,30 +29,41 @@ INT8_SYMMETRIC_MAX = 127.0
 # Rows are quantized in chunks of this many elements so the FP32 working copy
 # stays bounded (64 MiB) for 262k-row vocabularies.
 INT8_QUANTIZATION_CHUNK_ELEMENTS = 16 * 1024 * 1024
-INT8_SIDECAR_FORMAT = "int8_symmetric_per_row"
 INT8_SIDECAR_VERSION = "1"
-INT8_SIDECAR_ROLES = frozenset(("embedding", ))
+# Token embedding: one scale per row. Gemma 4 PLE: one scale per row and
+# per contiguous column group (one group per layer input).
+INT8_SIDECAR_FORMATS = {
+    "embedding": "int8_symmetric_per_row",
+    "ple_embedding": "int8_symmetric_column_groups_per_row",
+}
 
 
 def int8_sidecar_metadata(tensor_role: str) -> dict[str, str]:
     """Return the versioned safetensors metadata for an INT8 sidecar."""
-    if tensor_role not in INT8_SIDECAR_ROLES:
+    if tensor_role not in INT8_SIDECAR_FORMATS:
         raise ValueError(
             f"Unsupported INT8 sidecar tensor role: {tensor_role!r}")
     return {
-        "trt_edge_llm_quantization": INT8_SIDECAR_FORMAT,
+        "trt_edge_llm_quantization": INT8_SIDECAR_FORMATS[tensor_role],
         "trt_edge_llm_quantization_version": INT8_SIDECAR_VERSION,
         "trt_edge_llm_tensor_role": tensor_role,
     }
 
 
 def quantize_embedding_to_int8(
-        embedding_weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Quantize an embedding table to symmetric INT8 with one FP32 scale per row.
+    embedding_weight: torch.Tensor,
+    *,
+    num_groups: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize an embedding table to symmetric INT8 with FP32 scales.
 
-    The payload uses ``[-127, 127]`` so zero stays exact and the runtime
-    dequantizes as ``fp16(int8_value * row_scale)``. An all-zero row gets
-    scale 1.0 and an all-zero payload.
+    Each row is split into ``num_groups`` contiguous column groups and every
+    group gets its own scale, so an outlier in one group does not reduce the
+    precision of the others. With one group the scales are ``[vocab]``;
+    otherwise ``[vocab, num_groups]``. The payload uses ``[-127, 127]`` so
+    zero stays exact and the runtime dequantizes as
+    ``fp16(int8_value * scale)``. An all-zero group gets scale 1.0 and an
+    all-zero payload.
     """
     if embedding_weight.dim() != 2:
         raise ValueError(
@@ -65,11 +76,17 @@ def quantize_embedding_to_int8(
         raise ValueError(
             f"Embedding must have a floating-point dtype, got {embedding_weight.dtype}"
         )
+    if num_groups <= 0:
+        raise ValueError(f"num_groups must be positive, got {num_groups}")
+    if embedding_weight.shape[1] % num_groups != 0:
+        raise ValueError(
+            f"Embedding width {embedding_weight.shape[1]} must be divisible "
+            f"by num_groups {num_groups}")
 
     vocab_size, width = embedding_weight.shape
     rows_per_chunk = max(1, INT8_QUANTIZATION_CHUNK_ELEMENTS // width)
     embedding_int8 = torch.empty_like(embedding_weight, dtype=torch.int8)
-    scales = torch.empty(vocab_size,
+    scales = torch.empty((vocab_size, num_groups),
                          dtype=torch.float32,
                          device=embedding_weight.device)
 
@@ -79,16 +96,22 @@ def quantize_embedding_to_int8(
         if not torch.isfinite(weight_fp32).all():
             raise ValueError("Embedding contains non-finite values")
 
-        row_amax = weight_fp32.abs().amax(dim=1)
-        row_scales = torch.where(row_amax > 0, row_amax / INT8_SYMMETRIC_MAX,
-                                 torch.ones_like(row_amax))
-        quantized = torch.round(weight_fp32 / row_scales.unsqueeze(1))
+        grouped = weight_fp32.view(row_end - row_start, num_groups,
+                                   width // num_groups)
+        group_amax = grouped.abs().amax(dim=2)
+        group_scales = torch.where(group_amax > 0,
+                                   group_amax / INT8_SYMMETRIC_MAX,
+                                   torch.ones_like(group_amax))
+        quantized = torch.round(grouped / group_scales.unsqueeze(2))
         embedding_int8[row_start:row_end] = quantized.clamp(
-            -INT8_SYMMETRIC_MAX, INT8_SYMMETRIC_MAX).to(torch.int8)
-        scales[row_start:row_end] = row_scales
+            -INT8_SYMMETRIC_MAX,
+            INT8_SYMMETRIC_MAX).to(torch.int8).view(row_end - row_start, width)
+        scales[row_start:row_end] = group_scales
 
-    logger.info("Quantized embedding to INT8: [%d, %d], scales: [%d]",
-                vocab_size, width, vocab_size)
+    if num_groups == 1:
+        scales = scales[:, 0].contiguous()
+    logger.info("Quantized embedding to INT8: [%d, %d], scales: %s",
+                vocab_size, width, list(scales.shape))
     return embedding_int8, scales
 
 
