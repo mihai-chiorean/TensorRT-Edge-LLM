@@ -85,6 +85,7 @@ def export_onnx(
     *,
     int8_embedding: bool = False,
     int4_embedding: bool = False,
+    int4_embedding_scale: str = "absmax",
 ) -> None:
     """Export *model* to ONNX using the dynamo exporter.
 
@@ -118,6 +119,9 @@ def export_onnx(
         int4_embedding: Write embedding.safetensors (and the Gemma 4 PLE
                         sidecar) as packed symmetric INT4 with one FP16 scale
                         per 32 columns.
+        int4_embedding_scale: INT4 scale rule, ``"absmax"`` or
+                              ``"q4_0_grid"`` (see
+                              ``embedding_quantization.INT4_SCALE_MODES``).
     """
     out_dir = os.path.dirname(os.path.abspath(output_path))
     os.makedirs(out_dir, exist_ok=True)
@@ -139,6 +143,7 @@ def export_onnx(
                             fp8_embedding=fp8_embedding,
                             int8_embedding=int8_embedding,
                             int4_embedding=int4_embedding,
+                            int4_embedding_scale=int4_embedding_scale,
                             reduced_vocab_dir=reduced_vocab_dir,
                             config_filename=config_filename,
                             write_shared_artifacts=write_shared_artifacts)

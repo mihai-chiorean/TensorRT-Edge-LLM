@@ -42,6 +42,10 @@ INT4_SYMMETRIC_MAX = 7.0
 INT4_SIDECAR_VERSION = "1"
 INT4_SIDECAR_FORMAT = "int4_symmetric_group32_packed"
 INT4_SIDECAR_ROLES = ("embedding", "ple_embedding")
+# "absmax": d = amax / 7, codes in [-7, 7].
+# "q4_0_grid": d = max(max / 7, -min / 8), codes in [-8, 7]. Reproduces tables
+# that already lie on a symmetric Q4_0 group grid (QAT Q4_0 checkpoints).
+INT4_SCALE_MODES = ("absmax", "q4_0_grid")
 
 
 def int8_sidecar_metadata(tensor_role: str) -> dict[str, str]:
@@ -72,17 +76,22 @@ def quantize_embedding_to_int4(
     embedding_weight: torch.Tensor,
     *,
     group_size: int = INT4_GROUP_SIZE,
+    scale_mode: str = "absmax",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize an embedding table to packed symmetric INT4 with FP16 scales.
 
     Every ``group_size`` contiguous columns of a row share one FP16 scale.
-    Values are rounded to ``[-7, 7]`` with the FP16-rounded scale, so the
-    runtime's ``fp16((nibble - 8) * scale)`` reproduces the quantizer's own
-    grid and zero stays exact. Two columns are packed per byte: the even
+    ``scale_mode`` selects the scale and code range (see
+    ``INT4_SCALE_MODES``); values are rounded with the FP16-rounded scale, so
+    the runtime's ``fp16((nibble - 8) * scale)`` reproduces the quantizer's
+    own grid and zero stays exact. Two columns are packed per byte: the even
     column in the low nibble, the odd column in the high nibble, each stored
     as ``value + 8``. Returns ``(uint8 [vocab, width // 2],
     fp16 [vocab, width // group_size])``. An all-zero group gets scale 1.0.
     """
+    if scale_mode not in INT4_SCALE_MODES:
+        raise ValueError(f"scale_mode must be one of {INT4_SCALE_MODES}, "
+                         f"got {scale_mode!r}")
     if embedding_weight.dim() != 2:
         raise ValueError(
             f"Embedding must be 2D, got {embedding_weight.dim()}D")
@@ -119,14 +128,20 @@ def quantize_embedding_to_int4(
             raise ValueError("Embedding contains non-finite values")
 
         grouped = weight_fp32.view(row_end - row_start, num_groups, group_size)
-        group_amax = grouped.abs().amax(dim=2)
-        group_scales = torch.where(group_amax > 0,
-                                   group_amax / INT4_SYMMETRIC_MAX,
-                                   torch.ones_like(group_amax))
+        if scale_mode == "absmax":
+            group_step = grouped.abs().amax(dim=2) / INT4_SYMMETRIC_MAX
+            code_min = -INT4_SYMMETRIC_MAX
+        else:
+            group_step = torch.maximum(
+                grouped.amax(dim=2) / INT4_SYMMETRIC_MAX,
+                -grouped.amin(dim=2) / (INT4_SYMMETRIC_MAX + 1))
+            code_min = -(INT4_SYMMETRIC_MAX + 1)
+        group_scales = torch.where(group_step > 0, group_step,
+                                   torch.ones_like(group_step))
         # Quantize against the scale the runtime will see.
         group_scales = group_scales.to(torch.float16)
         quantized = torch.round(grouped / group_scales.float().unsqueeze(2))
-        quantized = quantized.clamp(-INT4_SYMMETRIC_MAX, INT4_SYMMETRIC_MAX)
+        quantized = quantized.clamp(code_min, INT4_SYMMETRIC_MAX)
         offset = (quantized + 8).to(torch.uint8).view(row_end - row_start,
                                                       width)
         packed[row_start:row_end] = offset[:, 0::2] | (offset[:, 1::2] << 4)

@@ -1089,7 +1089,8 @@ def write_runtime_artifacts(model: "CausalLM",
                             write_shared_artifacts: bool = True,
                             *,
                             int8_embedding: bool = False,
-                            int4_embedding: bool = False) -> None:
+                            int4_embedding: bool = False,
+                            int4_embedding_scale: str = "absmax") -> None:
     """Write runtime config and the shared model-input artifacts.
 
     ``config_filename`` selects the filename for the runtime config. Use
@@ -1220,7 +1221,7 @@ def write_runtime_artifacts(model: "CausalLM",
             elif int4_embedding:
                 from . import embedding_quantization
                 embedding_int4, scales = embedding_quantization.quantize_embedding_to_int4(
-                    weight)
+                    weight, scale_mode=int4_embedding_scale)
                 save_file(
                     {
                         "embedding": embedding_int4,
@@ -1273,7 +1274,7 @@ def write_runtime_artifacts(model: "CausalLM",
             elif int4_embedding:
                 from . import embedding_quantization
                 ple_int4, scales = embedding_quantization.quantize_embedding_to_int4(
-                    ple_weight)
+                    ple_weight, scale_mode=int4_embedding_scale)
                 save_file(
                     {
                         "weight": ple_int4,

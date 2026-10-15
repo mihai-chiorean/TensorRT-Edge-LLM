@@ -1016,7 +1016,8 @@ def _export_llm(model_dir: str,
                 quantization_override: "str | None" = None,
                 *,
                 int8_embedding: bool = False,
-                int4_embedding: bool = False) -> None:
+                int4_embedding: bool = False,
+                int4_embedding_scale: str = "absmax") -> None:
     """Export LLM backbone via the standard tensorrt_edgellm pipeline.
 
     When ``tp_size > 1``, exports ``tp_size`` per-rank ONNX files named
@@ -1161,6 +1162,7 @@ def _export_llm(model_dir: str,
                         fp8_embedding=fp8_embedding,
                         int8_embedding=int8_embedding,
                         int4_embedding=int4_embedding,
+                        int4_embedding_scale=int4_embedding_scale,
                         reduced_vocab_dir=reduced_vocab_dir,
                         externalize_weights=externalize_weights,
                         config_filename=config_filename,
@@ -1313,7 +1315,8 @@ def _export_diffusion_gemma(model_dir: str,
                             tp_size: int = 1,
                             *,
                             int8_embedding: bool = False,
-                            int4_embedding: bool = False) -> None:
+                            int4_embedding: bool = False,
+                            int4_embedding_scale: str = "absmax") -> None:
     """Export DiffusionGemma as one unified backbone graph."""
     if tp_size != 1:
         raise SystemExit(
@@ -1367,6 +1370,7 @@ def _export_diffusion_gemma(model_dir: str,
                     fp8_embedding=fp8_embedding,
                     int8_embedding=int8_embedding,
                     int4_embedding=int4_embedding,
+                    int4_embedding_scale=int4_embedding_scale,
                     reduced_vocab_dir=reduced_vocab_dir,
                     externalize_weights=backbone_externalize_weights)
     except (OSError, ValueError, RuntimeError) as exc:
@@ -4169,6 +4173,17 @@ def main() -> None:
               "packed symmetric INT4 with one FP16 scale per 32 columns."),
     )
     p.add_argument(
+        "--int4-embedding-scale",
+        "--int4_embedding_scale",
+        dest="int4_embedding_scale",
+        choices=("absmax", "q4_0_grid"),
+        default="absmax",
+        help=("Scale rule for --int4-embedding. 'absmax': amax / 7, codes in "
+              "[-7, 7]. 'q4_0_grid': max(max / 7, -min / 8), codes in "
+              "[-8, 7]; reproduces tables that already lie on a Q4_0 "
+              "group-32 grid, such as QAT Q4_0 checkpoints."),
+    )
+    p.add_argument(
         "--reduced-vocab-dir",
         "--reduced_vocab_dir",
         dest="reduced_vocab_dir",
@@ -4534,7 +4549,8 @@ def main() -> None:
                             os.path.join(args.output_dir, "llm"),
                             model_type="cosmos3_edge",
                             int8_embedding=args.int8_embedding,
-                            int4_embedding=args.int4_embedding)
+                            int4_embedding=args.int4_embedding,
+                            int4_embedding_scale=args.int4_embedding_scale)
             # SigLIP2 ViT + PatchMerger -> visual/ for the standard
             # visual_build + multimodal runtime. The vision tower is read
             # directly from its checkpoint shards (the root index maps it to
@@ -4774,6 +4790,7 @@ def main() -> None:
                 fp8_embedding=args.fp8_embedding,
                 int8_embedding=args.int8_embedding,
                 int4_embedding=args.int4_embedding,
+                int4_embedding_scale=args.int4_embedding_scale,
                 reduced_vocab_dir=args.reduced_vocab_dir,
                 externalize_weights=externalize_weights,
                 tp_size=args.tp_size,
@@ -4918,6 +4935,7 @@ def main() -> None:
              fp8_embedding=args.fp8_embedding,
              int8_embedding=args.int8_embedding,
              int4_embedding=args.int4_embedding,
+             int4_embedding_scale=args.int4_embedding_scale,
              reduced_vocab_dir=args.reduced_vocab_dir,
              externalize_weights=externalize_weights,
              tp_size=args.tp_size,
