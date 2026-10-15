@@ -86,12 +86,11 @@ Gemma4EmbeddingPreprocessor::Gemma4EmbeddingPreprocessor(std::filesystem::path c
             }
         }
         ELLM_CHECK(weight != nullptr, "ple_embedding.safetensors must contain a tensor named weight");
-        if (weight->getDataType() == nvinfer1::DataType::kINT8)
+        if (weight->getDataType() == nvinfer1::DataType::kINT8 || weight->getDataType() == nvinfer1::DataType::kUINT8)
         {
             ELLM_CHECK(pleTensors.size() == 2 && scales != nullptr,
-                "INT8 ple_embedding.safetensors must contain exactly weight and weight_scale");
+                "INT8/INT4 ple_embedding.safetensors must contain exactly weight and weight_scale");
             mPleScales = std::move(*scales);
-            ELLM_CHECK(mPleScales.getDataType() == nvinfer1::DataType::kFLOAT, "INT8 PLE scales must be FP32");
             scaleShape = mPleScales.getShape();
         }
         else
@@ -106,23 +105,40 @@ Gemma4EmbeddingPreprocessor::Gemma4EmbeddingPreprocessor(std::filesystem::path c
 
     ELLM_CHECK(tableShape.getNumDims() == 2, "PLE table must be 2D [vocab, num_layers * hidden]");
     ELLM_CHECK(tableShape[0] > 0, "PLE table vocab dimension must be positive");
-    ELLM_CHECK(tableShape[1] == static_cast<int64_t>(mConfig.numPleInputs) * mConfig.pleHiddenSize,
-        "PLE table second dimension must equal num_ple_inputs * ple_hidden_size");
-    mVocabSize = static_cast<int32_t>(tableShape[0]);
+    int64_t const rowWidth = static_cast<int64_t>(mConfig.numPleInputs) * mConfig.pleHiddenSize;
     bool const isInt8Ple = tableDataType == nvinfer1::DataType::kINT8;
-    ELLM_CHECK(tableDataType == nvinfer1::DataType::kHALF || tableDataType == nvinfer1::DataType::kBF16 || isInt8Ple,
-        "PLE table must be FP16, BF16, or INT8");
+    bool const isInt4Ple = tableDataType == nvinfer1::DataType::kUINT8;
+    ELLM_CHECK(tableShape[1] == (isInt4Ple ? rowWidth / 2 : rowWidth),
+        "PLE table second dimension must equal num_ple_inputs * ple_hidden_size (halved for packed INT4)");
+    mVocabSize = static_cast<int32_t>(tableShape[0]);
+    ELLM_CHECK(tableDataType == nvinfer1::DataType::kHALF || tableDataType == nvinfer1::DataType::kBF16 || isInt8Ple
+            || isInt4Ple,
+        "PLE table must be FP16, BF16, INT8, or packed INT4");
+    nvinfer1::DataType const scaleDataType = isHostResident()
+        ? (mHostTable->hasScales() ? mHostTable->scaleDataType() : nvinfer1::DataType::kFLOAT)
+        : mPleScales.getDataType();
     if (isInt8Ple)
     {
         ELLM_CHECK(
             scaleShape.has_value() && scaleShape->getNumDims() == 2, "INT8 PLE scales must be 2D [vocab, num_layers]");
+        ELLM_CHECK(scaleDataType == nvinfer1::DataType::kFLOAT, "INT8 PLE scales must be FP32");
         ELLM_CHECK((*scaleShape)[0] == tableShape[0], "INT8 PLE scale rows must match the table vocab size");
         ELLM_CHECK((*scaleShape)[1] == mConfig.numPleInputs, "INT8 PLE scale columns must match num_ple_inputs");
         mPleOutputDataType = nvinfer1::DataType::kHALF;
     }
+    else if (isInt4Ple)
+    {
+        ELLM_CHECK(scaleShape.has_value() && scaleShape->getNumDims() == 2,
+            "INT4 PLE scales must be 2D [vocab, num_layers * hidden / 32]");
+        ELLM_CHECK(scaleDataType == nvinfer1::DataType::kHALF, "INT4 PLE scales must be FP16");
+        ELLM_CHECK((*scaleShape)[0] == tableShape[0], "INT4 PLE scale rows must match the table vocab size");
+        ELLM_CHECK(rowWidth % kInt4EmbeddingGroupSize == 0 && (*scaleShape)[1] == rowWidth / kInt4EmbeddingGroupSize,
+            "INT4 PLE scale columns must match num_ple_inputs * ple_hidden_size / 32");
+        mPleOutputDataType = nvinfer1::DataType::kHALF;
+    }
     else
     {
-        ELLM_CHECK(!scaleShape.has_value(), "PLE scales are only valid for an INT8 table");
+        ELLM_CHECK(!scaleShape.has_value(), "PLE scales are only valid for an INT8 or INT4 table");
         mPleOutputDataType = tableDataType;
     }
 

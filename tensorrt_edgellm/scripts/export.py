@@ -1015,7 +1015,8 @@ def _export_llm(model_dir: str,
                 skip_softmax_target_sparsity: "float | None" = None,
                 quantization_override: "str | None" = None,
                 *,
-                int8_embedding: bool = False) -> None:
+                int8_embedding: bool = False,
+                int4_embedding: bool = False) -> None:
     """Export LLM backbone via the standard tensorrt_edgellm pipeline.
 
     When ``tp_size > 1``, exports ``tp_size`` per-rank ONNX files named
@@ -1159,6 +1160,7 @@ def _export_llm(model_dir: str,
                         model_dir=model_dir,
                         fp8_embedding=fp8_embedding,
                         int8_embedding=int8_embedding,
+                        int4_embedding=int4_embedding,
                         reduced_vocab_dir=reduced_vocab_dir,
                         externalize_weights=externalize_weights,
                         config_filename=config_filename,
@@ -1310,7 +1312,8 @@ def _export_diffusion_gemma(model_dir: str,
                             externalize_weights: "list[str] | None" = None,
                             tp_size: int = 1,
                             *,
-                            int8_embedding: bool = False) -> None:
+                            int8_embedding: bool = False,
+                            int4_embedding: bool = False) -> None:
     """Export DiffusionGemma as one unified backbone graph."""
     if tp_size != 1:
         raise SystemExit(
@@ -1363,6 +1366,7 @@ def _export_diffusion_gemma(model_dir: str,
                     model_dir=model_dir,
                     fp8_embedding=fp8_embedding,
                     int8_embedding=int8_embedding,
+                    int4_embedding=int4_embedding,
                     reduced_vocab_dir=reduced_vocab_dir,
                     externalize_weights=backbone_externalize_weights)
     except (OSError, ValueError, RuntimeError) as exc:
@@ -4156,6 +4160,14 @@ def main() -> None:
         help=("Write embedding.safetensors in symmetric INT8 format with one "
               "FP32 scale per row."),
     )
+    embedding_group.add_argument(
+        "--int4-embedding",
+        "--int4_embedding",
+        dest="int4_embedding",
+        action="store_true",
+        help=("Write embedding.safetensors (and the Gemma 4 PLE sidecar) as "
+              "packed symmetric INT4 with one FP16 scale per 32 columns."),
+    )
     p.add_argument(
         "--reduced-vocab-dir",
         "--reduced_vocab_dir",
@@ -4471,6 +4483,9 @@ def main() -> None:
     if args.int8_embedding and model_type.startswith("qwen3_omni"):
         p.error("--int8-embedding is not supported by Qwen3-Omni talker "
                 "runtimes")
+    if args.int4_embedding and model_type.startswith("qwen3_omni"):
+        p.error("--int4-embedding is not supported by Qwen3-Omni talker "
+                "runtimes")
 
     # Cosmos3-Edge checkpoints carry two model families that run on DIFFERENT
     # runtime paths; ``--task`` selects which artifact set this invocation
@@ -4518,7 +4533,8 @@ def main() -> None:
                 _export_llm(model_dir,
                             os.path.join(args.output_dir, "llm"),
                             model_type="cosmos3_edge",
-                            int8_embedding=args.int8_embedding)
+                            int8_embedding=args.int8_embedding,
+                            int4_embedding=args.int4_embedding)
             # SigLIP2 ViT + PatchMerger -> visual/ for the standard
             # visual_build + multimodal runtime. The vision tower is read
             # directly from its checkpoint shards (the root index maps it to
@@ -4747,6 +4763,8 @@ def main() -> None:
                     "yes" if args.fp8_embedding else "no")
         logger.info("INT8 embedding: %s",
                     "yes" if args.int8_embedding else "no")
+        logger.info("INT4 embedding: %s",
+                    "yes" if args.int4_embedding else "no")
         logger.info("TP size       : %d", args.tp_size)
         logger.info("=" * 60)
         if wants_diffusion_engines:
@@ -4755,6 +4773,7 @@ def main() -> None:
                 args.output_dir,
                 fp8_embedding=args.fp8_embedding,
                 int8_embedding=args.int8_embedding,
+                int4_embedding=args.int4_embedding,
                 reduced_vocab_dir=args.reduced_vocab_dir,
                 externalize_weights=externalize_weights,
                 tp_size=args.tp_size,
@@ -4898,6 +4917,7 @@ def main() -> None:
              gemma4_mtp_base=gemma4_mtp_requested,
              fp8_embedding=args.fp8_embedding,
              int8_embedding=args.int8_embedding,
+             int4_embedding=args.int4_embedding,
              reduced_vocab_dir=args.reduced_vocab_dir,
              externalize_weights=externalize_weights,
              tp_size=args.tp_size,
@@ -4979,6 +4999,7 @@ def main() -> None:
         logger.info("  %-15s: %s", component, "yes" if enabled else "no")
     logger.info("FP8 embedding : %s", "yes" if args.fp8_embedding else "no")
     logger.info("INT8 embedding: %s", "yes" if args.int8_embedding else "no")
+    logger.info("INT4 embedding: %s", "yes" if args.int4_embedding else "no")
     logger.info("MTP capable   : %s", "yes" if has_mtp_draft else "no")
     logger.info("MTP export    : %s",
                 "yes" if args.mtp or gemma4_mtp_requested else "no")
@@ -5011,10 +5032,11 @@ def main() -> None:
         logger.warning(
             "--fp8-embedding is not supported for Talker / CodePredictor; "
             "using FP16 embeddings.")
-    if args.int8_embedding and not _has_llm_component(model_type, "thinker"):
+    if (args.int8_embedding or args.int4_embedding) and not _has_llm_component(
+            model_type, "thinker"):
         logger.warning(
-            "--int8-embedding is not supported for Talker / CodePredictor; "
-            "using FP16 embeddings.")
+            "--int8-embedding/--int4-embedding are not supported for Talker / "
+            "CodePredictor; using FP16 embeddings.")
 
     if (_has_audio(model_type) and not args.skip_audio
             and _checkpoint_audio_config(config) is None):

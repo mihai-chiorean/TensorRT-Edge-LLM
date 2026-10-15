@@ -27,19 +27,21 @@ namespace trt_edgellm
 namespace kernel
 {
 
-//! \brief Embedding lookup for all modalities (supports FP16, FP8, and INT8 tables).
+//! \brief Embedding lookup for all modalities (supports FP16, FP8, INT8 and packed INT4 tables).
 //!
 //! Produces input embeddings for a batch of token ids. Text tokens are looked up from the embedding
 //! table. When image and/or audio embeddings are supplied (prefill), positions whose token id equals
 //! imageTokenId / audioTokenId are filled from imageEmbeds / audioEmbeds, selected by multimodalIndices;
 //! with no image/audio inputs (decode) it performs a pure text lookup. Automatically dispatches on the
 //! embedding table's datatype. FP8 tables dequantize with per-group scales, INT8 tables with one scale
-//! per vocabulary row.
+//! per vocabulary row, packed INT4 tables (UINT8, two columns per byte, value + 8, even column in the low
+//! nibble) with one FP16 scale per 32 columns.
 //!
 //! \param[in] inputIds Input token IDs with shape [batchSize, seqLen]
-//! \param[in] embeddingTable Text embedding table with shape [vocabSize, hiddenSize] (FP16, FP8, or INT8)
-//! \param[in] scales FP32 scales: [vocabSize, hiddenSize / blockSize] for FP8, [vocabSize] for INT8,
-//!                   std::nullopt for FP16
+//! \param[in] embeddingTable Text embedding table with shape [vocabSize, hiddenSize] (FP16, FP8, or INT8), or
+//!                           [vocabSize, hiddenSize / 2] for packed INT4
+//! \param[in] scales FP32 scales: [vocabSize, hiddenSize / blockSize] for FP8, [vocabSize] for INT8;
+//!                   FP16 [vocabSize, hiddenSize / 32] for INT4; std::nullopt for FP16
 //! \param[out] output Hidden states with shape [batchSize, seqLen, hiddenSize]
 //! \param[in] stream CUDA stream for execution
 //! \param[in] multimodalIndices Per-position indices into imageEmbeds/audioEmbeds [batchSize, seqLen];
@@ -109,17 +111,20 @@ void generateVisionBlockIds(
 //! \brief Gather Gemma4 per-layer token-identity embeddings.
 //!
 //! An FP16 or BF16 table is copied into an outputBuffer of the same dtype. An INT8 table is dequantized into an
-//! FP16 outputBuffer with one FP32 scale per vocabulary row and layer.
+//! FP16 outputBuffer with one FP32 scale per vocabulary row and layer; a packed INT4 table (UINT8, two columns per
+//! byte) with one FP16 scale per 32 columns of the row.
 //!
 //! \param[in] inputIds Input token IDs with shape [batchSize, seqLen]
-//! \param[in] pleTable PLE table with shape [vocabSize, numLayers * pleHiddenSize] (FP16, BF16, or INT8)
+//! \param[in] pleTable PLE table with shape [vocabSize, numLayers * pleHiddenSize] (FP16, BF16, or INT8), or
+//!                     [vocabSize, numLayers * pleHiddenSize / 2] for packed INT4
 //! \param[in,out] outputBuffer Backing tensor for all per-layer outputs; shape [numLayers, maxBatch, maxSeq, hidden]
 //! \param[in] numLayers Number of PLE layer outputs
 //! \param[in] pleHiddenSize Hidden size of each PLE output
 //! \param[in] imageTokenId Optional image token ID to zero-fill (-1 = unused)
 //! \param[in] audioTokenId Optional audio token ID to zero-fill (-1 = unused)
 //! \param[in] stream CUDA stream for execution
-//! \param[in] scales FP32 scales with shape [vocabSize, numLayers]; required for an INT8 table, std::nullopt otherwise
+//! \param[in] scales FP32 scales with shape [vocabSize, numLayers] for an INT8 table, FP16 scales with shape
+//!                   [vocabSize, numLayers * pleHiddenSize / 32] for a packed INT4 table, std::nullopt otherwise
 //! \param[in] stagedVocabSize When set, pleTable and scales hold one row per position (row i belongs to position i)
 //!                            rather than one per vocabulary entry; ids are range-checked against this size
 void gemma4PleGather(rt::Tensor const& inputIds, rt::Tensor const& pleTable, rt::Tensor& outputBuffer,

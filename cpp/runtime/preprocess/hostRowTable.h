@@ -101,15 +101,27 @@ public:
         return mScaleShape;
     }
 
-    //! FP32 scales per table row; 0 without scales.
+    //! Scales per table row; 0 without scales.
     int64_t scalesPerRow() const noexcept
     {
         return mScalesPerRow;
     }
 
+    //! FP32 or FP16; meaningful only with scales.
+    nvinfer1::DataType scaleDataType() const noexcept
+    {
+        return mScaleDataType;
+    }
+
+    //! Bytes of scales per table row; 0 without scales.
+    int64_t scaleRowBytes() const noexcept
+    {
+        return mScaleRowBytes;
+    }
+
     //! Copies table row ids[i] into row i of `rows` and its scales into `scales` (when the table has scales and
-    //! `scales` is non-null). Ids outside [0, rows()) produce zero rows and zero scales.
-    void gather(int32_t const* ids, int64_t count, void* rows, float* scales) const;
+    //! `scales` is non-null; scaleRowBytes() per row). Ids outside [0, rows()) produce zero rows and zero scales.
+    void gather(int32_t const* ids, int64_t count, void* rows, void* scales) const;
 
 private:
     file_io::MmapReader mFile;
@@ -118,9 +130,11 @@ private:
     Coords mShape;
     int64_t mRowBytes{0};
     uint8_t const* mTable{nullptr};
-    uint8_t const* mScales{nullptr}; //!< FP32 payload addressed as bytes; the file need not align it.
+    uint8_t const* mScales{nullptr}; //!< Scale payload addressed as bytes; the file need not align it.
+    nvinfer1::DataType mScaleDataType{nvinfer1::DataType::kFLOAT};
     Coords mScaleShape;
     int64_t mScalesPerRow{0};
+    int64_t mScaleRowBytes{0};
 };
 
 //! Pinned and device staging for rows gathered from a HostRowTable, sized for `capacity` rows.
