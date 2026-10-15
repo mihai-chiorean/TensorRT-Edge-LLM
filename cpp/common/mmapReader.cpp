@@ -125,5 +125,10 @@ size_t MmapReader::getSize() const noexcept
     return mBytes;
 }
 
+bool MmapReader::adviseRandomAccess() const noexcept
+{
+    return mData != nullptr && madvise(mData, mBytes, MADV_RANDOM) == 0;
+}
+
 } // namespace file_io
 } // namespace trt_edgellm

@@ -862,6 +862,75 @@ std::vector<int32_t> buildBatchMapping(std::vector<int8_t> const& finishedStates
 // Embedding Loading Utilities
 //=============================================================================
 
+namespace
+{
+
+//! Validates the dtype-specific layout of an embedding table and its optional scale tensor.
+void checkEmbeddingContract(nvinfer1::DataType dtype, rt::Coords const& shape,
+    std::optional<nvinfer1::DataType> const& scaleDtype, std::optional<rt::Coords> const& scaleShape,
+    std::filesystem::path const& embeddingPath)
+{
+    ELLM_CHECK(
+        shape.getNumDims() == 2, format::fmtstr("Embedding tensor must be 2D, got %d dimensions", shape.getNumDims()));
+
+    int64_t const vocabSize = shape[0];
+    int64_t const hiddenSize = shape[1];
+    bool const hasScales = scaleShape.has_value();
+
+    if (dtype == nvinfer1::DataType::kFP8)
+    {
+        ELLM_CHECK(hasScales,
+            format::fmtstr("FP8 embedding requires 'embedding_scale' tensor: %s", embeddingPath.string().c_str()));
+
+        ELLM_CHECK(*scaleDtype == nvinfer1::DataType::kFLOAT,
+            format::fmtstr("embedding_scale must have FP32 dtype, got %d", static_cast<int>(*scaleDtype)));
+
+        ELLM_CHECK(scaleShape->getNumDims() == 2,
+            format::fmtstr("embedding_scale must be 2D, got %d dimensions", scaleShape->getNumDims()));
+
+        int64_t const scaleVocabSize = (*scaleShape)[0];
+        int64_t const numGroups = (*scaleShape)[1];
+
+        ELLM_CHECK(vocabSize == scaleVocabSize,
+            format::fmtstr("Vocab size mismatch: embedding has %ld, scales has %ld", vocabSize, scaleVocabSize));
+
+        ELLM_CHECK(hiddenSize % kFP8EmbeddingBlockSize == 0,
+            format::fmtstr("Hidden size %ld must be divisible by block size %ld", hiddenSize, kFP8EmbeddingBlockSize));
+
+        int64_t const expectedNumGroups = hiddenSize / kFP8EmbeddingBlockSize;
+        ELLM_CHECK(numGroups == expectedNumGroups,
+            format::fmtstr("Scale groups mismatch: expected %ld, got %ld", expectedNumGroups, numGroups));
+
+        LOG_INFO(
+            "Loaded FP8 embedding: [%ld, %ld], scales: [%ld, %ld]", vocabSize, hiddenSize, scaleVocabSize, numGroups);
+    }
+    else if (dtype == nvinfer1::DataType::kINT8)
+    {
+        ELLM_CHECK(hasScales,
+            format::fmtstr("INT8 embedding requires 'embedding_scale' tensor: %s", embeddingPath.string().c_str()));
+        ELLM_CHECK(*scaleDtype == nvinfer1::DataType::kFLOAT,
+            format::fmtstr("embedding_scale must have FP32 dtype, got %d", static_cast<int>(*scaleDtype)));
+        ELLM_CHECK(scaleShape->getNumDims() == 1,
+            format::fmtstr("INT8 embedding_scale must be 1D, got %d dimensions", scaleShape->getNumDims()));
+        ELLM_CHECK((*scaleShape)[0] == vocabSize,
+            format::fmtstr("Vocab size mismatch: embedding has %ld, scales has %ld", vocabSize, (*scaleShape)[0]));
+
+        LOG_INFO("Loaded INT8 embedding: [%ld, %ld], scales: [%ld]", vocabSize, hiddenSize, vocabSize);
+    }
+    else
+    {
+        ELLM_CHECK(dtype == nvinfer1::DataType::kHALF,
+            format::fmtstr("Embedding tensor must be FP16, FP8, or INT8, got dtype %d: %s", static_cast<int>(dtype),
+                embeddingPath.string().c_str()));
+        ELLM_CHECK(!hasScales,
+            format::fmtstr(
+                "FP16 embedding must not have an 'embedding_scale' tensor: %s", embeddingPath.string().c_str()));
+        LOG_INFO("Loaded FP16 embedding: [%ld, %ld]", vocabSize, hiddenSize);
+    }
+}
+
+} // namespace
+
 EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cudaStream_t stream)
 {
     ELLM_CHECK(std::filesystem::exists(embeddingPath),
@@ -890,75 +959,36 @@ EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cud
     ELLM_CHECK(embeddingPtr != nullptr,
         format::fmtstr("Embedding file missing 'embedding' tensor: %s", embeddingPath.string().c_str()));
 
-    ELLM_CHECK(embeddingPtr->getShape().getNumDims() == 2,
-        format::fmtstr("Embedding tensor must be 2D, got %d dimensions", embeddingPtr->getShape().getNumDims()));
-
-    int64_t vocabSize = embeddingPtr->getShape()[0];
-    int64_t hiddenSize = embeddingPtr->getShape()[1];
+    std::optional<nvinfer1::DataType> const scaleDtype
+        = scalesPtr != nullptr ? std::optional{scalesPtr->getDataType()} : std::nullopt;
+    std::optional<rt::Coords> const scaleShape
+        = scalesPtr != nullptr ? std::optional{scalesPtr->getShape()} : std::nullopt;
+    checkEmbeddingContract(
+        embeddingPtr->getDataType(), embeddingPtr->getShape(), scaleDtype, scaleShape, embeddingPath);
 
     EmbeddingData result;
-
-    auto const dtype = embeddingPtr->getDataType();
-    if (dtype == nvinfer1::DataType::kFP8)
+    result.table = std::move(*embeddingPtr);
+    if (scalesPtr != nullptr)
     {
-        ELLM_CHECK(scalesPtr != nullptr,
-            format::fmtstr("FP8 embedding requires 'embedding_scale' tensor: %s", embeddingPath.string().c_str()));
-
-        ELLM_CHECK(scalesPtr->getDataType() == nvinfer1::DataType::kFLOAT,
-            format::fmtstr("embedding_scale must have FP32 dtype, got %d", static_cast<int>(scalesPtr->getDataType())));
-
-        ELLM_CHECK(scalesPtr->getShape().getNumDims() == 2,
-            format::fmtstr("embedding_scale must be 2D, got %d dimensions", scalesPtr->getShape().getNumDims()));
-
-        int64_t scaleVocabSize = scalesPtr->getShape()[0];
-        int64_t numGroups = scalesPtr->getShape()[1];
-
-        ELLM_CHECK(vocabSize == scaleVocabSize,
-            format::fmtstr("Vocab size mismatch: embedding has %ld, scales has %ld", vocabSize, scaleVocabSize));
-
-        ELLM_CHECK(hiddenSize % kFP8EmbeddingBlockSize == 0,
-            format::fmtstr("Hidden size %ld must be divisible by block size %ld", hiddenSize, kFP8EmbeddingBlockSize));
-
-        int64_t expectedNumGroups = hiddenSize / kFP8EmbeddingBlockSize;
-        ELLM_CHECK(numGroups == expectedNumGroups,
-            format::fmtstr("Scale groups mismatch: expected %ld, got %ld", expectedNumGroups, numGroups));
-
-        LOG_INFO(
-            "Loaded FP8 embedding: [%ld, %ld], scales: [%ld, %ld]", vocabSize, hiddenSize, scaleVocabSize, numGroups);
-
-        result.table = std::move(*embeddingPtr);
         result.tableScalingFactor = std::move(*scalesPtr);
     }
-    else if (dtype == nvinfer1::DataType::kINT8)
-    {
-        ELLM_CHECK(scalesPtr != nullptr,
-            format::fmtstr("INT8 embedding requires 'embedding_scale' tensor: %s", embeddingPath.string().c_str()));
-        ELLM_CHECK(scalesPtr->getDataType() == nvinfer1::DataType::kFLOAT,
-            format::fmtstr("embedding_scale must have FP32 dtype, got %d", static_cast<int>(scalesPtr->getDataType())));
-        ELLM_CHECK(scalesPtr->getShape().getNumDims() == 1,
-            format::fmtstr("INT8 embedding_scale must be 1D, got %d dimensions", scalesPtr->getShape().getNumDims()));
-        ELLM_CHECK(scalesPtr->getShape()[0] == vocabSize,
-            format::fmtstr(
-                "Vocab size mismatch: embedding has %ld, scales has %ld", vocabSize, scalesPtr->getShape()[0]));
+    return result;
+}
 
-        LOG_INFO("Loaded INT8 embedding: [%ld, %ld], scales: [%ld]", vocabSize, hiddenSize, vocabSize);
+EmbeddingData mapEmbeddingTable(std::filesystem::path const& embeddingPath)
+{
+    ELLM_CHECK(std::filesystem::exists(embeddingPath),
+        format::fmtstr("Embedding file not found: %s", embeddingPath.string().c_str()));
 
-        result.table = std::move(*embeddingPtr);
-        result.tableScalingFactor = std::move(*scalesPtr);
-    }
-    else
-    {
-        ELLM_CHECK(dtype == nvinfer1::DataType::kHALF,
-            format::fmtstr("Embedding tensor must be FP16, FP8, or INT8, got dtype %d: %s", static_cast<int>(dtype),
-                embeddingPath.string().c_str()));
-        ELLM_CHECK(scalesPtr == nullptr,
-            format::fmtstr(
-                "FP16 embedding must not have an 'embedding_scale' tensor: %s", embeddingPath.string().c_str()));
-        LOG_INFO("Loaded FP16 embedding: [%ld, %ld]", vocabSize, hiddenSize);
+    auto hostTable = std::make_unique<rt::HostRowTable>(embeddingPath, "embedding", "embedding_scale");
+    std::optional<nvinfer1::DataType> const scaleDtype
+        = hostTable->hasScales() ? std::optional{nvinfer1::DataType::kFLOAT} : std::nullopt;
+    std::optional<rt::Coords> const scaleShape
+        = hostTable->hasScales() ? std::optional{hostTable->scaleShape()} : std::nullopt;
+    checkEmbeddingContract(hostTable->dataType(), hostTable->shape(), scaleDtype, scaleShape, embeddingPath);
 
-        result.table = std::move(*embeddingPtr);
-    }
-
+    EmbeddingData result;
+    result.hostTable = std::move(hostTable);
     return result;
 }
 

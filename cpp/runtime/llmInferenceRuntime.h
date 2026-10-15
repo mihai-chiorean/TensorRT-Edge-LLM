@@ -65,6 +65,9 @@ public:
         ContextCacheConfig contextCacheConfig{};
         std::string checkpointDir{};
         std::string draftCheckpointDir{};
+        //! kHostMapped keeps the token-embedding and PLE sidecars mapped from their files and gathers rows on the
+        //! host each step; it needs single-rank vanilla decoding and the safetensors sidecars.
+        EmbeddingTableResidency embeddingTableResidency{EmbeddingTableResidency::kDevice};
         std::vector<int32_t> localRanks{};
         std::unordered_map<int32_t, int32_t> localRankDevices{};
         std::vector<cudaStream_t> localStreams{};
@@ -76,11 +79,13 @@ public:
         std::unordered_map<std::string, std::string> const& loraWeightsMap,
         SpecDecodeDraftingConfig const& draftingConfig, cudaStream_t stream,
         ContextCacheConfig const& contextCacheConfig = {}, std::string const& checkpointDir = "",
-        std::string const& draftCheckpointDir = "");
+        std::string const& draftCheckpointDir = "",
+        EmbeddingTableResidency embeddingTableResidency = EmbeddingTableResidency::kDevice);
 
     LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream,
-        ContextCacheConfig const& contextCacheConfig = {}, std::string const& checkpointDir = "");
+        ContextCacheConfig const& contextCacheConfig = {}, std::string const& checkpointDir = "",
+        EmbeddingTableResidency embeddingTableResidency = EmbeddingTableResidency::kDevice);
 
     LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, ParallelExecutionConfig config);

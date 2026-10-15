@@ -160,10 +160,10 @@ LLMRankRuntime::LLMRankRuntime(std::string const& engineDir, std::string const& 
     std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream, ParallelMapping const& mapping,
     tokenizer::Tokenizer& tokenizer, chat_template::ChatTemplate const& chatTemplate,
     ContextCacheConfig const& contextCacheConfig, std::string const& checkpointDir,
-    std::string const& draftCheckpointDir)
+    std::string const& draftCheckpointDir, EmbeddingTableResidency embeddingTableResidency)
 {
     initializeFromEngineDir(engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig, stream, mapping, tokenizer,
-        chatTemplate, contextCacheConfig, checkpointDir, draftCheckpointDir);
+        chatTemplate, contextCacheConfig, checkpointDir, draftCheckpointDir, embeddingTableResidency);
 }
 
 LLMRankRuntime::LLMRankRuntime(ModelArtifacts&& artifacts, std::string const& engineDir,
@@ -195,7 +195,7 @@ void LLMRankRuntime::initializeFromEngineDir(std::string const& engineDir, std::
     std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream, ParallelMapping const& mapping,
     tokenizer::Tokenizer& tokenizer, chat_template::ChatTemplate const& chatTemplate,
     ContextCacheConfig const& contextCacheConfig, std::string const& checkpointDir,
-    std::string const& draftCheckpointDir)
+    std::string const& draftCheckpointDir, EmbeddingTableResidency embeddingTableResidency)
 {
     int32_t const tensorParallelSize = mapping.tensorParallelSize;
     int32_t const tensorParallelRank = mapping.tensorParallelRank;
@@ -207,6 +207,8 @@ void LLMRankRuntime::initializeFromEngineDir(std::string const& engineDir, std::
         "tensorParallelRank must be in [0, tensorParallelSize)");
 
     ModelArtifacts artifacts;
+    artifacts.embeddingTableResidency = embeddingTableResidency;
+    bool const hostMapped = embeddingTableResidency == EmbeddingTableResidency::kHostMapped;
     std::filesystem::path const engineRoot{engineDir};
     parallel_artifacts::RankArtifactContext const artifactContext{
         worldSize > 0 ? worldSize : tensorParallelSize, globalRank >= 0 ? globalRank : tensorParallelRank};
@@ -224,13 +226,20 @@ void LLMRankRuntime::initializeFromEngineDir(std::string const& engineDir, std::
     artifacts.weights.load(engineRoot, baseConfigPath, stream, artifacts.checkpointDir, {}, weightTpRank, weightTpSize);
     if (auto embedding = artifacts.weights.takeEmbedding())
     {
+        ELLM_CHECK(!hostMapped, "Host-mapped embedding tables require the embedding.safetensors sidecar");
         artifacts.embedding.table = std::move(*embedding);
+    }
+    else if (hostMapped)
+    {
+        artifacts.embedding = mapEmbeddingTable(engineRoot / "embedding.safetensors");
     }
     else
     {
         artifacts.embedding = loadEmbeddingTable(engineRoot / "embedding.safetensors", stream);
     }
     artifacts.pleEmbedding = artifacts.weights.takePleEmbedding();
+    ELLM_CHECK(!hostMapped || !artifacts.pleEmbedding.has_value(),
+        "Host-mapped embedding tables require the ple_embedding.safetensors sidecar");
 
     // Parse engine configurations and attach user drafting. The bundle factory
     // performs cross-engine consistency and drafting-vs-capacity checks.
@@ -334,6 +343,13 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     mDeployment = std::move(artifacts.deployment);
     mBaseExecutor = std::move(artifacts.baseExecutor);
     mEmbedding = std::move(artifacts.embedding);
+    EmbeddingTableResidency const embeddingTableResidency = artifacts.embeddingTableResidency;
+    ELLM_CHECK(mEmbedding.isHostResident() == (embeddingTableResidency == EmbeddingTableResidency::kHostMapped),
+        "Model artifacts disagree with their embedding table residency");
+    // Speculative and diffusion decoders embed ids sampled on the device, which a host-side gather cannot see.
+    ELLM_CHECK(
+        !mEmbedding.isHostResident() || (!mDeployment.specConfig.has_value() && !mDeployment.base.isDiffusionBackbone),
+        "Host-mapped embedding tables support vanilla decoding only");
     mCheckpointDir = std::move(artifacts.checkpointDir);
     mDraftCheckpointDir = std::move(artifacts.draftCheckpointDir);
     ExternalWeightManager preparedWeights = std::move(artifacts.weights);
@@ -556,7 +572,8 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     {
         int32_t const maxPleSeqLen = std::max(maxInputLength, std::max(1, mDeployment.base.maxVerifyTreeSize));
         mGemma4Ple = std::make_unique<Gemma4EmbeddingPreprocessor>(std::filesystem::path(engineDir), mDeployment.base,
-            mMaxRuntimeBatchSize, maxPleSeqLen, mBaseTensorMap, stream, std::move(pleEmbedding));
+            mMaxRuntimeBatchSize, maxPleSeqLen, mBaseTensorMap, stream, std::move(pleEmbedding),
+            embeddingTableResidency);
     }
     LOG_INFO("Runtime tensors successfully allocated.");
 
@@ -3252,13 +3269,14 @@ bool LLMRankRuntime::runBaseModelPrefill(
         mPipelineIO->recordStepHostUploads(context.stream);
         precomputedIndices = rt::OptionalInputTensor{mMultimodalIndices};
     }
-    mEmbeddingPre->embed(
-        mIdsInput, context.visualEmbeddings, context.audioEmbeddings, *mPipelineIO, context.stream, precomputedIndices);
+    int32_t const* const hostTokenIds = batch.hostTokenIds.dataPointer<int32_t>();
+    mEmbeddingPre->embed(mIdsInput, hostTokenIds, context.visualEmbeddings, context.audioEmbeddings, *mPipelineIO,
+        context.stream, precomputedIndices);
 
     mEmbeddingPre->prepareDeepstack(mIdsInput, context.deepstackFeatures, *mPipelineIO, context.stream);
     if (mGemma4Ple)
     {
-        mGemma4Ple->embed(mIdsInput, context.stream);
+        mGemma4Ple->embed(mIdsInput, hostTokenIds, context.stream);
     }
 
     // Visual-token pruning compacts the assembled embeddings before the engine runs, pruning each

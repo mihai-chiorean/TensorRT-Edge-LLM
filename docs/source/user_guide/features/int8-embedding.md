@@ -62,6 +62,26 @@ For Gemma 4 E4B (vocabulary 262,144):
 
 The safetensors headers add a small amount beyond the tensor payloads.
 
+## Host-Mapped Tables
+
+By default the runtime copies both sidecars into device memory at load. On a
+board whose CPU and GPU share one memory pool, that memory is pinned for the
+life of the process even though a step touches only a handful of rows.
+`--hostEmbeddingTables` (`EmbeddingTableResidency::kHostMapped` in the API)
+keeps the files mapped read-only in host memory instead. Each step gathers the
+rows of its token ids on the CPU into a pinned staging buffer, copies only those
+rows to the device, and runs the same dequantization on them, so the inputs are
+bit-identical to the device-resident tables. The mapped pages are file-backed
+and reclaimable: the kernel can drop them under memory pressure and fault them
+back in on the next lookup.
+
+The staging buffers hold `maxBatchSize * maxInputLen` rows of each table in
+pinned and in device memory. The mode needs the safetensors sidecars (not
+checkpoint-backed tables), single-rank execution, and vanilla decoding:
+speculative and diffusion decoders embed ids sampled on the device, which a host
+gather cannot see. The Qwen3-Omni Talker also reads the dense table and is not
+supported.
+
 ## Limitations
 
 - The experimental direct checkpoint builder has no INT8 embedding option; it

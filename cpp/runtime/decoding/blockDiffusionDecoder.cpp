@@ -296,7 +296,7 @@ bool BlockDiffusionDecoder::runDenoiseStep(DenoiseStepParams const& params)
     }
     if (mRuntime.preprocess.gemma4Ple)
     {
-        mRuntime.preprocess.gemma4Ple->embed(mCanvasIds, params.stream);
+        mRuntime.preprocess.gemma4Ple->embed(mCanvasIds, nullptr, params.stream);
     }
     Tensor& denoiseLogits = currentDenoiseLogits();
     check::check(denoiseLogits.reshape({params.batchSize * params.canvasLen, mRuntime.deployment.base.outputVocabSize}),
@@ -475,7 +475,7 @@ bool BlockDiffusionDecoder::commitBlock(
         mRuntime.preprocess.embedding.scalesAsOptional(), io.inputsEmbeds, context.stream);
     if (mRuntime.preprocess.gemma4Ple)
     {
-        mRuntime.preprocess.gemma4Ple->embed(mCommitCanvasIds, context.stream);
+        mRuntime.preprocess.gemma4Ple->embed(mCommitCanvasIds, nullptr, context.stream);
     }
     bindDefaultSelfConditioningTensors();
     check::check(mSelfConditioningEmbedsA.reshape({batchSize * commitSeqLen, mRuntime.deployment.base.hiddenSize}),
@@ -716,7 +716,7 @@ bool BlockDiffusionDecoder::captureCudaGraphs(cudaStream_t stream)
             }
             if (mRuntime.preprocess.gemma4Ple)
             {
-                mRuntime.preprocess.gemma4Ple->embed(mCanvasIds, stream);
+                mRuntime.preprocess.gemma4Ple->embed(mCanvasIds, nullptr, stream);
             }
             auto const denoiseDims = mRuntime.deployment.base.denoiseDims(batchSize, captureCanvasLen);
             if (!prepareCanvasMetadata(
@@ -747,7 +747,7 @@ bool BlockDiffusionDecoder::captureCudaGraphs(cudaStream_t stream)
             mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, stream);
         if (mRuntime.preprocess.gemma4Ple)
         {
-            mRuntime.preprocess.gemma4Ple->embed(mCommitCanvasIds, stream);
+            mRuntime.preprocess.gemma4Ple->embed(mCommitCanvasIds, nullptr, stream);
         }
         bindDefaultSelfConditioningTensors();
         check::check(
