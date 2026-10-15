@@ -497,6 +497,20 @@ function(cute_dsl_setup)
     endforeach()
   endif()
 
+  # Group-32 W4A16 variants (`_g32` suffix) are optional in an artifact: older
+  # prebuilt packs only carry group 128, so the plugin's group-32 set is gated.
+  list(FIND _variants "int4_fp16_gemm_16x128x64_s3_sk1_g32" _int4_g32_idx)
+  if(NOT ${_int4_g32_idx} EQUAL -1 AND "int4_fp16_gemm" IN_LIST _active_groups)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(${_tgt}
+                                 PRIVATE "CUTE_DSL_INT4_FP16_GEMM_G32_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: group-32 INT4 W4A16 variants found — CUTE_DSL_INT4_FP16_GEMM_G32_ENABLED set"
+    )
+  endif()
+
   # Variant-specific GDN paths require the runner enabled by the gdn group;
   # artifact availability alone must not activate them.
   list(FIND _variants "gdn_prefill_blackwell" _bw_idx)

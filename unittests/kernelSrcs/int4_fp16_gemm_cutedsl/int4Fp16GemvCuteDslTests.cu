@@ -56,7 +56,6 @@ namespace
 
 #define ASSERT_CUDA_OK(expr) ASSERT_EQ((expr), cudaSuccess) << cudaGetErrorString(cudaGetLastError())
 
-constexpr int32_t kGroupSize = 128;
 constexpr int32_t kBN = 128; // fragment N-block (shared with the GEMM)
 constexpr int32_t kBK = 64;  // fragment K-tile
 
@@ -91,18 +90,29 @@ struct DeviceBuffer
 // The 8 compiled variants (one exported function per M). X(prefix, M) is expanded for
 // module declaration, loading, and runtime dispatch below.
 // ---------------------------------------------------------------------------
+// Group 128 keeps the unsuffixed names; group 32 carries a `_g32` suffix.
+#define INT4_FP16_GEMV_VARIANTS_G(X, SUFFIX)                                                                           \
+    X(int4_fp16_gemv_m1##SUFFIX, 1)                                                                                    \
+    X(int4_fp16_gemv_m2##SUFFIX, 2)                                                                                    \
+    X(int4_fp16_gemv_m3##SUFFIX, 3)                                                                                    \
+    X(int4_fp16_gemv_m4##SUFFIX, 4)                                                                                    \
+    X(int4_fp16_gemv_m5##SUFFIX, 5)                                                                                    \
+    X(int4_fp16_gemv_m6##SUFFIX, 6)                                                                                    \
+    X(int4_fp16_gemv_m7##SUFFIX, 7)                                                                                    \
+    X(int4_fp16_gemv_m8##SUFFIX, 8)
+#ifdef CUTE_DSL_INT4_FP16_GEMM_G32_ENABLED
+#define INT4_FP16_GEMV_VARIANTS_G32(X) INT4_FP16_GEMV_VARIANTS_G(X, _g32)
+constexpr bool kHasGroup32 = true;
+#else
+#define INT4_FP16_GEMV_VARIANTS_G32(X)
+constexpr bool kHasGroup32 = false;
+#endif
 #define INT4_FP16_GEMV_VARIANTS(X)                                                                                     \
-    X(int4_fp16_gemv_m1, 1)                                                                                            \
-    X(int4_fp16_gemv_m2, 2)                                                                                            \
-    X(int4_fp16_gemv_m3, 3)                                                                                            \
-    X(int4_fp16_gemv_m4, 4)                                                                                            \
-    X(int4_fp16_gemv_m5, 5)                                                                                            \
-    X(int4_fp16_gemv_m6, 6)                                                                                            \
-    X(int4_fp16_gemv_m7, 7)                                                                                            \
-    X(int4_fp16_gemv_m8, 8)
+    INT4_FP16_GEMV_VARIANTS_G(X, )                                                                                     \
+    INT4_FP16_GEMV_VARIANTS_G32(X)
 
 // ---------------------------------------------------------------------------
-// Module storage + loading (all 8, loaded once).
+// Module storage + loading (all 16, loaded once).
 // ---------------------------------------------------------------------------
 #define DECL_MODULE(prefix, M) prefix##_Kernel_Module_t g_##prefix{};
 INT4_FP16_GEMV_VARIANTS(DECL_MODULE)
@@ -165,12 +175,12 @@ bool loadModules()
         ret = cute_dsl_##PREFIX##_wrapper(&g_##PREFIX, &tA, &tQW, &tS, &tOut, stream);                                 \
     } while (0)
 
-int launchVariant(
-    int32_t M, void const* A, void const* QW, void const* scales, void* Out, int32_t N, int32_t K, cudaStream_t stream)
+int launchVariant(int32_t M, void const* A, void const* QW, void const* scales, void* Out, int32_t N, int32_t K,
+    int32_t groupSize, cudaStream_t stream)
 {
     int32_t const kn = (kBK / 16) * (kBN / 64);
     int32_t const qwRows = ceilDiv(N, kBN) * ceilDiv(K, kBK) * kn;
-    int32_t const scaleRows = ceilDiv(K, kGroupSize);
+    int32_t const scaleRows = ceilDiv(K, groupSize);
     int32_t ret = -1;
 #define DISPATCH_ONE(prefix, VM)                                                                                       \
     if (M == (VM))                                                                                                     \
@@ -178,7 +188,14 @@ int launchVariant(
         LAUNCH_ONE(prefix);                                                                                            \
         return ret;                                                                                                    \
     }
-    INT4_FP16_GEMV_VARIANTS(DISPATCH_ONE)
+    if (groupSize == 32)
+    {
+        INT4_FP16_GEMV_VARIANTS_G32(DISPATCH_ONE)
+    }
+    else
+    {
+        INT4_FP16_GEMV_VARIANTS_G(DISPATCH_ONE, )
+    }
 #undef DISPATCH_ONE
     return -1; // no matching variant
 }
@@ -291,6 +308,7 @@ struct Int4GemvTestConfig
     int32_t M;
     int32_t N;
     int32_t K;
+    int32_t groupSize;
 };
 
 std::vector<Int4GemvTestConfig> buildConfigs()
@@ -299,11 +317,18 @@ std::vector<Int4GemvTestConfig> buildConfigs()
     // (N, K) shapes: a canonical square-ish shape and Qwen2.5-0.5B projections
     // (incl. tall-K down_proj) -- N unconstrained, K % 64 == 0.
     int32_t const shapes[][2] = {{160, 256}, {256, 1024}, {896, 896}, {4864, 896}, {896, 4864}};
-    for (int32_t M = 1; M <= 8; ++M)
+    for (int32_t groupSize : {128, 32})
     {
-        for (auto const& s : shapes)
+        if (groupSize == 32 && !kHasGroup32)
         {
-            v.push_back(Int4GemvTestConfig{M, s[0], s[1]});
+            continue;
+        }
+        for (int32_t M = 1; M <= 8; ++M)
+        {
+            for (auto const& s : shapes)
+            {
+                v.push_back(Int4GemvTestConfig{M, s[0], s[1], groupSize});
+            }
         }
     }
     return v;
@@ -322,7 +347,7 @@ TEST_P(Int4Fp16GemvCuteDslTest, CorrectnessVsFp32Reference)
 {
     auto const& cfg = GetParam();
     int32_t const M = cfg.M, N = cfg.N, K = cfg.K;
-    int32_t const groupSize = kGroupSize;
+    int32_t const groupSize = cfg.groupSize;
 
     int32_t smMajor{}, smMinor{};
     ASSERT_CUDA_OK(cudaDeviceGetAttribute(&smMajor, cudaDevAttrComputeCapabilityMajor, 0));
@@ -375,7 +400,7 @@ TEST_P(Int4Fp16GemvCuteDslTest, CorrectnessVsFp32Reference)
     ASSERT_CUDA_OK(cudaMemset(dOutput.ptr, 0, static_cast<size_t>(M) * N * sizeof(half)));
 
     // ---- Run ----
-    ASSERT_EQ(launchVariant(M, dA.ptr, dQW.ptr, dScales.ptr, dOutput.ptr, N, K, /*stream=*/nullptr), 0)
+    ASSERT_EQ(launchVariant(M, dA.ptr, dQW.ptr, dScales.ptr, dOutput.ptr, N, K, groupSize, /*stream=*/nullptr), 0)
         << "INT4 FP16 GEMV kernel launch failed";
     ASSERT_CUDA_OK(cudaDeviceSynchronize());
 
@@ -400,7 +425,8 @@ TEST_P(Int4Fp16GemvCuteDslTest, CorrectnessVsFp32Reference)
 INSTANTIATE_TEST_SUITE_P(Int4Fp16GemvAllVariants, Int4Fp16GemvCuteDslTest, ::testing::ValuesIn(buildConfigs()),
     [](testing::TestParamInfo<Int4GemvTestConfig> const& info) {
         auto const& c = info.param;
-        return "M" + std::to_string(c.M) + "_N" + std::to_string(c.N) + "_K" + std::to_string(c.K);
+        return "M" + std::to_string(c.M) + "_N" + std::to_string(c.N) + "_K" + std::to_string(c.K) + "_g"
+            + std::to_string(c.groupSize);
     });
 
 } // namespace

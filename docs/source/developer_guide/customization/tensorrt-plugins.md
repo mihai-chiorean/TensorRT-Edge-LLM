@@ -115,14 +115,14 @@ The AttentionPlugin integrates into the TensorRT Edge-LLM inference pipeline thr
 **Functional Description**
 - Implements A([M, K]) x B([K, N]) GEMM semantic where A is activation input, B is weights input.
 - Supports INT4 weights-only groupwise quantization GEMM.
-- Supports group size of 128.
+- Supports group size 128 (group size 32 is served by Int4GroupwiseGemmPluginV2).
 - Accumulation is performed in FP16 precision for both GEMM and GEMV kernels.
 - Implements symmetric quantization schema and zero-points is not supported.
 
 **Configuration Parameters**:
 - `N`: Output feature dimensions of the GEMM operation
 - `K`: Inner dimensions of the GEMM operation
-- `GroupSize`: Number of INT4 weight items corresponding to one scaling factor (currently supports 128 only)
+- `GroupSize`: Number of INT4 weight items corresponding to one scaling factor (128)
 
 **Input Tensors**:
 - `GEMMInput`: Input activation tensor for the GEMM computation.
@@ -140,14 +140,14 @@ A simplified kernel implementation is provided for this plugin. Evaluation indic
 
 The Int4GroupwiseGemmPlugin integrates into the TensorRT Edge-LLM inference pipeline through the following stages:
 
-1. **Quantization Phase**: `tensorrt-edgellm-quantize` or a supported pre-quantized checkpoint stores linear layers in INT4 weights-only groupwise format with group size 128.
+1. **Quantization Phase**: `tensorrt-edgellm-quantize` or a supported pre-quantized checkpoint stores linear layers in INT4 weights-only groupwise format with group size 128 (or 32 for symmetric group-32 checkpoints such as Q4_0-style QAT weights).
 2. **Export Phase**: During ONNX model export, `tensorrt_edgellm` emits quantized matrix multiplication custom-op nodes for Int4GroupwiseGemmPlugin.
 3. **Engine Construction**: The TensorRT engine builder identifies Int4GroupwiseGemmPlugin operations via registered plugin creators and integrates them into the optimized computation graph.
 4. **Runtime Execution**: During inference, the Int4GroupwiseGemmPlugin executes quantized GEMM/GEMV operations as nodes within the TensorRT engine's execution graph.
 
 ## Int4GroupwiseGemmPluginV2
 
-`Int4GroupwiseGemmPluginV2` is the default INT4 groupwise GEMM backend. It shares the `Int4GroupwiseGemmPlugin` GEMM semantics — INT4 weights-only groupwise quantization, group size 128, FP16 accumulation, and symmetric (zero-point-free) quantization — but dispatches to AOT-compiled CuTe DSL (cuteDSL) W4A16 kernels instead of the AWQ CUDA-C++ kernels.
+`Int4GroupwiseGemmPluginV2` is the default INT4 groupwise GEMM backend. It shares the `Int4GroupwiseGemmPlugin` GEMM semantics — INT4 weights-only groupwise quantization, group size 128 or 32, FP16 accumulation, and symmetric (zero-point-free) quantization — but dispatches to AOT-compiled CuTe DSL (cuteDSL) W4A16 kernels instead of the AWQ CUDA-C++ kernels.
 
 The fragment layout supports any positive output width. The final 128-channel
 fragment is bounds-predicated by both the GEMM and GEMV kernels, so narrow
@@ -156,7 +156,7 @@ projections retain their native output shape.
 **Configuration Parameters**:
 - `N`: Output feature dimensions of the GEMM operation
 - `K`: Inner dimensions of the GEMM operation
-- `GroupSize`: Number of INT4 weight items corresponding to one scaling factor (currently supports 128 only)
+- `GroupSize`: Number of INT4 weight items corresponding to one scaling factor (128 or 32; the CuTe DSL artifact bakes one kernel set per group size, group 32 as `_g32` variants)
 
 **Input Tensors**:
 - `GEMMInput`: Input activation tensor for the GEMM computation.

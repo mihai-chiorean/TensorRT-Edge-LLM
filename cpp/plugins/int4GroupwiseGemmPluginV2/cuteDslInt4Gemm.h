@@ -55,9 +55,14 @@ CuteDslInt4Variant const& cuteDslInt4VariantAt(int32_t index);
 //! splitK divides ceil(K/bK). (bN is always 128; N residue is predicated.)
 bool cuteDslInt4VariantValid(CuteDslInt4Variant const& v, int32_t N, int32_t K);
 
-//! Load all cuteDSL kernel modules once (handle-checked). Returns false on any
-//! load failure.
-bool cuteDslInt4GemmLoadModules();
+//! True if the artifact carries variants baked for this quantization group size
+//! (32 or 128; the scale granularity is compile-time in the CuTe DSL kernels).
+bool cuteDslInt4GroupSizeSupported(int32_t groupSize);
+
+//! Load the cuteDSL kernel modules baked for this group size once
+//! (handle-checked). Returns false for an unsupported group size or on any load
+//! failure.
+bool cuteDslInt4GemmLoadModules(int32_t groupSize);
 
 //! Number of uint32 words (== the fragment weight buffer row count x 128) for a
 //! (N,K) tile. Rows = ceil(N/bN)*ceil(K/bK)*(bK/16)*(bN/64); each row is 128 words.
@@ -69,9 +74,10 @@ int64_t cuteDslInt4LockCount(int32_t M, int32_t N, int32_t bM, int32_t bN);
 //! Launch the variant. A: [M,K] fp16; fragW: fragment-order uint32 weights (the
 //! plugin's INT8 input[1] reinterpreted); scales: [ceil(K/G),N] fp16; C: [M,N]
 //! fp16 (also serves as the workspace placeholder); locks: zero-initialized int32
-//! [cuteDslInt4LockCount]; swizzle: grouped-M width. Returns 0 on success.
+//! [cuteDslInt4LockCount]; groupSize: 32 or 128 (selects the baked module set);
+//! swizzle: grouped-M width. Returns 0 on success.
 int32_t cuteDslInt4GemmLaunch(CuteDslInt4Variant const& v, void const* A, void const* fragW, void const* scales,
-    void* C, void* locks, int32_t M, int32_t N, int32_t K, int32_t swizzle, cudaStream_t stream);
+    void* C, void* locks, int32_t M, int32_t N, int32_t K, int32_t groupSize, int32_t swizzle, cudaStream_t stream);
 
 } // namespace plugins
 } // namespace trt_edgellm
