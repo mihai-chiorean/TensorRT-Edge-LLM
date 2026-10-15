@@ -86,6 +86,13 @@ For Gemma 4 E4B the two tables shrink from 3,534,749,696 bytes (INT8) to
 embeddings that feed the model, so unlike INT8 it is not accuracy-neutral by
 construction; validate the task accuracy for each model.
 
+`--int4-embedding-scale q4_0_grid` uses the step `max(max / 7, -min / 8)` per
+group and codes in `[-8, 7]` instead of the default `amax / 7` and `[-7, 7]`.
+Checkpoints trained for Q4_0 (for example Gemma 4 QAT Q4_0 releases) store their
+token and PLE tables on that grid, so this rule reproduces them up to FP16
+rounding of the scale. The sidecar format and the runtime decode are the same
+for both rules.
+
 ## Host-Mapped Tables
 
 By default the runtime copies both sidecars into device memory at load. On a
