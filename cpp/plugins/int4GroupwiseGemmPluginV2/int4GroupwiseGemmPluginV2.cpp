@@ -48,6 +48,17 @@ inline int32_t fragmentRows(int32_t N, int32_t K)
     return divUp(N, 128) * divUp(K, 64) * 8;
 }
 
+// GEMV vs GEMM routing, from SM87 measurements on the Gemma 4 decoder shapes:
+// the 16-row GEMM tile streams large weights near DRAM bandwidth already at
+// M = 1 and its time stays flat up to M = 16, while the GEMV's time grows with
+// M. Above M = 1 the GEMV stays faster only for narrow outputs.
+constexpr int32_t kGEMV_NARROW_MAX_N{512};
+
+inline bool routeToGemv(int32_t M, int32_t N)
+{
+    return M == 1 || N <= kGEMV_NARROW_MAX_N;
+}
+
 inline int64_t leadingVolume(Dims const& dims)
 {
     int64_t volume{1};
@@ -378,14 +389,10 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
             return -1;
         }
 
-        // Decode regime: route small M to the CUDA-core GEMV. At small M the GEMM's
-        // tensor-core MMA underfills its M rows, so the GEMV is the better compute
-        // path. It reads the SAME fragment weight buffer (input[1]), so there is no
-        // extra weight and no repack -- one buffer serves prefill and decode.
-        // Threshold kGemvDispatchMaxM=4 (the tensor-core crossover); the kernel
-        // itself supports up to kGemvMaxM=8.
-        constexpr int32_t kGemvDispatchMaxM = 4;
-        if (M >= 1 && M <= kGemvDispatchMaxM && cuteDslInt4GemvSupported(M) && cuteDslInt4GemvLoadModules())
+        // The CUDA-core GEMV reads the same fragment weight buffer (input[1]) as the
+        // GEMM, so one buffer serves both paths. A shape routed to the GEMM at small
+        // M runs the tactic TensorRT autotuned at the profile's optimum M.
+        if (cuteDslInt4GemvSupported(M) && routeToGemv(M, mGemmN) && cuteDslInt4GemvLoadModules())
         {
             return cuteDslInt4GemvLaunch(M, inputs[0], inputs[1], inputs[2], outputs[0], mGemmN, mGemmK, stream);
         }
