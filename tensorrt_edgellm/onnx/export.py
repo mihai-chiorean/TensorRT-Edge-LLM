@@ -84,6 +84,7 @@ def export_onnx(
     write_shared_artifacts: bool = True,
     *,
     int8_embedding: bool = False,
+    int4_embedding: bool = False,
 ) -> None:
     """Export *model* to ONNX using the dynamo exporter.
 
@@ -114,6 +115,9 @@ def export_onnx(
                                 redundant rewrites of identical sidecar files.
         int8_embedding: Write embedding.safetensors as symmetric INT8 with one
                         FP32 scale per row.
+        int4_embedding: Write embedding.safetensors (and the Gemma 4 PLE
+                        sidecar) as packed symmetric INT4 with one FP16 scale
+                        per 32 columns.
     """
     out_dir = os.path.dirname(os.path.abspath(output_path))
     os.makedirs(out_dir, exist_ok=True)
@@ -134,6 +138,7 @@ def export_onnx(
                             out_dir,
                             fp8_embedding=fp8_embedding,
                             int8_embedding=int8_embedding,
+                            int4_embedding=int4_embedding,
                             reduced_vocab_dir=reduced_vocab_dir,
                             config_filename=config_filename,
                             write_shared_artifacts=write_shared_artifacts)

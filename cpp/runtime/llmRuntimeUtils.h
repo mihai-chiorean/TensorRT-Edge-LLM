@@ -478,6 +478,9 @@ std::vector<int32_t> buildBatchMapping(std::vector<int8_t> const& finishedStates
  */
 inline constexpr int64_t kFP8EmbeddingBlockSize = 128;
 
+//! Columns per FP16 scale in the packed INT4 embedding and PLE sidecars (two columns per stored byte).
+inline constexpr int64_t kInt4EmbeddingGroupSize = 32;
+
 /*! \brief Embedding data for dense and row-scaled quantized formats
  *
  *  The embedding table datatype determines the format:

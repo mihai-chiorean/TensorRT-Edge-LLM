@@ -917,11 +917,30 @@ void checkEmbeddingContract(nvinfer1::DataType dtype, rt::Coords const& shape,
 
         LOG_INFO("Loaded INT8 embedding: [%ld, %ld], scales: [%ld]", vocabSize, hiddenSize, vocabSize);
     }
+    else if (dtype == nvinfer1::DataType::kUINT8)
+    {
+        // Packed INT4: two columns per byte, one FP16 scale per kInt4EmbeddingGroupSize columns.
+        int64_t const columns = 2 * hiddenSize;
+        ELLM_CHECK(hasScales,
+            format::fmtstr("INT4 embedding requires 'embedding_scale' tensor: %s", embeddingPath.string().c_str()));
+        ELLM_CHECK(*scaleDtype == nvinfer1::DataType::kHALF,
+            format::fmtstr("INT4 embedding_scale must have FP16 dtype, got %d", static_cast<int>(*scaleDtype)));
+        ELLM_CHECK(scaleShape->getNumDims() == 2,
+            format::fmtstr("INT4 embedding_scale must be 2D, got %d dimensions", scaleShape->getNumDims()));
+        ELLM_CHECK(columns % kInt4EmbeddingGroupSize == 0,
+            format::fmtstr("INT4 embedding width %ld must be a multiple of %ld", columns, kInt4EmbeddingGroupSize));
+        ELLM_CHECK((*scaleShape)[0] == vocabSize && (*scaleShape)[1] == columns / kInt4EmbeddingGroupSize,
+            format::fmtstr("INT4 embedding_scale must be [%ld, %ld], got [%ld, %ld]", vocabSize,
+                columns / kInt4EmbeddingGroupSize, (*scaleShape)[0], (*scaleShape)[1]));
+
+        LOG_INFO("Loaded INT4 embedding: [%ld, %ld] packed as [%ld, %ld], scales: [%ld, %ld]", vocabSize, columns,
+            vocabSize, hiddenSize, (*scaleShape)[0], (*scaleShape)[1]);
+    }
     else
     {
         ELLM_CHECK(dtype == nvinfer1::DataType::kHALF,
-            format::fmtstr("Embedding tensor must be FP16, FP8, or INT8, got dtype %d: %s", static_cast<int>(dtype),
-                embeddingPath.string().c_str()));
+            format::fmtstr("Embedding tensor must be FP16, FP8, INT8, or packed INT4, got dtype %d: %s",
+                static_cast<int>(dtype), embeddingPath.string().c_str()));
         ELLM_CHECK(!hasScales,
             format::fmtstr(
                 "FP16 embedding must not have an 'embedding_scale' tensor: %s", embeddingPath.string().c_str()));
@@ -982,7 +1001,7 @@ EmbeddingData mapEmbeddingTable(std::filesystem::path const& embeddingPath)
 
     auto hostTable = std::make_unique<rt::HostRowTable>(embeddingPath, "embedding", "embedding_scale");
     std::optional<nvinfer1::DataType> const scaleDtype
-        = hostTable->hasScales() ? std::optional{nvinfer1::DataType::kFLOAT} : std::nullopt;
+        = hostTable->hasScales() ? std::optional{hostTable->scaleDataType()} : std::nullopt;
     std::optional<rt::Coords> const scaleShape
         = hostTable->hasScales() ? std::optional{hostTable->scaleShape()} : std::nullopt;
     checkEmbeddingContract(hostTable->dataType(), hostTable->shape(), scaleDtype, scaleShape, embeddingPath);
