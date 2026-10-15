@@ -257,3 +257,62 @@ def test_gemma4_eagle_default_hidden_output_survives_onnx_export(tmp_path):
         "physical_tokens"
     assert hidden_output.type.tensor_type.shape.dim[1].dim_value == \
         3 * config.hidden_size
+
+
+def _shared_kv_config() -> ModelConfig:
+    config = _config()
+    config.num_hidden_layers = 4
+    config.num_kv_shared_layers = 2
+    config.attention_layer_types = [
+        "sliding_attention", "full_attention", "sliding_attention",
+        "full_attention"
+    ]
+    config.layer_types = ["attention"] * 4
+    return config
+
+
+def test_gemma4_shared_kv_suffix_runs_compacted_rows_on_decode_path(tmp_path):
+    output = tmp_path / "gemma4-shared-kv-ragged.onnx"
+    _export_model(Gemma4ForCausalLM(_shared_kv_config()),
+                  str(output),
+                  optimize=False)
+    graph = onnx.load(str(output), load_external_data=False).graph
+    attention_nodes = [
+        node for node in graph.node if node.op_type == "AttentionPlugin"
+    ]
+    markers = {init.name: init for init in graph.initializer}
+
+    assert len(attention_nodes) == 4
+    for node in attention_nodes[:2]:
+        assert "execution_phase_marker" in node.input
+    for node in attention_nodes[2:]:
+        attrs = {attr.name: attr.i for attr in node.attribute}
+        assert attrs["enable_kv_shared"] == 1
+        assert "execution_phase_marker" not in node.input
+        phase_input = [name for name in node.input if name in markers]
+        assert len(phase_input) == 1
+        assert list(markers[phase_input[0]].dims) == [3]
+
+
+def test_gemma4_shared_kv_compaction_keeps_rows_for_tree_base():
+    config = _shared_kv_config()
+    config.gemma4_mtp_base = True
+    spec = Gemma4ForCausalLM(config).onnx_export_spec()
+    logits, hidden_states, *_ = spec.wrapped(*spec.args)
+    args = dict(zip(spec.input_names, spec.args))
+
+    assert logits.shape[0] == args["logits_indices"].shape[0]
+    assert hidden_states.shape[0] == args["inputs_embeds"].shape[0]
+
+
+def test_gemma4_materializes_suffix_phase_marker_after_meta_init():
+    with torch.device("meta"):
+        model = Gemma4ForCausalLM(_shared_kv_config())
+    assert model.model.suffix_phase_marker.device.type == "meta"
+
+    model.materialize_checkpoint_defaults("cpu")
+
+    marker = model.model.suffix_phase_marker
+    assert marker.device.type == "cpu"
+    assert marker.dtype == torch.int32
+    assert tuple(marker.shape) == (3, )
