@@ -1890,6 +1890,10 @@ class Gemma4Transformer(nn.Module):
                     rope_rotary_cos_sin_full = torch.index_select(
                         rope_rotary_cos_sin_full, 0, compact_rows)
                 if vision_block_ids is not None:
+                    # Suffix attention runs the decode path, which ignores
+                    # vision_block_ids, so a last prompt token inside an
+                    # image block longer than the sliding window can compact
+                    # to a different result than the full prefill.
                     vision_block_ids = torch.index_select(
                         vision_block_ids, 0, compact_rows)
                 past_lengths = past_lengths + query_lengths - 1
