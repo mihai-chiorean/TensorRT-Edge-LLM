@@ -112,7 +112,7 @@ constexpr bool kHasGroup32 = false;
     INT4_FP16_GEMV_VARIANTS_G32(X)
 
 // ---------------------------------------------------------------------------
-// Module storage + loading (all 16, loaded once).
+// Module storage + loading (both group sizes when built with g32, loaded once).
 // ---------------------------------------------------------------------------
 #define DECL_MODULE(prefix, M) prefix##_Kernel_Module_t g_##prefix{};
 INT4_FP16_GEMV_VARIANTS(DECL_MODULE)
