@@ -75,12 +75,14 @@ bit-identical to the device-resident tables. The mapped pages are file-backed
 and reclaimable: the kernel can drop them under memory pressure and fault them
 back in on the next lookup.
 
-The staging buffers hold `maxBatchSize * maxInputLen` rows of each table in
-pinned and in device memory. The mode needs the safetensors sidecars (not
-checkpoint-backed tables), single-rank execution, and vanilla decoding:
+The staging buffers keep a pinned and a device copy of the rows: the token
+table stages the engine's maximum number of physical tokens, and the PLE table
+`maxBatchSize` rows times its sequence length (the maximum input length, or the
+verify-tree width when that is larger). The mode needs the safetensors sidecars
+(not checkpoint-backed tables), single-rank execution, and vanilla decoding:
 speculative and diffusion decoders embed ids sampled on the device, which a host
-gather cannot see. The Qwen3-Omni Talker also reads the dense table and is not
-supported.
+gather cannot see. `llm_inference` rejects the flag together with Qwen3-Omni
+audio output, because the Talker also reads the dense table.
 
 ## Limitations
 
