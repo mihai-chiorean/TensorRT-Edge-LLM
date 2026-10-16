@@ -2316,7 +2316,8 @@ class Gemma4ForCausalLM(CausalLM):
                 break
         collect_eagle_hidden_states = (self.config.eagle_base
                                        and not target_layer_ids)
-        # Row compaction needs one logits row per sequence and no per-row
+        # Row compaction needs one logits row per sequence, as enforced by
+        # the runtime in validateRuntimeAdapterStep, and no per-row
         # hidden-state consumer (EAGLE/MTP/DFlash/DSpark bases, tree verify).
         compact_rows = (
             logits_indices if self.model.first_kv_shared_layer is not None
