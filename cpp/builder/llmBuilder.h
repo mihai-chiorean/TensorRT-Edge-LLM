@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "builder/builderUtils.h"
 #include "common/checkMacros.h"
 #include "common/pagedKvTypes.h"
 
@@ -192,6 +193,7 @@ struct LLMBuilderConfig
     int64_t tpRank{0}; //!< Tensor parallel rank
     //! Total K-page budget for the independent SWA pool (0 = auto-size when reduced markers are present).
     int64_t numSwaPages{0};
+    HardwareCompatibility hardwareCompatibility{HardwareCompatibility::kNONE};
 
     //! Resolve and store the positive SWA page budget once SWA capability markers are known.
     //! A zero configured value selects the bounded builder default; runtime config does not use this auto mode.
@@ -250,6 +252,10 @@ struct LLMBuilderConfig
         if (numSwaPages > 0)
         {
             json["num_swa_pages"] = numSwaPages;
+        }
+        if (hardwareCompatibility != HardwareCompatibility::kNONE)
+        {
+            json["hardware_compatibility"] = hardwareCompatibilityName(hardwareCompatibility);
         }
         // Only include speculative-decoding limits for the engine role that owns them.
         if (specBase)
@@ -323,6 +329,12 @@ struct LLMBuilderConfig
         {
             config.tpSize = json["tp_size"];
         }
+        if (json.contains("hardware_compatibility"))
+        {
+            auto const compatibility = parseHardwareCompatibility(json["hardware_compatibility"].get<std::string>());
+            ELLM_CHECK(compatibility.has_value(), "LLMBuilderConfig: unknown hardware_compatibility value.");
+            config.hardwareCompatibility = *compatibility;
+        }
         return config;
     }
 
@@ -342,6 +354,7 @@ struct LLMBuilderConfig
         oss << "  tpSize: " << tpSize << "\n";
         oss << "  tpRank: " << tpRank << "\n";
         oss << "  numSwaPages: " << numSwaPages << "\n";
+        oss << "  hardwareCompatibility: " << hardwareCompatibilityName(hardwareCompatibility) << "\n";
         // Only show speculative-decoding limits for the engine role that owns them.
         if (specBase)
         {

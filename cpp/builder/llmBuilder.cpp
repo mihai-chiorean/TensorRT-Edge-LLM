@@ -404,6 +404,11 @@ bool LLMBuilder::build()
         LOG_INFO("Profiling verbosity set to DETAILED");
     }
 
+    if (!applyHardwareCompatibility(*config, mBuilderConfig.hardwareCompatibility))
+    {
+        return false;
+    }
+
     LOG_DEBUG("Builder config created. Setting up optimization profiles...");
 
     // Setup optimization profiles

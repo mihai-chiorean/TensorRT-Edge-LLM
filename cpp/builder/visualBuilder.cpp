@@ -92,6 +92,11 @@ bool VisualBuilder::build()
         LOG_INFO("Profiling verbosity set to DETAILED");
     }
 
+    if (!applyHardwareCompatibility(*config, mBuilderConfig.hardwareCompatibility))
+    {
+        return false;
+    }
+
     // Setup optimization profile
     if (!setupVisualOptimizationProfile(*builder.get(), *config.get(), *network.get()))
     {
