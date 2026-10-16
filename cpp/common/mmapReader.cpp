@@ -127,11 +127,7 @@ size_t MmapReader::getSize() const noexcept
 
 bool MmapReader::adviseRandomAccess() const noexcept
 {
-#if defined(__QNXNTO__)
     return mData != nullptr && posix_madvise(mData, mBytes, POSIX_MADV_RANDOM) == 0;
-#else
-    return mData != nullptr && madvise(mData, mBytes, MADV_RANDOM) == 0;
-#endif
 }
 
 } // namespace file_io
