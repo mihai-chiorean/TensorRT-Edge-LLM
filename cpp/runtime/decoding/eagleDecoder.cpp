@@ -322,8 +322,8 @@ bool EagleDecoder::runDraftModelPrefill(DecodingInferenceContext& context)
     // Unified embedding lookup (text, or vision by inserting image embeddings at the image
     // placeholder positions). Reuses the shared EmbeddingPreprocessor, which generates the
     // multimodal indices on-device and shares this decoder's embedding table.
-    mRuntime.preprocess.embeddingPreprocessor.embed(
-        mRuntime.preprocess.idsInput, context.visualEmbeddings, std::nullopt, mRuntime.base.pipelineIO, context.stream);
+    mRuntime.preprocess.embeddingPreprocessor.embed(mRuntime.preprocess.idsInput, nullptr, context.visualEmbeddings,
+        std::nullopt, mRuntime.base.pipelineIO, context.stream);
     int32_t* ctxLenData = mRuntime.base.pipelineIO.hostContextLengths.dataPointer<int32_t>();
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {

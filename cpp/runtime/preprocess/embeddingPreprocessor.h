@@ -55,6 +55,8 @@ public:
     //! caller and uploaded). Otherwise a fallback single-threaded GPU kernel generates them.
     //!
     //! @param tokenIds              GPU tensor of token IDs [batchSize, seqLen].
+    //! @param hostTokenIds          The same ids in host memory, or nullptr when the caller has none (ids sampled
+    //!                              on the device). Required when the embedding table is host-mapped.
     //! @param visionEmbeds          Optional vision (image) embeddings.
     //! @param audioEmbeds           Optional audio embeddings.
     //! @param io                    Pipeline I/O – `inputsEmbeds` is written.
@@ -65,9 +67,10 @@ public:
     //!                              Only used when precomputedIndices is nullptr.
     //! @param audioBaseOffsets      Device pointer to per-batch audio index offsets, or nullptr.
     //!                              Only used when precomputedIndices is nullptr.
-    void embed(Tensor const& tokenIds, OptionalInputTensor visionEmbeds, OptionalInputTensor audioEmbeds,
-        PipelineIO& io, cudaStream_t stream, OptionalInputTensor precomputedIndices = std::nullopt,
-        int32_t const* imageBaseOffsets = nullptr, int32_t const* audioBaseOffsets = nullptr);
+    void embed(Tensor const& tokenIds, int32_t const* hostTokenIds, OptionalInputTensor visionEmbeds,
+        OptionalInputTensor audioEmbeds, PipelineIO& io, cudaStream_t stream,
+        OptionalInputTensor precomputedIndices = std::nullopt, int32_t const* imageBaseOffsets = nullptr,
+        int32_t const* audioBaseOffsets = nullptr);
 
     //! Assemble deepstack features at image placeholder positions.
     //!
@@ -109,6 +112,9 @@ private:
 
     //! Fallback indices tensor allocated when no pre-computed indices are provided (decode paths).
     Tensor mOwnedIndices;
+
+    //! Per-step row staging for a host-mapped embedding table; null when the table is device resident.
+    std::unique_ptr<RowStaging> mStaging;
 };
 
 } // namespace rt
