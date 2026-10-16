@@ -38,7 +38,8 @@ enum VLMBuildOptionId : int
     MIN_IMAGE_TOKENS = 605,
     MAX_IMAGE_TOKENS = 606,
     MAX_IMAGE_TOKENS_PER_IMAGE = 607,
-    PROFILING_DETAILED = 608
+    PROFILING_DETAILED = 608,
+    HARDWARE_COMPATIBILITY = 609
 };
 
 struct ViTBuildArgs
@@ -51,6 +52,7 @@ struct ViTBuildArgs
     int64_t maxImageTokens{1024};
     int64_t maxImageTokensPerImage{512};
     bool profilingDetailed{false}; // Enable detailed profiling verbosity for layer info extraction
+    builder::HardwareCompatibility hardwareCompatibility{builder::HardwareCompatibility::kNONE};
 };
 
 void printUsage(char const* programName)
@@ -58,6 +60,7 @@ void printUsage(char const* programName)
     std::cerr << "Usage: " << programName
               << " [--help] <--onnxDir str> <--engineDir str> [--debug]"
                  "[--minImageTokens int] [--maxImageTokens int] [--maxImageTokensPerImage int] [--profilingDetailed]"
+                 " [--hardwareCompatibility none|same_compute_capability]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --help               Display this help message" << std::endl;
@@ -73,6 +76,9 @@ void printUsage(char const* programName)
     std::cerr << "  --profilingDetailed  Enable detailed profiling verbosity to include ONNX op names. "
                  "Use for DLSim analysis."
               << std::endl;
+    std::cerr << "  --hardwareCompatibility  none: the engine targets the build GPU. same_compute_capability: the "
+                 "engine runs on any GPU with the same compute capability (TensorRT >= 10.9). Default = none"
+              << std::endl;
 }
 
 bool parseViTBuildArgs(ViTBuildArgs& args, int argc, char* argv[])
@@ -84,7 +90,8 @@ bool parseViTBuildArgs(ViTBuildArgs& args, int argc, char* argv[])
         {"minImageTokens", required_argument, 0, VLMBuildOptionId::MIN_IMAGE_TOKENS},
         {"maxImageTokens", required_argument, 0, VLMBuildOptionId::MAX_IMAGE_TOKENS},
         {"maxImageTokensPerImage", required_argument, 0, VLMBuildOptionId::MAX_IMAGE_TOKENS_PER_IMAGE},
-        {"profilingDetailed", no_argument, 0, VLMBuildOptionId::PROFILING_DETAILED}, {0, 0, 0, 0}};
+        {"profilingDetailed", no_argument, 0, VLMBuildOptionId::PROFILING_DETAILED},
+        {"hardwareCompatibility", required_argument, 0, VLMBuildOptionId::HARDWARE_COMPATIBILITY}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", vitOptions, nullptr)) != -1)
@@ -134,6 +141,17 @@ bool parseViTBuildArgs(ViTBuildArgs& args, int argc, char* argv[])
             }
             break;
         case VLMBuildOptionId::PROFILING_DETAILED: args.profilingDetailed = true; break;
+        case VLMBuildOptionId::HARDWARE_COMPATIBILITY:
+        {
+            auto const compatibility = builder::parseHardwareCompatibility(optarg);
+            if (!compatibility)
+            {
+                LOG_ERROR("--hardwareCompatibility must be none or same_compute_capability, got %s.", optarg);
+                return false;
+            }
+            args.hardwareCompatibility = *compatibility;
+            break;
+        }
         default: LOG_ERROR("ERROR: Invalid Argument %c is %s", opt, optarg); return false;
         }
     }
@@ -189,6 +207,7 @@ int main(int argc, char** argv)
     config.maxImageTokens = args.maxImageTokens;
     config.maxImageTokensPerImage = args.maxImageTokensPerImage;
     config.profilingDetailed = args.profilingDetailed;
+    config.hardwareCompatibility = args.hardwareCompatibility;
 
     // The server loads <engineDir>/visual.engine, so land the engine under a
     // single "visual" segment whether the caller passes the base dir or the

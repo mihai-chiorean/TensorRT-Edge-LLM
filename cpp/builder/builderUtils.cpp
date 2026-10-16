@@ -327,6 +327,52 @@ std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder
     return config;
 }
 
+std::optional<HardwareCompatibility> parseHardwareCompatibility(std::string const& name) noexcept
+{
+    if (name == "none")
+    {
+        return HardwareCompatibility::kNONE;
+    }
+    if (name == "same_compute_capability")
+    {
+        return HardwareCompatibility::kSAME_COMPUTE_CAPABILITY;
+    }
+    return std::nullopt;
+}
+
+char const* hardwareCompatibilityName(HardwareCompatibility compatibility) noexcept
+{
+    switch (compatibility)
+    {
+    case HardwareCompatibility::kNONE: return "none";
+    case HardwareCompatibility::kSAME_COMPUTE_CAPABILITY: return "same_compute_capability";
+    }
+    return "unknown";
+}
+
+bool applyHardwareCompatibility(nvinfer1::IBuilderConfig& config, HardwareCompatibility compatibility) noexcept
+{
+    if (compatibility == HardwareCompatibility::kNONE)
+    {
+        return true;
+    }
+#if !IS_TRT_RTX && (NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 9))
+    config.setHardwareCompatibilityLevel(nvinfer1::HardwareCompatibilityLevel::kSAME_COMPUTE_CAPABILITY);
+    if (config.getHardwareCompatibilityLevel() != nvinfer1::HardwareCompatibilityLevel::kSAME_COMPUTE_CAPABILITY)
+    {
+        LOG_ERROR("TensorRT rejected hardware compatibility level %s.", hardwareCompatibilityName(compatibility));
+        return false;
+    }
+    LOG_INFO("Hardware compatibility level set to %s.", hardwareCompatibilityName(compatibility));
+    return true;
+#else
+    (void) config;
+    LOG_ERROR("Hardware compatibility level %s requires TensorRT 10.9 or newer and is not supported with TensorRT-RTX.",
+        hardwareCompatibilityName(compatibility));
+    return false;
+#endif
+}
+
 std::unique_ptr<nvonnxparser::IParser> parseOnnxModel(
     nvinfer1::INetworkDefinition* network, std::string const& onnxFilePath)
 {
