@@ -265,11 +265,10 @@ class OpenAIServingChat:
         num_logprobs = 0
         if request.logprobs:
             num_logprobs = max(1, request.top_logprobs or 0)
-        greedy = request.temperature == 0
         sampling = SamplingParams(
             temperature=request.temperature,
-            top_p=1.0 if greedy else request.top_p,
-            top_k=1 if greedy else request.top_k,
+            top_p=request.top_p,
+            top_k=request.top_k,
             seed=request.seed,
             max_tokens=request.effective_max_tokens,
             enable_thinking=request.enable_thinking,
