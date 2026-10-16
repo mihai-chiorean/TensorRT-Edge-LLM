@@ -37,7 +37,13 @@ def main() -> None:
     parser.add_argument("--output_dir",
                         help="Output checkpoint directory; omit to only "
                         "report how well the weights fit the grid")
-    parser.add_argument("--group_size", type=int, default=32)
+    parser.add_argument(
+        "--group_size",
+        type=int,
+        default=32,
+        choices=[32, 128],
+        help="input channels per scale; the INT4 W4A16 kernels serve 32 and "
+        "128 only")
     parser.add_argument("--linear_prefix",
                         default="model.language_model.",
                         help="Tensor name prefix of the decoder linears")

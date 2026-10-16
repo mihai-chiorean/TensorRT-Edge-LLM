@@ -15,6 +15,7 @@
 """CPU tests for the Q4_0-grid QAT checkpoint import."""
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -213,3 +214,82 @@ def test_fused_expert_tensors_are_rejected(tmp_path: Path):
 def test_grid_quantize_rejects_unaligned_k(k):
     with pytest.raises(ValueError):
         grid_quantize(torch.zeros(64, k), G)
+
+
+@pytest.mark.parametrize("group_size", [16, 64, 96, 129])
+def test_unsupported_group_size_is_rejected(tmp_path: Path, group_size: int):
+    # 64 is aligned and divisible here, so only the group-size gate rejects it.
+    src = tmp_path / "hf"
+    src.mkdir()
+    save_file(
+        {
+            "model.language_model.layers.0.mlp.up_proj.weight":
+            _grid_weight(64, 64, seed=9)
+        }, src / "model.safetensors")
+    (src / "config.json").write_text("{}")
+    with pytest.raises(ValueError, match="group_size"):
+        convert_q4_0_checkpoint(str(src),
+                                str(tmp_path / "out"),
+                                group_size=group_size)
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("group_size", [32, 128])
+def test_supported_group_sizes_are_accepted(tmp_path: Path, group_size: int):
+    src = tmp_path / "hf"
+    src.mkdir()
+    save_file(
+        {
+            "model.language_model.layers.0.mlp.up_proj.weight":
+            _grid_weight(64, 128, seed=10)
+        }, src / "model.safetensors")
+    report = convert_q4_0_checkpoint(str(src), None, group_size=group_size)
+    assert report["int4"].tensors == [
+        "model.language_model.layers.0.mlp.up_proj"
+    ]
+
+
+def test_sharded_checkpoint_is_rejected(tmp_path: Path):
+    src = tmp_path / "hf"
+    src.mkdir()
+    save_file(
+        {
+            "model.language_model.layers.0.mlp.up_proj.weight":
+            _grid_weight(64, 64, seed=11)
+        }, src / "model-00001-of-00001.safetensors")
+    (src / "model.safetensors.index.json").write_text(
+        json.dumps({
+            "metadata": {
+                "total_size": 0
+            },
+            "weight_map": {
+                "model.language_model.layers.0.mlp.up_proj.weight":
+                "model-00001-of-00001.safetensors"
+            },
+        }))
+    with pytest.raises(ValueError, match="sharded"):
+        convert_q4_0_checkpoint(str(src), None, group_size=G)
+
+
+@pytest.mark.parametrize("group_size,exit_code", [("64", 2), ("32", None)])
+def test_cli_group_size_choices(tmp_path: Path, monkeypatch, group_size: str,
+                                exit_code):
+    from tensorrt_edgellm.scripts import import_q4_0_qat
+    src = tmp_path / "hf"
+    src.mkdir()
+    save_file(
+        {
+            "model.language_model.layers.0.mlp.up_proj.weight":
+            _grid_weight(64, 64, seed=12)
+        }, src / "model.safetensors")
+    monkeypatch.setattr(sys, "argv", [
+        "import_q4_0_qat", "--model_dir",
+        str(src), "--group_size", group_size
+    ])
+    if exit_code is None:
+        import_q4_0_qat.main()
+    else:
+        # 2 is argparse's usage error; the converter's own failures exit 1.
+        with pytest.raises(SystemExit) as excinfo:
+            import_q4_0_qat.main()
+        assert excinfo.value.code == exit_code

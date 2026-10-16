@@ -158,12 +158,22 @@ def convert_q4_0_checkpoint(
     Returns the per-category statistics: ``"int4"`` for the quantized linears and, when requested,
     ``"lm_head"``.
     """
+    if group_size not in (32, 128):
+        raise ValueError(
+            f"unsupported group_size={group_size}: the INT4 W4A16 kernels serve "
+            "128 (both plugins) and 32 (Int4GroupwiseGemmPluginV2 with a CuTe "
+            "DSL artifact carrying the _g32 variants) only")
     keep_fp16 = list(keep_fp16)
     if embed_name is None:
         embed_name = linear_prefix + "embed_tokens.weight"
     report: Dict[str, GridStats] = {"int4": GridStats()}
     out: Dict[str, torch.Tensor] = {}
     excluded: List[str] = []
+    index = os.path.join(model_dir, "model.safetensors.index.json")
+    if os.path.exists(index):
+        raise ValueError(
+            f"sharded checkpoint ({index}) is not supported; merge the shards "
+            "into a single model.safetensors")
     checkpoint = os.path.join(model_dir, "model.safetensors")
     with safe_open(checkpoint, "pt") as sf:
         # Fused expert tensors ([E, N, K]) would stay unquantized while hf_quant_config declares
