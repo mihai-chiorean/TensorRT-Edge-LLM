@@ -1692,11 +1692,7 @@ class Gemma4Transformer(nn.Module):
             self, projected_per_layer_inputs: torch.Tensor,
             ple_token_embeds: Tuple[torch.Tensor, ...], first_layer: int,
             rows: torch.Tensor) -> torch.Tensor:
-        """Combine the per-layer inputs of layers >= first_layer at the selected rows.
-
-        One concat, one row gather and one fused add/scale replace the per-layer
-        gathers, which keeps the decode-step kernel count below the uncompacted graph.
-        """
+        """Combine the per-layer inputs of layers >= first_layer at the selected rows."""
         if len(ple_token_embeds) != len(self.layers):
             raise ValueError(
                 "Gemma4 PLE expects one ple_token_embeds input per layer; "
