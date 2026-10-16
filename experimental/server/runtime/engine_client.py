@@ -235,8 +235,8 @@ def _read_json(path: str) -> Dict[str, Any]:
 
 
 def _capabilities_for(llm: Union[LLM, TTS]) -> EngineCapabilities:
-    bundle_dir = llm.bundle_dir
     layout = llm.bundle_layout
+    bundle_dir = layout.engine_dir
     candidates = [
         os.path.join(bundle_dir, "config.json"),
         os.path.join(bundle_dir, "base_config.json"),
