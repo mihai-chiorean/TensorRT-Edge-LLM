@@ -266,7 +266,18 @@ bool Int4GroupwiseGemmPluginV2::supportsFormatCombination(int32_t pos, DynamicPl
             status &= tensorDesc.format == PluginFormat::kLINEAR;
             status &= tensorDesc.dims.nbDims == 2;
 #ifdef CUTE_DSL_INT4_FP16_GEMM_ENABLED
-            status &= cuteDslInt4GroupSizeSupported(mGroupSize);
+            if (!cuteDslInt4GroupSizeSupported(mGroupSize))
+            {
+                // TRT only reports "no supported format combination" at failure; name the cause once.
+                static std::once_flag sUnsupportedGroupSizeFlag;
+                std::call_once(sUnsupportedGroupSizeFlag, [this] {
+                    LOG_ERROR(
+                        "Int4GroupwiseGemmPluginV2: group size %d is not served by the loaded CuTe DSL "
+                        "artifact (group 128, and 32 only when the artifact carries the _g32 variants)",
+                        mGroupSize);
+                });
+                status = false;
+            }
 #endif
             status &= mGroupSize > 0 && tensorDesc.dims.d[0] == mGemmK / mGroupSize;
             status &= tensorDesc.dims.d[1] == mGemmN;
