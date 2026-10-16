@@ -135,6 +135,13 @@ def test_maps_model_cache_and_build_profile(tmp_path):
     assert config.api.enable_auto_tool_choice
 
 
+def test_host_embedding_tables_flag_reaches_llm_kwargs():
+    assert not parse_server_config(["model"]).model.host_embedding_tables
+    config = parse_server_config(["model", "--host-embedding-tables"])
+    assert config.model.host_embedding_tables
+    assert config.model.llm_kwargs()["host_embedding_tables"] is True
+
+
 def test_context_cache_config_rejects_ignored_or_invalid_options():
     with pytest.raises(ServerConfigError, match="tuning requires"):
         ContextCacheConfig(recurrent_snapshot_pool_bytes=1)

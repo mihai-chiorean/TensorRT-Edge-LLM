@@ -237,6 +237,11 @@ int32_t runStandaloneTTS(Qwen3OmniTTSRuntime& ttsRuntime, Code2WavRunner& code2w
     return talkerResponse.batchRvqCodes.empty() ? 0 : static_cast<int32_t>(talkerResponse.batchRvqCodes[0].size());
 }
 
+EmbeddingTableResidency embeddingTableResidency(bool hostEmbeddingTables)
+{
+    return hostEmbeddingTables ? EmbeddingTableResidency::kHostMapped : EmbeddingTableResidency::kDevice;
+}
+
 //! Unified Python wrapper for LLMInferenceRuntime.
 //! Supports both vanilla decoding and the runtime's speculative decoders
 //! through constructor overloading — mirrors the C++ unified runtime.
@@ -248,11 +253,11 @@ public:
     //! identity-page runtime path unchanged when callers omit it.
     PyLLMRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, std::string const& checkpointDir,
-        ContextCacheConfig const& contextCacheConfig)
+        ContextCacheConfig const& contextCacheConfig, bool hostEmbeddingTables)
     {
         mPluginHandle = loadEdgellmPluginLib();
-        mRuntime = std::make_unique<LLMInferenceRuntime>(
-            engineDir, multimodalEngineDir, loraWeightsMap, mStream.get(), contextCacheConfig, checkpointDir);
+        mRuntime = std::make_unique<LLMInferenceRuntime>(engineDir, multimodalEngineDir, loraWeightsMap, mStream.get(),
+            contextCacheConfig, checkpointDir, embeddingTableResidency(hostEmbeddingTables));
     }
 
     //! Speculative decoding constructor.
@@ -507,13 +512,13 @@ public:
     PyRequestEngine(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, std::string const& checkpointDir,
         ContextCacheConfig const& contextCacheConfig, int32_t maxBatchSize, int32_t maxPendingRequests,
-        int32_t commandQueueCapacity, bool captureCudaGraph)
+        int32_t commandQueueCapacity, bool captureCudaGraph, bool hostEmbeddingTables)
     {
         mPluginHandle = loadEdgellmPluginLib();
         // Single rank only in this release: tensor-parallel deployments stay on the blocking path
         // until the stepped command stream reaches the other ranks (see the IFB support matrix).
-        auto runtime = std::make_unique<LLMInferenceRuntime>(
-            engineDir, multimodalEngineDir, loraWeightsMap, mStream.get(), contextCacheConfig, checkpointDir);
+        auto runtime = std::make_unique<LLMInferenceRuntime>(engineDir, multimodalEngineDir, loraWeightsMap,
+            mStream.get(), contextCacheConfig, checkpointDir, embeddingTableResidency(hostEmbeddingTables));
         // Capture happens here because after the constructor hands the runtime over, nothing but
         // the actor may touch it, and the actor has no pre-first-request hook to capture from.
         if (captureCudaGraph && !runtime->captureDecodingCUDAGraph(mStream.get()))
@@ -1103,11 +1108,11 @@ PYBIND11_MODULE(_edgellm_runtime, m)
     // ========================================================================
     py::class_<PyLLMRuntime>(m, "LLMRuntime", "Unified LLM inference runtime with optional speculative decoding.")
         .def(py::init<std::string const&, std::string const&, std::unordered_map<std::string, std::string> const&,
-                 std::string const&, ContextCacheConfig const&>(),
+                 std::string const&, ContextCacheConfig const&, bool>(),
             py::arg("engine_dir"), py::arg("multimodal_engine_dir") = "",
             py::arg("lora_weights_map") = std::unordered_map<std::string, std::string>{},
             py::arg("checkpoint_dir") = "", py::arg("context_cache_config") = ContextCacheConfig{},
-            "Construct for vanilla (non-speculative) decoding")
+            py::arg("host_embedding_tables") = false, "Construct for vanilla (non-speculative) decoding")
         .def(py::init<std::string const&, std::string const&, std::unordered_map<std::string, std::string> const&,
                  int32_t, int32_t, int32_t, std::string const&, std::string const&, ContextCacheConfig const&,
                  int32_t>(),
@@ -1191,12 +1196,13 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         "Owns a runtime and the actor thread that drives it; submissions from any thread, "
         "responses through RequestHandle.")
         .def(py::init<std::string const&, std::string const&, std::unordered_map<std::string, std::string> const&,
-                 std::string const&, ContextCacheConfig const&, int32_t, int32_t, int32_t, bool>(),
+                 std::string const&, ContextCacheConfig const&, int32_t, int32_t, int32_t, bool, bool>(),
             py::arg("engine_dir"), py::arg("multimodal_engine_dir") = "",
             py::arg("lora_weights_map") = std::unordered_map<std::string, std::string>{},
             py::arg("checkpoint_dir") = "", py::arg("context_cache_config") = ContextCacheConfig{},
             py::arg("max_batch_size") = 1, py::arg("max_pending_requests") = 256,
-            py::arg("command_queue_capacity") = 64, py::arg("capture_cuda_graph") = true)
+            py::arg("command_queue_capacity") = 64, py::arg("capture_cuda_graph") = true,
+            py::arg("host_embedding_tables") = false)
         .def("submit", &PyRequestEngine::submit, py::arg("request"), py::call_guard<py::gil_scoped_release>(),
             "Queue a request. Returns immediately with a RequestHandle; raises SubmitError when refused.")
         .def("cancel", &PyRequestEngine::cancel, py::arg("request_id"), py::call_guard<py::gil_scoped_release>(),
