@@ -168,7 +168,21 @@ Tensor::Tensor(Coords const& shape, DeviceType deviceType, nvinfer1::DataType da
     }
     else
     {
-        CUDA_CHECK(cudaMalloc(&data, memoryCapacity));
+        cudaError_t const status = cudaMalloc(&data, memoryCapacity);
+        if (status != cudaSuccess)
+        {
+            size_t freeBytes{0};
+            size_t totalBytes{0};
+            cudaError_t const memoryInfoStatus = cudaMemGetInfo(&freeBytes, &totalBytes);
+            std::string const memoryInfo = memoryInfoStatus == cudaSuccess
+                ? format::fmtstr("; CUDA memory free %zu bytes (%.2f MB), total %zu bytes (%.2f MB)", freeBytes,
+                      utils::toMB(freeBytes), totalBytes, utils::toMB(totalBytes))
+                : format::fmtstr("; CUDA memory query failed: %s", cudaGetErrorString(memoryInfoStatus));
+            throw std::runtime_error(
+                format::fmtstr("Failed to allocate GPU tensor '%s' with shape %s and size %zu bytes (%.2f MB): %s%s",
+                    name.c_str(), shape.formatString().c_str(), memoryCapacity, utils::toMB(memoryCapacity),
+                    cudaGetErrorString(status), memoryInfo.c_str()));
+        }
         LOG_DEBUG("Tensor %s of shape %s with size %ld bytes (%.2f MB) allocated on GPU", name.c_str(),
             shape.formatString().c_str(), memoryCapacity, utils::toMB(memoryCapacity));
     }
