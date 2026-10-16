@@ -101,6 +101,23 @@ class EngineError(ServerError):
         super().__init__(message, status_code=status, error_type=error_type)
 
 
+class ToolProtocolResponseError(ServerError):
+    """The model produced tool protocol that must not reach the client as
+    content: an unparsable, unauthorized or unterminated call."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__("The model generated an invalid tool call.",
+                         status_code=HTTPStatus.BAD_GATEWAY,
+                         error_type="tool_protocol_error")
+        self.reason = reason
+
+    def payload(self) -> Dict[str, Any]:
+        payload = super().payload()
+        payload["error"]["code"] = "invalid_tool_call"
+        payload["error"]["reason"] = self.reason
+        return payload
+
+
 class PayloadTooLargeError(ServerError):
 
     def __init__(self, message: str, *, param: Optional[str] = None) -> None:
