@@ -1780,6 +1780,14 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         return nullptr;
     }
 
+    // The Talker pipeline reads the Thinker embedding table as a dense device tensor, which a host-mapped
+    // table has no copy of.
+    if (outputThinkerEmbeddings && mEmbedding.isHostResident())
+    {
+        LOG_ERROR("Host-mapped embedding tables do not support the Thinker embedding output of the Talker pipeline.");
+        return nullptr;
+    }
+
     if (mContextCache != nullptr && request.saveSystemPromptKVCache)
     {
         LOG_ERROR("Legacy system-prompt KV-cache capture cannot be combined with context reuse.");

@@ -944,6 +944,15 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         LOG_INFO("Thinker-Talker streaming enabled (single CUDA stream)");
     }
 
+    // The Talker reads the Thinker embedding table as a dense device tensor, which a host-mapped table has no copy of.
+    if (args.enableAudioOutput && args.embeddingTableResidency == rt::EmbeddingTableResidency::kHostMapped)
+    {
+        LOG_ERROR(
+            "--hostEmbeddingTables does not support Qwen3-Omni audio output: the Talker reads the Thinker "
+            "embedding table as a dense device tensor");
+        return false;
+    }
+
     if (args.debug)
     {
         gLogger.setLevel(nvinfer1::ILogger::Severity::kVERBOSE);
