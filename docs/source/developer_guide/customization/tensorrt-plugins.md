@@ -150,8 +150,8 @@ The Int4GroupwiseGemmPlugin integrates into the TensorRT Edge-LLM inference pipe
 `Int4GroupwiseGemmPluginV2` is the default INT4 groupwise GEMM backend. It shares the `Int4GroupwiseGemmPlugin` GEMM semantics — INT4 weights-only groupwise quantization, group size 128 or 32, FP16 accumulation, and symmetric (zero-point-free) quantization — but dispatches to AOT-compiled CuTe DSL (cuteDSL) W4A16 kernels instead of the AWQ CUDA-C++ kernels.
 
 Group-32 checkpoints (symmetric Q4_0-style QAT weights) are served only by this plugin, and only
-when the CuTe DSL artifact carries the `_g32` variants; among the artifacts shipped today, only
-sm_87 does.
+when the CuTe DSL artifact carries the `_g32` variants. Of the prebuilt artifacts in
+`kernelSrcs/cuteDSLPrebuilt`, only the sm_87 one carries them.
 
 The fragment layout supports any positive output width. The final 128-channel
 fragment is bounds-predicated by both the GEMM and GEMV kernels, so narrow
