@@ -2004,3 +2004,225 @@ def test_unknown_request_fields_are_ignored(client_and_llm):
                                },
                            })
     assert response.status_code == 200
+
+
+def _gemma_tool():
+    return {
+        "type": "function",
+        "function": {
+            "name": "weather",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string"
+                    }
+                },
+            },
+        },
+    }
+
+
+def _gemma_client(tmp_path):
+    """A client whose model directory identifies a Gemma 4 runtime bundle."""
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    llm = _FakeLLM(tmp_path)
+    model_dir = tmp_path / "gemma-4-e4b"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model": "gemma4_text"}',
+                                           encoding="utf-8")
+    llm.model_dir = str(model_dir)
+    config = ApiConfig(enable_auto_tool_choice=True)
+    return TestClient(_create_app(llm, config)), llm
+
+
+@pytest.mark.parametrize("output", [
+    "call:weather{location:Berkeley, California}",
+    "<|tool_call>call:unknown{}<tool_call|>It is sunny.",
+    "<|tool_call>call:weather{location:Paris}",
+])
+def test_gemma_tool_protocol_error_never_returns_model_content(
+        tmp_path, output):
+    client, llm = _gemma_client(tmp_path)
+
+    def complete(_request, _params, tool_config, **kwargs):
+        from experimental.server.parsing.tool_calling import \
+            parse_assistant_output
+        kwargs.pop("on_handle", None)
+        parse_assistant_output(output, tool_config, llm.model_dir, **kwargs)
+        raise AssertionError("unreachable")
+
+    llm._complete_prepared_request = complete
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Weather?"
+                               }],
+                               "tools": [_gemma_tool()],
+                           })
+    assert response.status_code == 502
+    error = response.json()["error"]
+    assert error["type"] == "tool_protocol_error"
+    assert error["code"] == "invalid_tool_call"
+    assert error["reason"] in {"malformed", "unauthorized", "incomplete"}
+    assert "Berkeley" not in response.text and "sunny" not in response.text
+
+
+def test_gemma_tool_stream_protocol_error_is_typed_and_terminal(tmp_path):
+    client, llm = _gemma_client(tmp_path)
+    pieces = [
+        "Sure. ", "<|tool_call>call:weather{location:Paris,",
+        "location:London}<tool_call|>", "Done."
+    ]
+
+    def stream(_messages, _params, **_kwargs):
+        for i, piece in enumerate(pieces):
+            yield StreamDelta(text=piece, token_ids=[i], prompt_tokens=7)
+        yield StreamDelta(text="", finished=True, finish_reason="stop")
+
+    llm.generate_stream = stream
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Weather?"
+                               }],
+                               "tools": [_gemma_tool()],
+                               "stream":
+                               True,
+                           })
+    assert response.status_code == 200
+    payloads = _sse_payloads(response)
+    contents = "".join(p["choices"][0]["delta"].get("content") or ""
+                       for p in payloads if p.get("choices"))
+    assert contents == "Sure. "
+    assert "Done." not in response.text and "Paris" not in response.text
+    errors = [p["error"] for p in payloads if "error" in p]
+    assert len(errors) == 1
+    assert errors[0]["type"] == "tool_protocol_error"
+    assert errors[0]["reason"] == "malformed"
+    finish = [
+        p["choices"][0]["finish_reason"] for p in payloads
+        if p.get("choices") and p["choices"][0].get("finish_reason")
+    ]
+    assert finish == ["error"]
+    assert response.text.rstrip().endswith("data: [DONE]")
+
+
+def test_gemma_tool_stream_emits_call_and_drops_trailing_prose(tmp_path):
+    client, llm = _gemma_client(tmp_path)
+    pieces = [
+        "call:weat", "her{location:<|\"|>Berkeley, CA<|\"|>}",
+        "I already looked it up."
+    ]
+
+    def stream(_messages, _params, **_kwargs):
+        for i, piece in enumerate(pieces):
+            yield StreamDelta(text=piece, token_ids=[i], prompt_tokens=7)
+        yield StreamDelta(text="", finished=True, finish_reason="stop")
+
+    llm.generate_stream = stream
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Weather?"
+                               }],
+                               "tools": [_gemma_tool()],
+                               "tool_choice":
+                               "required",
+                               "stream":
+                               True,
+                           })
+    assert response.status_code == 200
+    payloads = _sse_payloads(response)
+    calls = [
+        p["choices"][0]["delta"]["tool_calls"] for p in payloads
+        if p.get("choices") and p["choices"][0]["delta"].get("tool_calls")
+    ]
+    assert calls[0][0]["function"]["name"] == "weather"
+    assert json.loads(calls[1][0]["function"]["arguments"]) == {
+        "location": "Berkeley, CA"
+    }
+    assert "already looked" not in response.text
+    finish = [
+        p["choices"][0]["finish_reason"] for p in payloads
+        if p.get("choices") and p["choices"][0].get("finish_reason")
+    ]
+    assert finish == ["tool_calls"]
+
+
+@pytest.mark.parametrize("pieces", [
+    ["<|tool_call>call:weather{location:Paris"],
+    ["call:weather{location:Paris,", "location:London}"],
+])
+def test_gemma_anthropic_stream_reports_tool_protocol_error(tmp_path, pieces):
+    client, llm = _gemma_client(tmp_path)
+
+    def stream(_messages, _params, **_kwargs):
+        for i, piece in enumerate(pieces):
+            yield StreamDelta(text=piece, token_ids=[i], prompt_tokens=7)
+        yield StreamDelta(text="", finished=True, finish_reason="stop")
+
+    llm.generate_stream = stream
+    response = client.post("/v1/messages",
+                           json={
+                               "model":
+                               "fake-model",
+                               "max_tokens":
+                               64,
+                               "stream":
+                               True,
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Weather?"
+                               }],
+                               "tools": [{
+                                   "name": "weather",
+                                   "input_schema": {
+                                       "type": "object"
+                                   },
+                               }],
+                           })
+    assert response.status_code == 200
+    assert "event: error" in response.text
+    assert "invalid tool call" in response.text
+    assert "Paris" not in response.text and "London" not in response.text
+    assert "message_stop" not in response.text
+
+
+def test_gemma_tool_stream_closes_generation_on_protocol_error(tmp_path):
+    client, llm = _gemma_client(tmp_path)
+    closed = []
+
+    def stream(_messages, _params, **_kwargs):
+        try:
+            yield StreamDelta(text="<|tool_call>call:weather{location:Paris,",
+                              token_ids=[0],
+                              prompt_tokens=7)
+            yield StreamDelta(text="location:London}<tool_call|>",
+                              token_ids=[1])
+            for i in range(2, 1000):
+                yield StreamDelta(text=" more", token_ids=[i])
+            yield StreamDelta(text="", finished=True, finish_reason="stop")
+        finally:
+            closed.append(True)
+
+    llm.generate_stream = stream
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Weather?"
+                               }],
+                               "tools": [_gemma_tool()],
+                               "stream":
+                               True,
+                           })
+    assert response.status_code == 200
+    assert "tool_protocol_error" in response.text
+    assert closed == [True]
