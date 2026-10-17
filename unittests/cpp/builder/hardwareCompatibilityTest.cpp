@@ -16,6 +16,7 @@
  */
 
 #include "builder/builderUtils.h"
+#include "builder/hardwareCompatibility.h"
 #include "builder/llmBuilder.h"
 #include "builder/visualBuilder.h"
 #include "common/logger.h"
@@ -82,6 +83,18 @@ TEST(HardwareCompatibilityTest, UnknownJsonValueIsRejected)
 
     EXPECT_THROW(LLMBuilderConfig::fromJson(json), std::runtime_error);
     EXPECT_THROW(VisualBuilderConfig::fromJson(json), std::runtime_error);
+}
+
+TEST(HardwareCompatibilityTest, NonStringJsonValueIsRejected)
+{
+    Json const jsonValues = Json::array({Json(1), Json(true), Json(), Json::object()});
+
+    for (auto const& value : jsonValues)
+    {
+        Json const json = {{"hardware_compatibility", value}};
+        EXPECT_THROW(LLMBuilderConfig::fromJson(json), std::runtime_error);
+        EXPECT_THROW(VisualBuilderConfig::fromJson(json), std::runtime_error);
+    }
 }
 
 TEST(HardwareCompatibilityTest, AppliesLevelToBuilderConfig)

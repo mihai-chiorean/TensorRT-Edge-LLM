@@ -331,7 +331,9 @@ struct LLMBuilderConfig
         }
         if (json.contains("hardware_compatibility"))
         {
-            auto const compatibility = parseHardwareCompatibility(json["hardware_compatibility"].get<std::string>());
+            auto const& value = json["hardware_compatibility"];
+            ELLM_CHECK(value.is_string(), "LLMBuilderConfig: hardware_compatibility must be a string.");
+            auto const compatibility = parseHardwareCompatibility(value.get<std::string>());
             ELLM_CHECK(compatibility.has_value(), "LLMBuilderConfig: unknown hardware_compatibility value.");
             config.hardwareCompatibility = *compatibility;
         }
