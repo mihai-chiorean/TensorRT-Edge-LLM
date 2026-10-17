@@ -388,3 +388,226 @@ def test_int8_runtime_artifacts_reject_qwen3_omni():
                                                  "",
                                                  "",
                                                  int8_embedding=True)
+
+
+def test_int4_quantization_packs_nibbles_and_round_trips():
+    torch.manual_seed(0)
+    weight = (torch.randn(5, 64) * 0.3).to(torch.float16)
+    weight[0] = 0.0
+
+    packed, scales = embedding_quantization.quantize_embedding_to_int4(weight)
+    repeated, repeated_scales = \
+        embedding_quantization.quantize_embedding_to_int4(weight)
+
+    assert packed.dtype == torch.uint8
+    assert scales.dtype == torch.float16
+    assert packed.shape == (5, 32)
+    assert scales.shape == (5, 2)
+    assert torch.equal(packed, repeated)
+    assert torch.equal(scales, repeated_scales)
+    assert scales[0].float().tolist() == [1.0, 1.0]
+    # An all-zero row packs to the offset nibble 8 in both halves.
+    assert torch.all(packed[0] == 0x88)
+
+    low = (packed & 0x0F).int() - 8
+    high = (packed >> 4).int() - 8
+    assert low.min() >= -7 and low.max() <= 7
+    assert high.min() >= -7 and high.max() <= 7
+
+    dequantized = embedding_quantization.dequantize_int4_embedding(
+        packed, scales)
+    assert dequantized.dtype == torch.float16
+    assert dequantized.shape == weight.shape
+    error = (weight.float() - dequantized.float()).abs()
+    bound = scales.float().repeat_interleave(32, dim=1) / 2 + 2e-3
+    assert torch.all(error <= bound)
+
+
+def test_int4_quantization_uses_independent_group_scales():
+    weight = torch.zeros(1, 64, dtype=torch.float16)
+    weight[0, :32] = 0.07
+    weight[0, 32:] = 7.0
+
+    packed, scales = embedding_quantization.quantize_embedding_to_int4(weight)
+    dequantized = embedding_quantization.dequantize_int4_embedding(
+        packed, scales)
+
+    assert scales[0, 0].item() == pytest.approx(0.01, rel=1e-2)
+    assert scales[0, 1].item() == pytest.approx(1.0)
+    assert torch.allclose(dequantized[0, :32].float(),
+                          torch.full((32, ), 0.07),
+                          atol=2e-3)
+    assert torch.allclose(dequantized[0, 32:].float(), torch.full((32, ), 7.0))
+
+
+def test_int4_chunked_quantization_matches_single_chunk(monkeypatch):
+    torch.manual_seed(1)
+    weight = torch.randn(9, 64).to(torch.float16)
+    packed, scales = embedding_quantization.quantize_embedding_to_int4(weight)
+
+    monkeypatch.setattr(embedding_quantization,
+                        "INT8_QUANTIZATION_CHUNK_ELEMENTS", 64)
+    chunked, chunked_scales = \
+        embedding_quantization.quantize_embedding_to_int4(weight)
+
+    assert torch.equal(packed, chunked)
+    assert torch.equal(scales, chunked_scales)
+
+
+def _q4_0_grid_table(rows, width, group_size=32):
+    """Rows of ``code * step`` with codes in [-8, 7]; every group reaches -8 or 7."""
+    torch.manual_seed(2)
+    num_groups = width // group_size
+    codes = torch.randint(-8, 8, (rows, num_groups, group_size))
+    codes[:, 0::2, 0] = -8
+    codes[:, 1::2, 0] = 7
+    codes[:, 1::2, 1:] = codes[:, 1::2, 1:].clamp(-7, 7)
+    # Steps with short mantissas keep code * step exact in FP16.
+    steps = torch.tensor([0.125, 0.0390625, 0.5, 0.01171875])
+    step = steps[torch.randint(0, len(steps), (rows, num_groups))]
+    return (codes * step.unsqueeze(2)).view(rows, width).to(torch.float16)
+
+
+def test_int4_q4_0_grid_mode_reproduces_grid_tables_exactly():
+    weight = _q4_0_grid_table(6, 128)
+
+    packed, scales = embedding_quantization.quantize_embedding_to_int4(
+        weight, scale_mode="q4_0_grid")
+    dequantized = embedding_quantization.dequantize_int4_embedding(
+        packed, scales)
+
+    assert torch.equal(dequantized, weight)
+    low = (packed & 0x0F).int() - 8
+    assert low.min() == -8 and low.max() <= 7
+
+    absmax_packed, absmax_scales = \
+        embedding_quantization.quantize_embedding_to_int4(weight)
+    absmax = embedding_quantization.dequantize_int4_embedding(
+        absmax_packed, absmax_scales)
+    assert not torch.equal(absmax, weight)
+
+
+def test_int4_default_scale_mode_is_absmax():
+    torch.manual_seed(3)
+    weight = torch.randn(4, 64).to(torch.float16)
+
+    default = embedding_quantization.quantize_embedding_to_int4(weight)
+    explicit = embedding_quantization.quantize_embedding_to_int4(
+        weight, scale_mode="absmax")
+
+    assert torch.equal(default[0], explicit[0])
+    assert torch.equal(default[1], explicit[1])
+    assert torch.equal(default[1].float(),
+                       (weight.float().view(4, 2, 32).abs().amax(dim=2) /
+                        7).half().float())
+
+
+def test_int4_rejects_unknown_scale_mode():
+    with pytest.raises(ValueError, match="scale_mode"):
+        embedding_quantization.quantize_embedding_to_int4(torch.zeros(2, 32),
+                                                          scale_mode="q8")
+
+
+@pytest.mark.parametrize("kwargs, weight, message", [
+    (dict(group_size=3), torch.zeros(2, 6), "positive even"),
+    (dict(), torch.zeros(2, 40), "divisible by group_size"),
+    (dict(), torch.zeros(2, 32, dtype=torch.int8), "floating-point"),
+    (dict(), torch.zeros(32), "2D"),
+])
+def test_int4_quantization_rejects_invalid_inputs(kwargs, weight, message):
+    with pytest.raises(ValueError, match=message):
+        embedding_quantization.quantize_embedding_to_int4(weight, **kwargs)
+
+
+def test_int4_sidecar_metadata():
+    metadata = embedding_quantization.int4_sidecar_metadata("ple_embedding")
+    assert metadata[
+        "trt_edge_llm_quantization"] == "int4_symmetric_group32_packed"
+    assert metadata["trt_edge_llm_tensor_role"] == "ple_embedding"
+    with pytest.raises(ValueError, match="tensor role"):
+        embedding_quantization.int4_sidecar_metadata("unknown")
+
+
+def _gemma4_model_32():
+    embedding = (torch.arange(2 * 64, dtype=torch.float16).view(2, 64) -
+                 64) / 16
+    ple = (torch.arange(2 * 128, dtype=torch.float16).view(2, 128) - 128) / 8
+    config = SimpleNamespace(hidden_size=64,
+                             hidden_size_per_layer_input=64,
+                             model_type="gemma4_text",
+                             num_hidden_layers=2,
+                             ple_enabled=True,
+                             **_spec_flags())
+    return SimpleNamespace(
+        config=config,
+        embed_tokens=SimpleNamespace(weight=embedding),
+        model=SimpleNamespace(embed_tokens_per_layer=SimpleNamespace(
+            weight=ple)),
+    )
+
+
+def test_runtime_artifact_writer_exports_int4_embedding_and_ple(
+        tmp_path, monkeypatch):
+    checkpoint_utils = _writer_under_test(monkeypatch)
+    out_dir = tmp_path / "artifacts"
+
+    checkpoint_utils.write_runtime_artifacts(_gemma4_model_32(),
+                                             str(tmp_path),
+                                             str(out_dir),
+                                             int4_embedding=True)
+
+    with safe_open(out_dir / "embedding.safetensors",
+                   framework="pt",
+                   device="cpu") as sidecar:
+        assert set(sidecar.keys()) == {"embedding", "embedding_scale"}
+        assert sidecar.get_tensor("embedding").dtype == torch.uint8
+        assert sidecar.get_tensor("embedding").shape == (2, 32)
+        assert sidecar.get_tensor("embedding_scale").dtype == torch.float16
+        assert sidecar.get_tensor("embedding_scale").shape == (2, 2)
+        assert sidecar.metadata()["trt_edge_llm_quantization"] == (
+            "int4_symmetric_group32_packed")
+    with safe_open(out_dir / "ple_embedding.safetensors",
+                   framework="pt",
+                   device="cpu") as sidecar:
+        assert set(sidecar.keys()) == {"weight", "weight_scale"}
+        assert sidecar.get_tensor("weight").dtype == torch.uint8
+        assert sidecar.get_tensor("weight").shape == (2, 64)
+        assert sidecar.get_tensor("weight_scale").shape == (2, 4)
+        assert sidecar.metadata(
+        )["trt_edge_llm_tensor_role"] == "ple_embedding"
+
+
+def test_runtime_artifact_writer_passes_int4_scale_mode(tmp_path, monkeypatch):
+    checkpoint_utils = _writer_under_test(monkeypatch)
+    model = _gemma4_model_32()
+    grid = _q4_0_grid_table(2, 64)
+    model.embed_tokens.weight = grid / 8
+    out_dir = tmp_path / "artifacts"
+
+    checkpoint_utils.write_runtime_artifacts(model,
+                                             str(tmp_path),
+                                             str(out_dir),
+                                             int4_embedding=True,
+                                             int4_embedding_scale="q4_0_grid")
+
+    with safe_open(out_dir / "embedding.safetensors",
+                   framework="pt",
+                   device="cpu") as sidecar:
+        dequantized = embedding_quantization.dequantize_int4_embedding(
+            sidecar.get_tensor("embedding"),
+            sidecar.get_tensor("embedding_scale"))
+    # The writer folds sqrt(hidden_size) = 8 into the Gemma 4 token table.
+    assert torch.equal(dequantized, grid)
+
+
+def test_int4_and_int8_embedding_modes_are_mutually_exclusive():
+    checkpoint_utils = _load_repo_module(
+        "tensorrt_edgellm/checkpoint/checkpoint_utils.py",
+        "checkpoint_utils_int4_under_test")
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        checkpoint_utils.write_runtime_artifacts(None,
+                                                 "",
+                                                 "",
+                                                 int8_embedding=True,
+                                                 int4_embedding=True)
