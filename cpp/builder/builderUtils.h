@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "builder/hardwareCompatibility.h"
+
 #include <NvInfer.h>
 #include <NvOnnxParser.h>
 #include <filesystem>
@@ -96,6 +98,11 @@ std::pair<std::unique_ptr<nvinfer1::IBuilder>, std::unique_ptr<nvinfer1::INetwor
 //! @return Builder config with monitor memory flag enabled (TRT >= 10.6)
 std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(
     nvinfer1::IBuilder* builder, bool enableAliasedPluginIO = false);
+
+//! Apply a hardware compatibility level to a builder config.
+//! kSAME_COMPUTE_CAPABILITY requires TensorRT >= 10.9 and is not available with TensorRT-RTX.
+//! @return false if the level is not supported by the TensorRT library this was built against
+bool applyHardwareCompatibility(nvinfer1::IBuilderConfig& config, HardwareCompatibility compatibility) noexcept;
 
 //! Parse ONNX model and create parser.
 //! @param network TensorRT network definition to populate
