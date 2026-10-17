@@ -201,8 +201,13 @@ edgellm_add_unit_test(
   cpp/kernels/qsaIndexer)
 
 edgellm_add_unit_test(
-  NAME unitTestPlugins DIRS cpp/plugins/nvfp4A16GemmPlugin
-  cpp/plugins/nvfp4A16BlackwellMoePlugin cpp/plugins/allReducePlugin)
+  NAME
+  unitTestPlugins
+  DIRS
+  cpp/plugins/int4GroupwiseGemmPlugin
+  cpp/plugins/nvfp4A16GemmPlugin
+  cpp/plugins/nvfp4A16BlackwellMoePlugin
+  cpp/plugins/allReducePlugin)
 
 edgellm_add_unit_test(NAME unitTestCuteDslKernels DIRS
                       kernelSrcs/int4_fp16_gemm_cutedsl)

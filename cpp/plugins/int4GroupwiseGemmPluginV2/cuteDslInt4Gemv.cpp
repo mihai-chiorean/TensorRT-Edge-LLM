@@ -19,6 +19,7 @@
 
 #include "cuteDslInt4Gemv.h"
 #include "common/cudaUtils.h"
+#include "cuteDslInt4Gemm.h"
 
 // The AOT-generated headers use cudaLibrary_t (CUDA 12.8+ runtime). On CUDA < 12.8
 // the build defines TRT_EDGELLM_CUDA_LIBRARY_T_COMPAT; route it to the driver type.
@@ -47,29 +48,56 @@ namespace
 {
 
 // The compiled GEMV variants (must match build_cutedsl.py's int4_fp16_gemv
-// registration): one exported function per M. X(prefix, M).
-#define INT4_FP16_GEMV_VARIANTS(X)                                                                                     \
-    X(int4_fp16_gemv_m1, 1)                                                                                            \
-    X(int4_fp16_gemv_m2, 2)                                                                                            \
-    X(int4_fp16_gemv_m3, 3)                                                                                            \
-    X(int4_fp16_gemv_m4, 4)                                                                                            \
-    X(int4_fp16_gemv_m5, 5)                                                                                            \
-    X(int4_fp16_gemv_m6, 6)                                                                                            \
-    X(int4_fp16_gemv_m7, 7)                                                                                            \
-    X(int4_fp16_gemv_m8, 8)
+// registration): one exported function per M, baked once per group size. The
+// group-128 set keeps the unsuffixed names; group 32 carries a `_g32` suffix.
+// X(prefix, M).
+#define INT4_FP16_GEMV_VARIANTS_G(X, SUFFIX)                                                                           \
+    X(int4_fp16_gemv_m1##SUFFIX, 1)                                                                                    \
+    X(int4_fp16_gemv_m2##SUFFIX, 2)                                                                                    \
+    X(int4_fp16_gemv_m3##SUFFIX, 3)                                                                                    \
+    X(int4_fp16_gemv_m4##SUFFIX, 4)                                                                                    \
+    X(int4_fp16_gemv_m5##SUFFIX, 5)                                                                                    \
+    X(int4_fp16_gemv_m6##SUFFIX, 6)                                                                                    \
+    X(int4_fp16_gemv_m7##SUFFIX, 7)                                                                                    \
+    X(int4_fp16_gemv_m8##SUFFIX, 8)
+#define INT4_FP16_GEMV_VARIANTS_G128(X) INT4_FP16_GEMV_VARIANTS_G(X, )
+#ifdef CUTE_DSL_INT4_FP16_GEMM_G32_ENABLED
+#define INT4_FP16_GEMV_VARIANTS_G32(X) INT4_FP16_GEMV_VARIANTS_G(X, _g32)
+#else
+#define INT4_FP16_GEMV_VARIANTS_G32(X)
+#endif
 
-// Module storage, loaded once.
+// Module storage, loaded once per group size.
 #define DECL_MODULE(prefix, M) prefix##_Kernel_Module_t g_##prefix{};
-INT4_FP16_GEMV_VARIANTS(DECL_MODULE)
+INT4_FP16_GEMV_VARIANTS_G128(DECL_MODULE)
+INT4_FP16_GEMV_VARIANTS_G32(DECL_MODULE)
 #undef DECL_MODULE
 
-bool gLoaded = false;
+bool gLoadedG128 = false;
+bool gLoadedG32 = false;
 std::mutex gLoadMutex;
 
-// GEMV group size is baked at 128 (matches build_cutedsl.py); scale rows = ceil(K/128).
-constexpr int32_t kGemvGroupSize = 128;
 constexpr int32_t kBN = 128; // fragment N-block (shared with the GEMM)
 constexpr int32_t kBK = 64;  // fragment K-tile
+
+#define LOAD_MODULE(prefix, M)                                                                                         \
+    prefix##_Kernel_Module_Load(&g_##prefix);                                                                          \
+    ok = ok && (g_##prefix.module != nullptr);
+
+bool loadModulesG128()
+{
+    bool ok = true;
+    INT4_FP16_GEMV_VARIANTS_G128(LOAD_MODULE)
+    return ok;
+}
+
+bool loadModulesG32()
+{
+    bool ok = true;
+    INT4_FP16_GEMV_VARIANTS_G32(LOAD_MODULE)
+    return ok;
+}
+#undef LOAD_MODULE
 } // namespace
 
 bool cuteDslInt4GemvSupported(int32_t M)
@@ -77,26 +105,26 @@ bool cuteDslInt4GemvSupported(int32_t M)
     return M >= 1 && M <= kGemvMaxM;
 }
 
-bool cuteDslInt4GemvLoadModules()
+bool cuteDslInt4GemvLoadModules(int32_t groupSize)
 {
+    if (!cuteDslInt4GroupSizeSupported(groupSize))
+    {
+        return false;
+    }
     std::lock_guard<std::mutex> lock(gLoadMutex);
-    if (gLoaded)
+    bool& loaded = (groupSize == 32) ? gLoadedG32 : gLoadedG128;
+    if (loaded)
     {
         return true;
     }
     cudaFree(nullptr); // ensure a current context for the (driver-API on CUDA<12.8) loads
     (void) cudaGetLastError();
-    bool ok = true;
-#define LOAD_MODULE(prefix, M)                                                                                         \
-    prefix##_Kernel_Module_Load(&g_##prefix);                                                                          \
-    ok = ok && (g_##prefix.module != nullptr);
-    INT4_FP16_GEMV_VARIANTS(LOAD_MODULE)
-#undef LOAD_MODULE
+    bool const ok = (groupSize == 32) ? loadModulesG32() : loadModulesG128();
     if (!ok || cudaGetLastError() != cudaSuccess)
     {
         return false;
     }
-    gLoaded = true;
+    loaded = true;
     return true;
 }
 
@@ -111,14 +139,15 @@ bool cuteDslInt4GemvLoadModules()
     } while (0)
 
 int32_t cuteDslInt4GemvLaunch(int32_t M, void const* A, void const* fragW, void const* scales, void* Out, int32_t N,
-    int32_t K, cudaStream_t stream)
+    int32_t K, int32_t groupSize, cudaStream_t stream)
 {
-    if (!gLoaded)
+    bool const loaded = (groupSize == 32) ? gLoadedG32 : (groupSize == 128) ? gLoadedG128 : false;
+    if (!loaded)
     {
         return -1;
     }
     int32_t const qwRows = divUp(N, kBN) * divUp(K, kBK) * (kBK / 16) * (kBN / 64);
-    int32_t const scaleRows = divUp(K, kGemvGroupSize);
+    int32_t const scaleRows = divUp(K, groupSize);
 #define DISPATCH(prefix, VM)                                                                                           \
     if (M == (VM))                                                                                                     \
     {                                                                                                                  \
@@ -132,12 +161,22 @@ int32_t cuteDslInt4GemvLaunch(int32_t M, void const* A, void const* fragW, void 
         SET_2D(tOut, Out, M, N);                                                                                       \
         return cute_dsl_##prefix##_wrapper(&g_##prefix, &tA, &tW, &tS, &tOut, stream);                                 \
     }
-    INT4_FP16_GEMV_VARIANTS(DISPATCH)
+    if (groupSize == 32)
+    {
+        INT4_FP16_GEMV_VARIANTS_G32(DISPATCH)
+    }
+    else
+    {
+        INT4_FP16_GEMV_VARIANTS_G128(DISPATCH)
+    }
 #undef DISPATCH
     return -1; // M outside [1, kGemvMaxM]
 }
 
 #undef SET_2D
+#undef INT4_FP16_GEMV_VARIANTS_G
+#undef INT4_FP16_GEMV_VARIANTS_G128
+#undef INT4_FP16_GEMV_VARIANTS_G32
 #undef INT4_FP16_GEMV_VARIANTS
 
 } // namespace plugins

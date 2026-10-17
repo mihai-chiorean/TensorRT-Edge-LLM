@@ -34,7 +34,8 @@ namespace plugins
  * repack and no cached weight buffer.
  *
  * Inputs: [0] activations [b,seq,K] fp16; [1] fragment weights [rows,512] int8
- * (rows = ceil(N/128)*ceil(K/64)*8); [2] scales [ceil(K/G),N] fp16.
+ * (rows = ceil(N/128)*ceil(K/64)*8); [2] scales [ceil(K/G),N] fp16, G in {32, 128}
+ * (the artifact bakes one kernel set per group size).
  * Output: [b,seq,N] fp16.
  */
 class Int4GroupwiseGemmPluginV2 : public nvinfer1::IPluginV3,

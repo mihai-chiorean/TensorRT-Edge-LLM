@@ -86,6 +86,10 @@ public:
     //! @return Size in bytes
     size_t getSize() const noexcept;
 
+    //! @brief Tell the kernel the mapping is read at random offsets, which disables read-around on page faults
+    //! @return True when the hint was applied
+    bool adviseRandomAccess() const noexcept;
+
 private:
     void* mData;   //!< Pointer to mapped memory
     size_t mBytes; //!< Size of mapped data in bytes

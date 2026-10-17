@@ -98,6 +98,7 @@ tensorrt-edgellm-insert-lora = "tensorrt_edgellm.scripts.insert_lora:main"
 tensorrt-edgellm-process-lora = "tensorrt_edgellm.scripts.process_lora_weights:main"
 tensorrt-edgellm-merge-lora = "tensorrt_edgellm.scripts.merge_lora:main"
 tensorrt-edgellm-reduce-vocab = "tensorrt_edgellm.scripts.reduce_vocab:main"
+tensorrt-edgellm-import-q4-0-qat = "tensorrt_edgellm.scripts.import_q4_0_qat:main"
 tensorrt-edgellm-serve = "experimental.server.cli:main"
 
 [tool.isort]

@@ -21,6 +21,7 @@
 #include "common/tensor.h"
 #include "runtime/audioUtils.h"
 #include "runtime/imageUtils.h"
+#include "runtime/preprocess/hostRowTable.h"
 #include "runtime/state/contextCache/contextCacheConfig.h"
 
 #include <cstdint>
@@ -490,6 +491,13 @@ struct EmbeddingData
 {
     rt::Tensor table;              //!< Embedding table [vocabSize, hiddenSize] (FP16, FP8, or INT8)
     rt::Tensor tableScalingFactor; //!< FP32 scales for quantized table formats
+    //! Set instead of `table` when the table stays mapped in host memory (EmbeddingTableResidency::kHostMapped).
+    std::unique_ptr<rt::HostRowTable> hostTable;
+
+    bool isHostResident() const noexcept
+    {
+        return hostTable != nullptr;
+    }
 
     //! \brief Returns scales as OptionalInputTensor (std::nullopt for FP16)
     rt::OptionalInputTensor scalesAsOptional() const
@@ -511,6 +519,16 @@ struct EmbeddingData
  *  \throws std::runtime_error if file not found, tensors missing, or invalid dtypes
  */
 EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cudaStream_t stream);
+
+/*! \brief Map an embedding table from safetensors without copying it to the device
+ *
+ *  Validates the same dtype contract as loadEmbeddingTable and returns EmbeddingData whose `hostTable` is set and
+ *  whose device tensors are empty. Row lookups then gather on the host per step.
+ *
+ *  \param embeddingPath Path to embedding.safetensors file
+ *  \throws std::runtime_error if file not found, tensors missing, or invalid dtypes
+ */
+EmbeddingData mapEmbeddingTable(std::filesystem::path const& embeddingPath);
 
 /*!
  * @brief Clamp max generation length against KV-cache capacity across the full active batch

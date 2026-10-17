@@ -185,26 +185,36 @@ void validateDsparkTreeMetadataBindings(DeploymentConfig const& deployment, Engi
 
 ModelArtifacts ModelArtifacts::loadFromEngineDir(std::filesystem::path const& engineDir,
     std::optional<SpecDecodeDraftingConfig> const& draftingConfig, std::filesystem::path const& checkpointDir,
-    std::filesystem::path const& draftCheckpointDir, bool contextReuseEnabled, cudaStream_t stream)
+    std::filesystem::path const& draftCheckpointDir, bool contextReuseEnabled, cudaStream_t stream,
+    EmbeddingTableResidency embeddingTableResidency)
 {
     ModelArtifacts artifacts;
     artifacts.checkpointDir = checkpointDir;
     artifacts.draftCheckpointDir = draftCheckpointDir;
+    artifacts.embeddingTableResidency = embeddingTableResidency;
 
     std::filesystem::path const baseConfigPath
         = draftingConfig.has_value() ? engineDir / "base_config.json" : engineDir / "config.json";
 
     // Finish checkpoint reads and weight conversion before any engine can run.
     artifacts.weights.load(engineDir, baseConfigPath, stream, artifacts.checkpointDir);
+    bool const hostMapped = embeddingTableResidency == EmbeddingTableResidency::kHostMapped;
     if (auto embedding = artifacts.weights.takeEmbedding())
     {
+        ELLM_CHECK(!hostMapped, "Host-mapped embedding tables require the embedding.safetensors sidecar");
         artifacts.embedding.table = std::move(*embedding);
+    }
+    else if (hostMapped)
+    {
+        artifacts.embedding = mapEmbeddingTable(engineDir / "embedding.safetensors");
     }
     else
     {
         artifacts.embedding = loadEmbeddingTable(engineDir / "embedding.safetensors", stream);
     }
     artifacts.pleEmbedding = artifacts.weights.takePleEmbedding();
+    ELLM_CHECK(!hostMapped || !artifacts.pleEmbedding.has_value(),
+        "Host-mapped embedding tables require the ple_embedding.safetensors sidecar");
 
     std::optional<std::filesystem::path> const draftConfigPath = draftingConfig.has_value()
         ? std::optional<std::filesystem::path>{engineDir / "draft_config.json"}

@@ -63,15 +63,16 @@ shape:
 | CTA tile `(M,N,K)` | `16x128x64`, `32x128x64`, `64x128x64`, `128x128x64` | yes |
 | `num_stages` | `2`, `3`, `4` | yes |
 | `split_k` | selected values from `1`, `2`, `4` (in-kernel reduction for `>1`) | yes |
-| `group_size` | `128` only (kernel also supports `32`) | **yes — but fixed at 128 today** |
+| `group_size` | `128`, `32` | yes — one module set per group size (`_g32` suffix for 32) |
 | `swizzle` | grouped-M width | **no — runtime arg** |
 | `num_k_tiles` | `ceil(K/64)` | **no — dynamic in K** |
 
 The 16-entry set is listed in `_INT4_FP16_GEMM_CONFIGS` in
 `kernelSrcs/build_cutedsl.py` and mirrored by the plugin and C++ test X-macros.
-All use the single baked `group_size = 128` and names of the form
-`int4_fp16_gemm_<tile>_s<stages>_sk<splitk>`. Building another group size, or
-shipping both, would multiply the artifact count.
+Each config is baked once per group size in `_INT4_FP16_GROUP_SIZES` (128 and
+32): names of the form `int4_fp16_gemm_<tile>_s<stages>_sk<splitk>` for 128 and
+`..._g32` for 32 (32 GEMM functions in total). The plugin selects the set by its
+`group_size` attribute; the tactic table is shared.
 
 ### Important: split-K correctness contract
 
