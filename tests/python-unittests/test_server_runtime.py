@@ -749,9 +749,12 @@ def test_runtime_load_forwards_context_cache_config(monkeypatch, engine_type):
     llm = LLM.__new__(LLM)
     llm._layout = SimpleNamespace(engine_type=engine_type, has_speech=False)
     llm._bundle_dir = "/bundle"
+    llm._engine_dir = "/bundle"
     llm._media_dir = ""
     llm._model_dir = "/model"
     llm._draft_model_dir = "/draft"
+    llm._checkpoint_dir = "/model"
+    llm._draft_checkpoint_dir = "/draft"
     llm._draft_top_k = 4
     llm._draft_step = 3
     llm._verify_tree_size = 8
@@ -1103,7 +1106,8 @@ def test_capabilities_do_not_advertise_speech_under_ifb():
         video_capable = False
         has_draft_model = False
         context_cache_enabled = False
-        bundle_layout = SimpleNamespace(visual_dir=None,
+        bundle_layout = SimpleNamespace(engine_dir="/nonexistent",
+                                        visual_dir=None,
                                         audio_dir=None,
                                         has_speech=True,
                                         has_transcription=False)
@@ -1318,7 +1322,8 @@ def test_engine_refusal_maps_to_overload():
         video_capable = False
         has_draft_model = False
         context_cache_enabled = False
-        bundle_layout = SimpleNamespace(visual_dir=None,
+        bundle_layout = SimpleNamespace(engine_dir="/nonexistent",
+                                        visual_dir=None,
                                         audio_dir=None,
                                         has_speech=False,
                                         has_transcription=False)
