@@ -867,6 +867,7 @@ class LLM:
         context_cache_config: Optional[Union[ContextCacheConfig,
                                              Mapping[str, Any]]] = None,
         enable_in_flight_batching: bool = False,
+        host_embedding_tables: bool = False,
     ):
         if not model:
             raise ValueError("'model' must be provided")
@@ -899,6 +900,7 @@ class LLM:
         self._context_cache_config = ContextCacheConfig.parse(
             context_cache_config)
         self._enable_in_flight_batching = enable_in_flight_batching
+        self._host_embedding_tables = host_embedding_tables
         self._admission_sem = threading.Semaphore(1)
         self._infer_lock = threading.Lock()
         self._close_lock = threading.Lock()
@@ -965,6 +967,9 @@ class LLM:
         self._cache_dir = cache_root(cache_dir)
         self._model_dir = prepared.model_dir
         self._draft_model_dir = prepared.draft_model_dir
+        self._checkpoint_dir = "" if prepared.prebuilt else prepared.model_dir
+        self._draft_checkpoint_dir = ("" if prepared.prebuilt else
+                                      prepared.draft_model_dir)
         runtime_options = _resolve_spec_decode_runtime_options(
             prepared.bundle_dir,
             spec_method,
@@ -994,7 +999,8 @@ class LLM:
                              f"{self._layout.root!r}")
 
         self._bundle_dir = self._layout.root
-        builder_config = _read_bundle_builder_config(self._bundle_dir)
+        self._engine_dir = self._layout.engine_dir
+        builder_config = _read_bundle_builder_config(self._engine_dir)
         self._max_input_len = _engine_config_value(builder_config,
                                                    "max_input_len",
                                                    self._max_input_len)
@@ -1006,7 +1012,7 @@ class LLM:
             self._max_kv_cache_capacity)
 
         self._media_dir = self._layout.media_dir
-        logger.info("Using cached engine bundle: %s", self._bundle_dir)
+        logger.info("Using engine bundle: %s", self._bundle_dir)
 
     def _load_runtime(self) -> None:
         """Load checkpoint-backed weights once, then initialize the runtime."""
@@ -1021,6 +1027,9 @@ class LLM:
             reason = ifb_unsupported_reason(self._layout)
             if reason:
                 raise _ifb_unsupported_error(reason)
+        host_embedding_tables = getattr(self, "_host_embedding_tables", False)
+        if host_embedding_tables:
+            _check_host_embedding_tables(self._layout, self._engine_dir)
         if self._layout.engine_type == EngineType.SPEC_DECODE:
             logger.info(
                 "Speculative decoding enabled (top_k=%d, step=%d, "
@@ -1031,14 +1040,14 @@ class LLM:
                 self._dflash_block_size,
             )
             self._runtime = self._rt.LLMRuntime(
-                self._bundle_dir,
+                self._engine_dir,
                 self._media_dir,
                 {},
                 self._draft_top_k,
                 self._draft_step,
                 self._verify_tree_size,
-                self._model_dir,
-                self._draft_model_dir,
+                self._checkpoint_dir,
+                self._draft_checkpoint_dir,
                 context_cache_config,
                 self._dflash_block_size,
             )
@@ -1051,12 +1060,13 @@ class LLM:
             # speech_available).
             try:
                 self._engine = self._rt.RequestEngine(
-                    self._bundle_dir,
+                    self._engine_dir,
                     self._media_dir,
                     {},
-                    self._model_dir,
+                    self._checkpoint_dir,
                     context_cache_config,
                     max_batch_size=self._max_batch_size,
+                    host_embedding_tables=host_embedding_tables,
                 )
                 logger.info("In-flight batching enabled (max_batch_size=%d)",
                             self._max_batch_size)
@@ -1081,11 +1091,12 @@ class LLM:
         if (getattr(self, "_engine", None) is None
                 and getattr(self, "_runtime", None) is None):
             self._runtime = self._rt.LLMRuntime(
-                self._bundle_dir,
+                self._engine_dir,
                 self._media_dir,
                 {},
-                self._model_dir,
+                self._checkpoint_dir,
                 context_cache_config,
+                host_embedding_tables=host_embedding_tables,
             )
         if getattr(self, "_runtime", None) is not None:
             self._runtime.capture_decoding_cuda_graph()
@@ -1130,8 +1141,8 @@ class LLM:
 
         self._runtime.load_omni(self._layout.talker_dir,
                                 self._layout.code_predictor_dir,
-                                self._layout.code2wav_dir, self._bundle_dir,
-                                self._model_dir)
+                                self._layout.code2wav_dir, self._engine_dir,
+                                self._checkpoint_dir)
         logger.info("Omni audio output ready.")
 
     def _visual_config(self) -> dict:
@@ -2162,12 +2173,35 @@ class TTS:
         run_http_server(EngineClient(self, config), config)
 
 
+def _check_host_embedding_tables(layout, engine_dir: str) -> None:
+    if layout.engine_type == EngineType.SPEC_DECODE:
+        raise ValueError("--host-embedding-tables is not supported with "
+                         "speculative decoding")
+    if layout.has_speech:
+        raise ValueError(
+            "--host-embedding-tables does not support Qwen3-Omni audio "
+            "output: the Talker reads the Thinker embedding table on the GPU")
+    # Only an export with an embedding sidecar (--int8-embedding) can be
+    # host-mapped; engines this server builds from a checkpoint keep the
+    # tables checkpoint-backed.
+    if not os.path.isfile(os.path.join(engine_dir, "embedding.safetensors")):
+        raise ValueError(
+            "--host-embedding-tables needs an engine tree with the "
+            "embedding.safetensors sidecar, as written by an "
+            "--int8-embedding export")
+
+
 def load_model(**kwargs):
     """Select the model-specific runtime from provider checkpoint metadata."""
-    from .engine_build import resolve_model_dir
+    from .engine_build import prebuilt_bundle_layout, resolve_model_dir
 
     original_model = kwargs["model"]
-    resolved = resolve_model_dir(original_model, kwargs.get("cache_dir", ""))
+    prebuilt = prebuilt_bundle_layout(original_model)
+    if prebuilt is not None:
+        resolved = prebuilt.engine_dir
+    else:
+        resolved = resolve_model_dir(original_model,
+                                     kwargs.get("cache_dir", ""))
     with open(os.path.join(resolved, "config.json"), encoding="utf-8") as file:
         model_type = json.load(file).get("model_type")
     if model_type == "qwen3_tts":
@@ -2180,6 +2214,9 @@ def load_model(**kwargs):
         if kwargs.pop("speculative_config", None):
             raise ValueError(
                 "standalone TTS models do not support speculative decoding")
+        if kwargs.pop("host_embedding_tables", False):
+            raise ValueError(
+                "standalone TTS models have no embedding sidecar tables")
         if kwargs.pop("enable_in_flight_batching", False):
             raise _ifb_unsupported_error(
                 ifb_unsupported_reason(None, model_type=model_type))
@@ -2190,7 +2227,10 @@ def load_model(**kwargs):
                 "standalone TTS models do not use a KV context cache")
     else:
         runtime_class = LLM
-    runtime = runtime_class(**{**kwargs, "model": resolved})
+    # A pre-built tree is addressed by its root (llm/ next to visual/); the
+    # resolved llm dir only served the model-type lookup above.
+    model_arg = original_model if prebuilt is not None else resolved
+    runtime = runtime_class(**{**kwargs, "model": model_arg})
     runtime._model_id = _derive_model_id(original_model)
     return runtime
 
