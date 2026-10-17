@@ -212,6 +212,8 @@ bool Int4GroupwiseGemmPlugin::supportsFormatCombination(int32_t pos, DynamicPlug
             status &= tensorDesc.type == DataType::kHALF;
             status &= tensorDesc.format == PluginFormat::kLINEAR;
             status &= tensorDesc.dims.nbDims == 2;
+            // gemm_forward_cuda_new is compiled for one group size only.
+            status &= mGroupSize == trt_edgellm::kernel::kGemmGroupSize;
             status &= tensorDesc.dims.d[0] == mGemmK / mGroupSize;
             status &= tensorDesc.dims.d[1] == mGemmN;
             break;

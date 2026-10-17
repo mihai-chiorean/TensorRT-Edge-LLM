@@ -265,7 +265,21 @@ bool Int4GroupwiseGemmPluginV2::supportsFormatCombination(int32_t pos, DynamicPl
             status &= tensorDesc.type == DataType::kHALF;
             status &= tensorDesc.format == PluginFormat::kLINEAR;
             status &= tensorDesc.dims.nbDims == 2;
-            status &= tensorDesc.dims.d[0] == mGemmK / mGroupSize;
+#ifdef CUTE_DSL_INT4_FP16_GEMM_ENABLED
+            if (!cuteDslInt4GroupSizeSupported(mGroupSize))
+            {
+                // TRT only reports "no supported format combination" at failure; name the cause once.
+                static std::once_flag sUnsupportedGroupSizeFlag;
+                std::call_once(sUnsupportedGroupSizeFlag, [this] {
+                    LOG_ERROR(
+                        "Int4GroupwiseGemmPluginV2: group size %d is not served by the loaded CuTe DSL "
+                        "artifact (group 128, and 32 only when the artifact carries the _g32 variants)",
+                        mGroupSize);
+                });
+                status = false;
+            }
+#endif
+            status &= mGroupSize > 0 && tensorDesc.dims.d[0] == mGemmK / mGroupSize;
             status &= tensorDesc.dims.d[1] == mGemmN;
             break;
         }
@@ -373,7 +387,7 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
         // Fragment-layout contract for BOTH the GEMV and GEMM paths: input[1]
         // stores ceil(N/128) N tiles and K/64 K tiles. Both kernels predicate
         // the final N tile and require a complete K tile.
-        if (mGemmN <= 0 || mGemmK <= 0 || mGemmK % 64 != 0)
+        if (mGemmN <= 0 || mGemmK <= 0 || mGemmK % 64 != 0 || !cuteDslInt4GroupSizeSupported(mGroupSize))
         {
             return -1;
         }
@@ -385,14 +399,15 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
         // Threshold kGemvDispatchMaxM=4 (the tensor-core crossover); the kernel
         // itself supports up to kGemvMaxM=8.
         constexpr int32_t kGemvDispatchMaxM = 4;
-        if (M >= 1 && M <= kGemvDispatchMaxM && cuteDslInt4GemvSupported(M) && cuteDslInt4GemvLoadModules())
+        if (M >= 1 && M <= kGemvDispatchMaxM && cuteDslInt4GemvSupported(M) && cuteDslInt4GemvLoadModules(mGroupSize))
         {
-            return cuteDslInt4GemvLaunch(M, inputs[0], inputs[1], inputs[2], outputs[0], mGemmN, mGemmK, stream);
+            return cuteDslInt4GemvLaunch(
+                M, inputs[0], inputs[1], inputs[2], outputs[0], mGemmN, mGemmK, mGroupSize, stream);
         }
 #endif
 
 #ifdef CUTE_DSL_INT4_FP16_GEMM_ENABLED
-        if (!cuteDslInt4GemmLoadModules())
+        if (!cuteDslInt4GemmLoadModules(mGroupSize))
         {
             return -1;
         }
@@ -424,7 +439,7 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
         // input[1] is the fragment-layout weight buffer (INT8 bytes of the uint32
         // words); pass it straight through as mQW -- no repack, no cache.
         return cuteDslInt4GemmLaunch(v, inputs[0], inputs[1], inputs[2], outputs[0],
-            (v.splitK > 1) ? mLockWorkspace : nullptr, M, mGemmN, mGemmK, /*swizzle=*/1, stream);
+            (v.splitK > 1) ? mLockWorkspace : nullptr, M, mGemmN, mGemmK, mGroupSize, /*swizzle=*/1, stream);
 #else
         return -1;
 #endif

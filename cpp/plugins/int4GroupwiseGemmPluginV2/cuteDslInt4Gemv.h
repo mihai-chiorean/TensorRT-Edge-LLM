@@ -35,9 +35,10 @@ namespace plugins
 //! Largest M the GEMV kernel has a compiled variant for (one per M in [1, 8]).
 constexpr int32_t kGemvMaxM = 8;
 
-//! Load all GEMV kernel modules once (handle-checked). Returns false on any
-//! load failure (so the caller can fall back to the GEMM path).
-bool cuteDslInt4GemvLoadModules();
+//! Load the GEMV kernel modules baked for this group size (32 or 128) once
+//! (handle-checked). Returns false for an unsupported group size or on any load
+//! failure (so the caller can fall back to the GEMM path).
+bool cuteDslInt4GemvLoadModules(int32_t groupSize);
 
 //! True if a compiled GEMV variant exists for this M (1 <= M <= kGemvMaxM).
 bool cuteDslInt4GemvSupported(int32_t M);
@@ -45,9 +46,9 @@ bool cuteDslInt4GemvSupported(int32_t M);
 //! Launch the M-variant GEMV. A: [M,K] fp16; fragW: fragment-order uint32 weights
 //! (the plugin's INT8 input[1] reinterpreted); scales: [ceil(K/G),N] fp16; Out:
 //! [M,N] fp16 written directly. Single launch, no workspace/locks. Returns 0 on
-//! success, -1 if M is unsupported or a launch fails.
+//! success, -1 if M or groupSize is unsupported or a launch fails.
 int32_t cuteDslInt4GemvLaunch(int32_t M, void const* A, void const* fragW, void const* scales, void* Out, int32_t N,
-    int32_t K, cudaStream_t stream);
+    int32_t K, int32_t groupSize, cudaStream_t stream);
 
 } // namespace plugins
 } // namespace trt_edgellm
