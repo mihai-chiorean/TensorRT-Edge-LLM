@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "builder/hardwareCompatibility.h"
 #include "builder/visualBuilder.h"
 #include "common/fileUtils.h"
 #include "common/logger.h"

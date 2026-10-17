@@ -17,12 +17,13 @@
 
 #pragma once
 
+#include "builder/hardwareCompatibility.h"
+
 #include <NvInfer.h>
 #include <NvOnnxParser.h>
 #include <filesystem>
 #include <memory>
 #include <nlohmann/json.hpp>
-#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -97,20 +98,6 @@ std::pair<std::unique_ptr<nvinfer1::IBuilder>, std::unique_ptr<nvinfer1::INetwor
 //! @return Builder config with monitor memory flag enabled (TRT >= 10.6)
 std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(
     nvinfer1::IBuilder* builder, bool enableAliasedPluginIO = false);
-
-//! Engine hardware compatibility requested from the builder.
-enum class HardwareCompatibility : int32_t
-{
-    kNONE = 0,                    //!< Engine targets the build GPU only (TensorRT default)
-    kSAME_COMPUTE_CAPABILITY = 1, //!< Engine runs on any GPU with the build GPU's compute capability
-};
-
-//! Parse a hardware compatibility name: "none" or "same_compute_capability".
-//! @return The parsed value, or std::nullopt for an unknown name
-std::optional<HardwareCompatibility> parseHardwareCompatibility(std::string const& name) noexcept;
-
-//! @return The name accepted by parseHardwareCompatibility for this value
-char const* hardwareCompatibilityName(HardwareCompatibility compatibility) noexcept;
 
 //! Apply a hardware compatibility level to a builder config.
 //! kSAME_COMPUTE_CAPABILITY requires TensorRT >= 10.9 and is not available with TensorRT-RTX.
