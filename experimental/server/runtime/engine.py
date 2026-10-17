@@ -1959,7 +1959,8 @@ class LLM:
               enable_auto_tool_choice: bool = False,
               max_queued_requests: int = 16,
               queue_timeout: float = 600.0,
-              allowed_local_media_path: Optional[str] = None) -> None:
+              allowed_local_media_path: Optional[str] = None,
+              allow_remote_media: bool = False) -> None:
         """Start the HTTP frontend for this runtime."""
         from ..api.app import run_http_server
         from ..config import ApiConfig
@@ -1976,6 +1977,7 @@ class LLM:
             max_queued_requests=max_queued_requests,
             queue_timeout=queue_timeout,
             allowed_local_media_path=allowed_local_media_path or "",
+            allow_remote_media=allow_remote_media,
         )
         run_http_server(EngineClient(self, config), config)
 
@@ -2495,17 +2497,28 @@ def _load_image_buffers(rt_module,
     # Phase 1: reserve every image up front so the video sampler's budget is
     # order-independent ([image, video] and [video, image] behave identically).
     if budget is not None:
-        from ..media.video_sampling import estimate_image_tokens
+        from ..media.image_preflight import probe_image_dimensions
+        from ..media.video_sampling import (estimate_image_tokens,
+                                            estimate_image_tokens_for_size)
         for item in items:
             if item.get("type") not in ("image", "image_url"):
                 continue
             source = image_sources[id(item)]
+            do_resize = bool(item.get("do_resize", True))
             if isinstance(source, str) and os.path.isfile(source):
                 est = estimate_image_tokens(source,
                                             family,
                                             limits,
-                                            do_resize=bool(
-                                                item.get("do_resize", True)))
+                                            do_resize=do_resize)
+            elif isinstance(source, bytes):
+                # In-memory images were bounded by the preflight probe; the
+                # same header gives the size the C++ resize will see.
+                width, height = probe_image_dimensions(source)
+                est = estimate_image_tokens_for_size(width,
+                                                     height,
+                                                     family,
+                                                     limits,
+                                                     do_resize=do_resize)
             else:
                 est = int(limits.get("max_image_tokens_per_image", 0))
             image_upper += est

@@ -190,6 +190,7 @@ class OpenAIServingChat:
             enforce_local_media_policy(
                 request.messages,
                 self._config.allowed_local_media_path,
+                allow_remote=self._config.allow_remote_media,
             )
         except PermissionError as exc:
             raise ServerError(str(exc), status_code=403) from exc
