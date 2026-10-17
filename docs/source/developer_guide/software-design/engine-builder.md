@@ -401,6 +401,9 @@ to `llm_build` or `visual_build`:
   is not available with TensorRT-RTX. Build and run with the same TensorRT version and an Edge-LLM plugin library built
   for the target SM.
 - TensorRT drops cuBLAS, cuBLASLt and cuDNN as tactic sources at this level, which can cost performance.
+- `Int4MoePlugin`, `Nvfp4A16GemmPlugin` and `Nvfp4A16MoePlugin` size their Marlin workspace from the build GPU's
+  SM count and recompute the layout from the running GPU's SM count. Do not run an engine that contains them on a GPU
+  with more SMs than the build GPU. Building on the larger device, as above, meets this.
 - TensorRT's engine compatibility documentation lists hardware compatibility as unsupported on JetPack. Validate the
   engine on the target device.
 - Without this option, an engine built on a device with more SMs can still load on the smaller one, but TensorRT warns
