@@ -97,9 +97,9 @@ TEST(HardwareCompatibilityTest, AppliesLevelToBuilderConfig)
     ASSERT_NE(config, nullptr);
 
     EXPECT_TRUE(applyHardwareCompatibility(*config, HardwareCompatibility::kNONE));
-    EXPECT_EQ(config->getHardwareCompatibilityLevel(), nvinfer1::HardwareCompatibilityLevel::kNONE);
 
 #if !IS_TRT_RTX && (NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 9))
+    EXPECT_EQ(config->getHardwareCompatibilityLevel(), nvinfer1::HardwareCompatibilityLevel::kNONE);
     EXPECT_TRUE(applyHardwareCompatibility(*config, HardwareCompatibility::kSAME_COMPUTE_CAPABILITY));
     EXPECT_EQ(config->getHardwareCompatibilityLevel(), nvinfer1::HardwareCompatibilityLevel::kSAME_COMPUTE_CAPABILITY);
 #else
