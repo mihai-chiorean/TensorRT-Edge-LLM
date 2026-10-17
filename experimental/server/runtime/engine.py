@@ -47,6 +47,8 @@ from typing import (TYPE_CHECKING, Any, Dict, Iterator, List, Mapping,
                     Optional, Sequence, Tuple, Union)
 
 from ..config import DEFAULT_MAX_QUEUED_REQUESTS, ContextCacheConfig
+from ..parsing.terminal_tokens import (ended_on_stop, strip_terminal_tokens,
+                                       terminal_special_tokens)
 from ..parsing.tool_calling import (ToolConfig, inject_tool_requirement,
                                     parse_assistant_output,
                                     validate_tool_request)
@@ -1375,7 +1377,13 @@ class LLM:
         *,
         tool_parser: str = "auto",
         reasoning_parser: str = "none",
+        skip_special_tokens: bool = True,
     ) -> CompletionOutput:
+        if (tool_config.parse_output and not skip_special_tokens
+                and ended_on_stop(finish_reason)):
+            # The stop token that ended generation is still at the end.
+            text = strip_terminal_tokens(
+                text, terminal_special_tokens(self._model_dir))
         parsed = parse_assistant_output(
             text,
             tool_config,
@@ -1419,6 +1427,7 @@ class LLM:
             tool_config,
             tool_parser=tool_parser,
             reasoning_parser=reasoning_parser,
+            skip_special_tokens=params.skip_special_tokens,
         )
         if params.num_logprobs > 0 and response.logprobs:
             output.logprobs = _convert_logprobs(response.logprobs[0])

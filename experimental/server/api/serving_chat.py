@@ -26,6 +26,9 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from ..config import ApiConfig
 from ..parsing.reasoning import REASONING_PARSERS
+from ..parsing.terminal_tokens import (IM_END_TOKEN, TerminalTokenStripper,
+                                       ended_on_stop, strip_terminal_tokens,
+                                       terminal_special_tokens)
 from ..parsing.tool_calling import (StreamingAssistantOutputParser, ToolConfig,
                                     ToolProtocolError, _select_parser,
                                     list_tool_parsers, parse_assistant_output,
@@ -42,8 +45,6 @@ from .protocol import (ChatCompletionChoice, ChatCompletionMessage,
                        ChatCompletionStreamResponse, DeltaMessage, UsageInfo)
 
 logger = logging.getLogger("edgellm.server.chat")
-
-IM_END_TOKEN = "<|im_end|>"
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,7 @@ class OpenAIServingChat:
         self._client = engine_client
         self._config = config
         self._model_dir = engine_client.llm.model_dir
+        self._terminal_tokens = terminal_special_tokens(self._model_dir)
         # Fail during startup instead of after the first request.
         REASONING_PARSERS.resolve(config.reasoning_parser, self._model_dir)
         if config.tool_call_parser not in list_tool_parsers():
@@ -332,7 +334,12 @@ class OpenAIServingChat:
         except (KeyError, TypeError, ValueError) as exc:
             raise InvalidRequestError(str(exc)) from exc
 
-        output.text = output.text.replace(IM_END_TOKEN, "")
+        if (not prepared.tool_config.parse_output
+                and ended_on_stop(output.finish_reason)):
+            # Tool output was stripped before parsing, at the end of the
+            # generation rather than the end of the content.
+            output.text = strip_terminal_tokens(
+                output.text, self._terminal_tokens_for(prepared))
         message = ChatCompletionMessage(
             content=(output.text or None)
             if output.tool_calls else output.text,
@@ -388,7 +395,10 @@ class OpenAIServingChat:
                 finish_reason = delta.finish_reason or "stop"
 
         parsed = self.parse_output(
-            "".join(text_parts).replace(IM_END_TOKEN, ""), prepared)
+            strip_terminal_tokens(
+                "".join(text_parts),
+                self._terminal_tokens_for(prepared)
+                if ended_on_stop(finish_reason) else ()), prepared)
         response_id = f"chatcmpl-{uuid.uuid4().hex}"
         message = ChatCompletionMessage(
             content=parsed.content,
@@ -469,6 +479,7 @@ class OpenAIServingChat:
         parser = REASONING_PARSERS.resolve(prepared.reasoning_parser,
                                            self._model_dir)
         stream_parser = parser.stream() if parser else None
+        stripper = self.stream_stripper(prepared)
         completion_tokens = 0
         finish_reason = "stop"
         try:
@@ -486,8 +497,10 @@ class OpenAIServingChat:
                     delta.logprobs,
                     request.top_logprobs is not None,
                 ) if request.logprobs else None
-                if delta.text:
-                    text = delta.text.replace(IM_END_TOKEN, "")
+                text = stripper.feed(delta.text) if delta.text else ""
+                if delta.finished:
+                    text += stripper.flush(ended_on_stop(delta.finish_reason))
+                if text:
                     if stream_parser:
                         for parsed in stream_parser.feed(text):
                             message = DeltaMessage(
@@ -572,6 +585,7 @@ class OpenAIServingChat:
         prompt_tokens = None
         finish_reason = "stop"
         audio_id = f"audio-{response_id}"
+        stripper = self.stream_stripper(prepared)
         try:
             async for delta in self._client.stream_with_audio(
                     request.messages,
@@ -581,8 +595,10 @@ class OpenAIServingChat:
                 completion_tokens += len(delta.token_ids)
                 if delta.prompt_tokens is not None:
                     prompt_tokens = delta.prompt_tokens
-                if delta.text:
-                    text = delta.text.replace(IM_END_TOKEN, "")
+                text = stripper.feed(delta.text) if delta.text else ""
+                if delta.finished:
+                    text += stripper.flush(ended_on_stop(delta.finish_reason))
+                if text:
                     if stream_parser:
                         for parsed in stream_parser.feed(text):
                             field = ("reasoning_content" if parsed.field
@@ -656,6 +672,7 @@ class OpenAIServingChat:
         reasoning = REASONING_PARSERS.resolve(prepared.reasoning_parser,
                                               self._model_dir)
         reasoning_stream = reasoning.stream() if reasoning else None
+        stripper = self.stream_stripper(prepared)
         completion_tokens = 0
         prompt_tokens = None
         finish_reason = "stop"
@@ -707,8 +724,10 @@ class OpenAIServingChat:
                     delta.logprobs,
                     request.top_logprobs is not None,
                 ) if request.logprobs else None
-                if delta.text:
-                    text = delta.text.replace(IM_END_TOKEN, "")
+                text = stripper.feed(delta.text) if delta.text else ""
+                if delta.finished:
+                    text += stripper.flush(ended_on_stop(delta.finish_reason))
+                if text:
                     for message in messages_for(parser.feed(text)):
                         yield self._chunk(response_id,
                                           created,
@@ -780,6 +799,17 @@ class OpenAIServingChat:
             )
             yield _sse(usage_chunk)
         yield "data: [DONE]\n\n"
+
+    def _terminal_tokens_for(self, prepared: PreparedChatRequest):
+        """Skipped special tokens cannot be told apart from literal text, so
+        only ``<|im_end|>`` is removed then."""
+        if prepared.sampling.skip_special_tokens:
+            return (IM_END_TOKEN, )
+        return self._terminal_tokens
+
+    def stream_stripper(
+            self, prepared: PreparedChatRequest) -> TerminalTokenStripper:
+        return TerminalTokenStripper(self._terminal_tokens_for(prepared))
 
     def _tool_protocol_failure(self, response_id: str, created: int,
                                exc: ToolProtocolError) -> List[str]:
