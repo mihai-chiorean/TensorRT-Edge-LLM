@@ -527,7 +527,7 @@ TEST(Gemma4PleGatherKernelTest, Int8SidecarLoadsThroughPreprocessor)
     rt::Gemma4EmbeddingPreprocessor preprocessor(testDir, config, 1, 2, tensorMap, nullptr);
     rt::Tensor inputIds({1, 2}, rt::DeviceType::kGPU, DataType::kINT32);
     copyHostToDevice(inputIds, std::vector<int32_t>{0, 1});
-    preprocessor.embed(inputIds, nullptr);
+    preprocessor.embed(inputIds, nullptr, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     for (int32_t layerIdx = 0; layerIdx < kNumLayers; ++layerIdx)
@@ -540,6 +540,111 @@ TEST(Gemma4PleGatherKernelTest, Int8SidecarLoadsThroughPreprocessor)
             EXPECT_NEAR(__half2float(value), 1.0F, 1e-3F);
         }
     }
+    std::filesystem::remove_all(testDir);
+}
+
+// The host-mapped preprocessor gathers rows on the CPU and must produce the same bytes as the device-resident one,
+// including zero rows for placeholder and out-of-vocabulary ids.
+TEST(Gemma4PleGatherKernelTest, HostMappedInt8SidecarMatchesDeviceResident)
+{
+    constexpr int32_t kVocabSize = 7;
+    constexpr int32_t kNumLayers = 3;
+    constexpr int32_t kPleHiddenSize = 16;
+    constexpr int32_t kImageTokenId = 5;
+    std::vector<int8_t> table(static_cast<size_t>(kVocabSize) * kNumLayers * kPleHiddenSize);
+    for (size_t idx = 0; idx < table.size(); ++idx)
+    {
+        table[idx] = static_cast<int8_t>(static_cast<int32_t>((idx * 37) % 255) - 127);
+    }
+    std::vector<float> scales(static_cast<size_t>(kVocabSize) * kNumLayers);
+    for (size_t idx = 0; idx < scales.size(); ++idx)
+    {
+        scales[idx] = 0.001F * static_cast<float>(idx + 1);
+    }
+    rt::Tensor tableTensor({kVocabSize, kNumLayers * kPleHiddenSize}, rt::DeviceType::kCPU, DataType::kINT8, "weight");
+    rt::Tensor scalesTensor({kVocabSize, kNumLayers}, rt::DeviceType::kCPU, DataType::kFLOAT, "weight_scale");
+    std::memcpy(tableTensor.rawPointer(), table.data(), table.size() * sizeof(int8_t));
+    std::memcpy(scalesTensor.rawPointer(), scales.data(), scales.size() * sizeof(float));
+
+    auto const testDir = std::filesystem::temp_directory_path() / "trt_edgellm_int8_ple_host_mapped_test";
+    std::filesystem::remove_all(testDir);
+    std::filesystem::create_directories(testDir);
+    std::vector<rt::Tensor> sidecar;
+    sidecar.emplace_back(std::move(tableTensor));
+    sidecar.emplace_back(std::move(scalesTensor));
+    ASSERT_TRUE(rt::safetensors::saveSafetensors(testDir / "ple_embedding.safetensors", sidecar, nullptr));
+
+    rt::LLMEngineConfig config;
+    config.pleEnabled = true;
+    config.numPleInputs = kNumLayers;
+    config.pleHiddenSize = kPleHiddenSize;
+    config.imageTokenId = kImageTokenId;
+    std::vector<int32_t> const ids{3, kImageTokenId, 0, -1, kVocabSize, 6};
+    rt::Tensor inputIds({2, 3}, rt::DeviceType::kGPU, DataType::kINT32);
+    copyHostToDevice(inputIds, ids);
+
+    auto const run = [&](rt::EmbeddingTableResidency residency) -> std::vector<std::vector<half>> {
+        rt::TensorMap tensorMap;
+        rt::Gemma4EmbeddingPreprocessor preprocessor(
+            testDir, config, 2, 3, tensorMap, nullptr, std::nullopt, residency);
+        EXPECT_EQ(preprocessor.isHostResident(), residency == rt::EmbeddingTableResidency::kHostMapped);
+        preprocessor.embed(inputIds, ids.data(), nullptr);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<std::vector<half>> outputs;
+        for (int32_t layerIdx = 0; layerIdx < kNumLayers; ++layerIdx)
+        {
+            auto* output = tensorMap.get("ple_token_embeds_" + std::to_string(layerIdx));
+            if (output == nullptr)
+            {
+                ADD_FAILURE() << "missing ple_token_embeds_" << layerIdx;
+                return outputs;
+            }
+            outputs.push_back(copyDeviceToHost<half>(*output));
+        }
+        return outputs;
+    };
+    auto const device = run(rt::EmbeddingTableResidency::kDevice);
+    auto const host = run(rt::EmbeddingTableResidency::kHostMapped);
+    ASSERT_EQ(device.size(), host.size());
+    for (size_t layerIdx = 0; layerIdx < device.size(); ++layerIdx)
+    {
+        ASSERT_EQ(device[layerIdx].size(), static_cast<size_t>(ids.size()) * kPleHiddenSize);
+        EXPECT_EQ(
+            std::memcmp(device[layerIdx].data(), host[layerIdx].data(), device[layerIdx].size() * sizeof(half)), 0)
+            << "layer " << layerIdx;
+        // Row 0 is token 3, layer layerIdx; row 1 is the image placeholder and must be zero.
+        float const expected = static_cast<float>(table[(3 * kNumLayers + layerIdx) * kPleHiddenSize])
+            * scales[3 * kNumLayers + layerIdx];
+        EXPECT_EQ(__half2float(host[layerIdx][0]), __half2float(__float2half(expected)));
+        EXPECT_EQ(__half2float(host[layerIdx][kPleHiddenSize]), 0.0F);
+    }
+    std::filesystem::remove_all(testDir);
+}
+
+TEST(Gemma4PleGatherKernelTest, HostMappedPreprocessorRequiresHostTokenIds)
+{
+    constexpr int32_t kVocabSize = 3;
+    constexpr int32_t kNumLayers = 1;
+    constexpr int32_t kPleHiddenSize = 8;
+    rt::Tensor tableTensor({kVocabSize, kNumLayers * kPleHiddenSize}, rt::DeviceType::kCPU, DataType::kHALF, "weight");
+    auto const testDir = std::filesystem::temp_directory_path() / "trt_edgellm_ple_host_mapped_ids_test";
+    std::filesystem::remove_all(testDir);
+    std::filesystem::create_directories(testDir);
+    std::vector<rt::Tensor> sidecar;
+    sidecar.emplace_back(std::move(tableTensor));
+    ASSERT_TRUE(rt::safetensors::saveSafetensors(testDir / "ple_embedding.safetensors", sidecar, nullptr));
+
+    rt::LLMEngineConfig config;
+    config.pleEnabled = true;
+    config.numPleInputs = kNumLayers;
+    config.pleHiddenSize = kPleHiddenSize;
+    rt::TensorMap tensorMap;
+    rt::Gemma4EmbeddingPreprocessor preprocessor(
+        testDir, config, 1, 2, tensorMap, nullptr, std::nullopt, rt::EmbeddingTableResidency::kHostMapped);
+    rt::Tensor inputIds({1, 2}, rt::DeviceType::kGPU, DataType::kINT32);
+    copyHostToDevice(inputIds, std::vector<int32_t>{0, 1});
+    expectContains(thrownMessage([&]() { preprocessor.embed(inputIds, nullptr, nullptr); }),
+        "A host-mapped PLE table needs the token ids in host memory");
     std::filesystem::remove_all(testDir);
 }
 
@@ -572,7 +677,7 @@ TEST(Gemma4PleGatherKernelTest, Int8SidecarWithOneLayerLoadsThroughPreprocessor)
     rt::Gemma4EmbeddingPreprocessor preprocessor(testDir, config, 1, 2, tensorMap, nullptr);
     rt::Tensor inputIds({1, 2}, rt::DeviceType::kGPU, DataType::kINT32);
     copyHostToDevice(inputIds, std::vector<int32_t>{0, 1});
-    preprocessor.embed(inputIds, nullptr);
+    preprocessor.embed(inputIds, nullptr, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     for (int32_t layerIdx = 0; layerIdx < kNumLayers; ++layerIdx)

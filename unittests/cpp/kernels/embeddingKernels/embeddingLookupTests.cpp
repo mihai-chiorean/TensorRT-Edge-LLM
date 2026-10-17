@@ -399,6 +399,42 @@ TEST_F(EmbeddingLookupTest, Int8MultimodalLookupDequantizesRequestedRows)
     auto const expected = embeddingLookupMultimodalInt8Ref(inputIds, table, scales, multimodalIndices, kImageTokenId,
         imageEmbeds, kAudioTokenId, audioEmbeds, kBatchSize, kSeqLen, kVocabSize, kHiddenSize);
     EXPECT_TRUE(compareResults(expected, output, "INT8 Multimodal Embedding Lookup"));
+
+    // Staged rows: the table holds one pre-gathered row per position. Placeholder and out-of-range positions carry
+    // zero rows that the kernel never reads, and the output must be bit-identical to the resident lookup.
+    std::vector<int8_t> stagedRows(static_cast<size_t>(kSeqLen) * kHiddenSize, 0);
+    std::vector<float> stagedScales(kSeqLen, 0.0F);
+    for (int64_t pos = 0; pos < kSeqLen; ++pos)
+    {
+        int32_t const tokenId = inputIds[pos];
+        if (tokenId >= 0 && tokenId < kVocabSize)
+        {
+            std::copy_n(table.begin() + static_cast<int64_t>(tokenId) * kHiddenSize, kHiddenSize,
+                stagedRows.begin() + pos * kHiddenSize);
+            stagedScales[pos] = scales[tokenId];
+        }
+    }
+    rt::Tensor stagedRowsDevice({kSeqLen, kHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+    rt::Tensor stagedScalesDevice({kSeqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor stagedOutputDevice({kBatchSize, kSeqLen, kHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    copyHostToDevice(stagedRowsDevice, stagedRows);
+    copyHostToDevice(stagedScalesDevice, stagedScales);
+    kernel::embeddingLookup(inputIdsDevice, stagedRowsDevice, rt::OptionalInputTensor{stagedScalesDevice},
+        stagedOutputDevice, stream, rt::OptionalInputTensor{indicesDevice}, kImageTokenId,
+        rt::OptionalInputTensor{imageDevice}, kAudioTokenId, rt::OptionalInputTensor{audioDevice}, kVocabSize);
+    auto const stagedOutput = copyDeviceToHost<half>(stagedOutputDevice);
+    ASSERT_EQ(stagedOutput.size(), output.size());
+    EXPECT_EQ(std::memcmp(stagedOutput.data(), output.data(), output.size() * sizeof(half)), 0);
+}
+
+TEST_F(EmbeddingLookupTest, StagedRowsRejectRowCountMismatch)
+{
+    rt::Tensor inputIds({1, 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor rows({2, 16}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor output({1, 3, 16}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    EXPECT_THROW(kernel::embeddingLookup(inputIds, rows, std::nullopt, output, stream, std::nullopt, std::nullopt,
+                     std::nullopt, std::nullopt, std::nullopt, 100),
+        std::runtime_error);
 }
 
 // The lookup kernel assigns one warp per token and eight elements per lane, so hiddenSize must be a multiple of 8

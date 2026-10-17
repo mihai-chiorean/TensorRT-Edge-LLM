@@ -75,6 +75,7 @@ public:
         ContextCacheConfig contextCacheConfig;
         std::string checkpointDir;
         std::string draftCheckpointDir;
+        EmbeddingTableResidency embeddingTableResidency{EmbeddingTableResidency::kDevice};
         std::vector<int32_t> localRanks;
         std::unordered_map<int32_t, int32_t> localRankDevices;
         std::vector<cudaStream_t> localStreams;

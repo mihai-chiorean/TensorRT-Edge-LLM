@@ -129,6 +129,8 @@ void RuntimeCoordinator::validateParallelPlan()
         "Tensor-parallel speculative decoding is not supported.");
     ELLM_CHECK(mWorldSize == 1 || !mConfig.contextCacheConfig.enabled,
         "Tensor-parallel context reuse is not supported in the current multi-device runtime.");
+    ELLM_CHECK(mWorldSize == 1 || mConfig.embeddingTableResidency == EmbeddingTableResidency::kDevice,
+        "Host-mapped embedding tables are not supported with tensor parallelism.");
     if (mWorldSize > 1)
     {
         for (ParallelBackendHandles const& backendHandles : mConfig.backendHandles)
@@ -995,7 +997,7 @@ std::unique_ptr<LLMRankRuntime> RuntimeCoordinator::createRankRuntime(int32_t gl
     }
     return std::make_unique<LLMRankRuntime>(mConfig.engineDir, mConfig.multimodalEngineDir, mConfig.loraWeightsMap,
         mConfig.draftingConfig, mStreams[globalRank], mapping, *mTokenizer, *mChatTemplate, mConfig.contextCacheConfig,
-        mConfig.checkpointDir, mConfig.draftCheckpointDir);
+        mConfig.checkpointDir, mConfig.draftCheckpointDir, mConfig.embeddingTableResidency);
 }
 
 LLMGenerationRequest RuntimeCoordinator::prepareRequestState(LLMGenerationRequest const& request) const

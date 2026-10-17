@@ -35,12 +35,29 @@ EmbeddingPreprocessor::EmbeddingPreprocessor(EmbeddingData const& embedding, LLM
     , mOwnedIndices(Coords{config.maxPhysicalTokens}, DeviceType::kGPU, nvinfer1::DataType::kINT32,
           "EmbeddingPreprocessor::ownedMultimodalIndices")
 {
+    if (mEmbedding.isHostResident())
+    {
+        mStaging = std::make_unique<RowStaging>(
+            *mEmbedding.hostTable, config.maxPhysicalTokens, "EmbeddingPreprocessor::staging");
+    }
 }
 
-void EmbeddingPreprocessor::embed(Tensor const& tokenIds, OptionalInputTensor visionEmbeds,
+void EmbeddingPreprocessor::embed(Tensor const& tokenIds, int32_t const* hostTokenIds, OptionalInputTensor visionEmbeds,
     OptionalInputTensor audioEmbeds, PipelineIO& io, cudaStream_t stream, OptionalInputTensor precomputedIndices,
     int32_t const* imageBaseOffsets, int32_t const* audioBaseOffsets)
 {
+    Tensor const* table = &mEmbedding.table;
+    OptionalInputTensor scales = mEmbedding.scalesAsOptional();
+    std::optional<int32_t> stagedVocabSize;
+    if (mStaging)
+    {
+        ELLM_CHECK(hostTokenIds != nullptr, "A host-mapped embedding table needs the token ids in host memory");
+        mStaging->upload(hostTokenIds, tokenIds.getShape().volume(), stream);
+        table = &mStaging->rows();
+        scales = mStaging->scales();
+        stagedVocabSize = static_cast<int32_t>(mEmbedding.hostTable->rows());
+    }
+
     if (visionEmbeds.has_value() || audioEmbeds.has_value())
     {
         std::optional<int32_t> audioTokenOpt
@@ -60,12 +77,14 @@ void EmbeddingPreprocessor::embed(Tensor const& tokenIds, OptionalInputTensor vi
             mIndicesPtr = &mOwnedIndices;
         }
 
-        kernel::embeddingLookup(tokenIds, mEmbedding.table, mEmbedding.scalesAsOptional(), io.inputsEmbeds, stream,
-            std::optional{std::ref(*mIndicesPtr)}, imageTokenOpt, visionEmbeds, audioTokenOpt, audioEmbeds);
+        kernel::embeddingLookup(tokenIds, *table, scales, io.inputsEmbeds, stream,
+            std::optional{std::ref(*mIndicesPtr)}, imageTokenOpt, visionEmbeds, audioTokenOpt, audioEmbeds,
+            stagedVocabSize);
     }
     else
     {
-        kernel::embeddingLookup(tokenIds, mEmbedding.table, mEmbedding.scalesAsOptional(), io.inputsEmbeds, stream);
+        kernel::embeddingLookup(tokenIds, *table, scales, io.inputsEmbeds, stream, std::nullopt, std::nullopt,
+            std::nullopt, std::nullopt, std::nullopt, stagedVocabSize);
     }
 }
 
