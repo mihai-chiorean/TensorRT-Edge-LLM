@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "builder/hardwareCompatibility.h"
 #include "builder/llmBuilder.h"
 #include "common/cudaUtils.h"
 #include "common/fileUtils.h"

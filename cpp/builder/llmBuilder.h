@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "builder/builderUtils.h"
+#include "builder/hardwareCompatibility.h"
 #include "common/checkMacros.h"
 #include "common/pagedKvTypes.h"
 

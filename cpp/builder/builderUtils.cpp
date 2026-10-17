@@ -327,29 +327,6 @@ std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder
     return config;
 }
 
-std::optional<HardwareCompatibility> parseHardwareCompatibility(std::string const& name) noexcept
-{
-    if (name == "none")
-    {
-        return HardwareCompatibility::kNONE;
-    }
-    if (name == "same_compute_capability")
-    {
-        return HardwareCompatibility::kSAME_COMPUTE_CAPABILITY;
-    }
-    return std::nullopt;
-}
-
-char const* hardwareCompatibilityName(HardwareCompatibility compatibility) noexcept
-{
-    switch (compatibility)
-    {
-    case HardwareCompatibility::kNONE: return "none";
-    case HardwareCompatibility::kSAME_COMPUTE_CAPABILITY: return "same_compute_capability";
-    }
-    return "unknown";
-}
-
 bool applyHardwareCompatibility(nvinfer1::IBuilderConfig& config, HardwareCompatibility compatibility) noexcept
 {
     if (compatibility == HardwareCompatibility::kNONE)

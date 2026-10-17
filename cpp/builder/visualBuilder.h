@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "builder/builderUtils.h"
+#include "builder/hardwareCompatibility.h"
 #include "common/checkMacros.h"
 #include "multimodal/common/imageUtils.h"
 #include "multimodal/common/modelTypes.h"
