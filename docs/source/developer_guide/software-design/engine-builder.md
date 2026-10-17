@@ -383,6 +383,33 @@ Base and draft engine directories should be the same. This example uses EAGLE3; 
   --maxLoraRank=64
 ```
 
+### Building on a Larger Device With the Same SM
+
+When the target device runs out of memory while building, build on a larger device with the same compute capability,
+for example a Jetson AGX Orin for a Jetson Orin Nano (both SM 8.7), and pass `--hardwareCompatibility=same_compute_capability`
+to `llm_build` or `visual_build`:
+
+```bash
+./build/examples/llm/llm_build \
+  --onnxDir=onnx_models/qwen2.5-0.5b \
+  --engineDir=engines/qwen2.5-0.5b \
+  --maxBatchSize=1 \
+  --hardwareCompatibility=same_compute_capability
+```
+
+- This sets TensorRT's `HardwareCompatibilityLevel::kSAME_COMPUTE_CAPABILITY`, which needs TensorRT 10.9 or newer and
+  is not available with TensorRT-RTX. Build and run with the same TensorRT version and an Edge-LLM plugin library built
+  for the target SM.
+- TensorRT drops cuBLAS, cuBLASLt and cuDNN as tactic sources at this level, which can cost performance.
+- `Int4MoePlugin`, `Nvfp4A16GemmPlugin` and `Nvfp4A16MoePlugin` size their Marlin workspace from the build GPU's
+  SM count and recompute the layout from the running GPU's SM count. Do not run an engine that contains them on a GPU
+  with more SMs than the build GPU. Building on the larger device, as above, meets this.
+- TensorRT's engine compatibility documentation lists hardware compatibility as unsupported on JetPack. Validate the
+  engine on the target device.
+- Without this option, an engine built on a device with more SMs can still load on the smaller one, but TensorRT warns
+  `The current device only supports 8 multiprocessors but the engine file requires 16. Deadlocking is likely`. Do not
+  deploy such an engine.
+
 ---
 
 ## Best Practices
@@ -411,6 +438,7 @@ Base and draft engine directories should be the same. This example uses EAGLE3; 
 - Reduce `maxBatchSize`
 - Reduce `maxInputLen` and `maxKVCacheCapacity`
 - Use lighter quantization (INT4 instead of FP16)
+- Build on a larger device with the same compute capability (see [Building on a Larger Device With the Same SM](#building-on-a-larger-device-with-the-same-sm))
 
 **Build Takes Too Long**:
 - Expected: 1-20 minutes depending on model size
