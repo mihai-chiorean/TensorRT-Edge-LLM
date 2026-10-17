@@ -196,6 +196,7 @@ class ModelConfig:
     context_cache_config: ContextCacheConfig = field(
         default_factory=ContextCacheConfig)
     enable_in_flight_batching: bool = False
+    host_embedding_tables: bool = False
 
     def __post_init__(self) -> None:
         if (isinstance(self.engine_cache_max_size_gb, bool)
@@ -223,6 +224,7 @@ class ModelConfig:
             "speculative_config": self.speculative_config,
             "context_cache_config": self.context_cache_config,
             "enable_in_flight_batching": self.enable_in_flight_batching,
+            "host_embedding_tables": self.host_embedding_tables,
         }
 
 
@@ -378,6 +380,14 @@ def create_argument_parser() -> argparse.ArgumentParser:
         "standalone TTS deployment refuses the flag at startup, and a "
         "Qwen3-Omni bundle serves text only (its speech endpoints refuse).",
     )
+    model.add_argument(
+        "--host-embedding-tables",
+        action="store_true",
+        help="Keep the INT8 token-embedding and PLE sidecar tables mapped in "
+        "host memory instead of uploading them to the GPU. Needs a "
+        "pre-built engine tree exported with --int8-embedding; not "
+        "supported with speculative decoding or Qwen3-Omni audio output.",
+    )
     model.add_argument("--context-cache-max-records",
                        type=_non_negative_int,
                        default=1024)
@@ -440,6 +450,7 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
         speculative_config=speculative,
         context_cache_config=context_cache,
         enable_in_flight_batching=args.enable_in_flight_batching,
+        host_embedding_tables=args.host_embedding_tables,
     )
     api = ApiConfig(
         host=args.host,

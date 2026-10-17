@@ -1980,7 +1980,7 @@ def test_image_data_url_reaches_bytes_loader():
         }],
     }])
     assert len(buffers) == 1
-    assert Runtime.loaded == b"encoded-image"
+    assert Runtime.loaded == _png_bytes(64, 48)
 
 
 def test_seed_is_accepted_and_ignored(client_and_llm):
@@ -2585,7 +2585,6 @@ def test_context_cache_metrics_do_not_wait_for_a_running_request():
     with llm._infer_lock:
         assert llm.context_cache_metrics() == {"hit_sequences": 1}
     assert llm.context_cache_metrics() == {"hit_sequences": 2}
-    assert Runtime.loaded == _png_bytes(64, 48)
 
 
 # ---------------------------------------------------------------------------

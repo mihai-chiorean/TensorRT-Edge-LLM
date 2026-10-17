@@ -280,8 +280,9 @@ def test_prepare_model_serves_prebuilt_bundle_without_building(
 
 class _FakeRuntime:
 
-    def __init__(self, *args):
+    def __init__(self, *args, **kwargs):
         self.args = args
+        self.kwargs = kwargs
 
     def capture_decoding_cuda_graph(self):
         return True
@@ -445,6 +446,41 @@ def test_llm_loads_prebuilt_engine_tree_without_checkpoint(
     assert llm._runtime.args[:4] == (str(bundle / "llm"), str(bundle), {}, "")
     assert llm._max_input_len == 8192
     assert llm._max_kv_cache_capacity == 16384
+
+
+def _prebuilt_text_tree(root, with_embedding_sidecar):
+    (root / "llm").mkdir(parents=True)
+    (root / "llm" / "llm.engine").touch()
+    _write_json(root / "llm" / "config.json", _engine_config())
+    if with_embedding_sidecar:
+        (root / "llm" / "embedding.safetensors").touch()
+    return root
+
+
+def test_load_model_forwards_host_embedding_tables_for_a_sidecar_tree(
+        tmp_path, monkeypatch):
+    from experimental.server.runtime.engine import load_model
+
+    bundle = _prebuilt_text_tree(tmp_path / "engines", True)
+    monkeypatch.setattr("experimental.server.runtime.engine._import_runtime",
+                        lambda: _FakeBindings)
+    llm = load_model(model=str(bundle),
+                     cache_dir=str(tmp_path / "cache"),
+                     host_embedding_tables=True)
+    assert llm._runtime.kwargs == {"host_embedding_tables": True}
+
+
+def test_load_model_refuses_host_embedding_tables_without_a_sidecar(
+        tmp_path, monkeypatch):
+    from experimental.server.runtime.engine import load_model
+
+    bundle = _prebuilt_text_tree(tmp_path / "engines", False)
+    monkeypatch.setattr("experimental.server.runtime.engine._import_runtime",
+                        lambda: _FakeBindings)
+    with pytest.raises(ValueError, match="embedding.safetensors sidecar"):
+        load_model(model=str(bundle),
+                   cache_dir=str(tmp_path / "cache"),
+                   host_embedding_tables=True)
 
 
 def test_load_model_keeps_prebuilt_tree_root(tmp_path, monkeypatch):

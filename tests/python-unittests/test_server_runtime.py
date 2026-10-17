@@ -765,8 +765,9 @@ def test_runtime_load_forwards_context_cache_config(monkeypatch, engine_type):
 
     class Runtime:
 
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             captured["args"] = args
+            captured["kwargs"] = kwargs
 
         @staticmethod
         def capture_decoding_cuda_graph():
@@ -802,6 +803,83 @@ def test_runtime_load_forwards_context_cache_config(monkeypatch, engine_type):
     assert native.encoder_embedding_cache_budget_bytes == 512
     if engine_type == EngineType.SPEC_DECODE:
         assert captured["args"][-1] == 0
+        assert captured["kwargs"] == {}
+    else:
+        assert captured["kwargs"] == {"host_embedding_tables": False}
+
+
+def _host_tables_llm(monkeypatch,
+                     engine_type,
+                     captured,
+                     engine_dir="",
+                     has_speech=False):
+    from experimental.server.runtime import engine as engine_module
+
+    class Runtime:
+
+        def __init__(self, *args, **kwargs):
+            captured["kwargs"] = kwargs
+
+        @staticmethod
+        def capture_decoding_cuda_graph():
+            return True
+
+    monkeypatch.setattr(
+        engine_module, "_import_runtime",
+        lambda: SimpleNamespace(ContextCacheConfig=lambda: SimpleNamespace(),
+                                LLMRuntime=Runtime))
+    monkeypatch.setattr(engine_module, "_native_context_cache_config",
+                        lambda rt, config: config)
+    llm = LLM.__new__(LLM)
+    llm._layout = SimpleNamespace(engine_type=engine_type,
+                                  has_speech=has_speech)
+    llm._bundle_dir = llm._engine_dir = str(engine_dir)
+    llm._media_dir = ""
+    llm._model_dir = llm._draft_model_dir = ""
+    llm._checkpoint_dir = llm._draft_checkpoint_dir = ""
+    llm._draft_top_k = llm._draft_step = llm._verify_tree_size = 1
+    llm._dflash_block_size = 0
+    llm._context_cache_config = ContextCacheConfig()
+    llm._host_embedding_tables = True
+    return llm
+
+
+def test_runtime_load_forwards_host_embedding_tables(monkeypatch, tmp_path):
+    (tmp_path / "embedding.safetensors").write_bytes(b"")
+    captured = {}
+    llm = _host_tables_llm(monkeypatch, EngineType.LLM, captured, tmp_path)
+    llm._load_runtime()
+    assert captured["kwargs"] == {"host_embedding_tables": True}
+
+
+def test_host_embedding_tables_require_the_embedding_sidecar(
+        monkeypatch, tmp_path):
+    captured = {}
+    llm = _host_tables_llm(monkeypatch, EngineType.LLM, captured, tmp_path)
+    with pytest.raises(ValueError, match="embedding.safetensors sidecar"):
+        llm._load_runtime()
+    assert "kwargs" not in captured
+
+
+def test_host_embedding_tables_rejected_for_omni_audio(monkeypatch, tmp_path):
+    (tmp_path / "embedding.safetensors").write_bytes(b"")
+    captured = {}
+    llm = _host_tables_llm(monkeypatch,
+                           EngineType.LLM,
+                           captured,
+                           tmp_path,
+                           has_speech=True)
+    with pytest.raises(ValueError, match="Qwen3-Omni audio"):
+        llm._load_runtime()
+    assert "kwargs" not in captured
+
+
+def test_host_embedding_tables_rejected_for_speculative_decoding(monkeypatch):
+    captured = {}
+    llm = _host_tables_llm(monkeypatch, EngineType.SPEC_DECODE, captured)
+    with pytest.raises(ValueError, match="speculative decoding"):
+        llm._load_runtime()
+    assert "kwargs" not in captured
 
 
 # ---------------------------------------------------------------------------

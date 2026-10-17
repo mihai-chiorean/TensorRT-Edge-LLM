@@ -180,6 +180,13 @@ def test_encoder_embedding_budget_rejects_negative_values(capsys):
         ContextCacheConfig(encoder_embedding_cache_budget_bytes=2**63)
 
 
+def test_host_embedding_tables_flag_reaches_llm_kwargs():
+    assert not parse_server_config(["model"]).model.host_embedding_tables
+    config = parse_server_config(["model", "--host-embedding-tables"])
+    assert config.model.host_embedding_tables
+    assert config.model.llm_kwargs()["host_embedding_tables"] is True
+
+
 def test_context_cache_config_rejects_ignored_or_invalid_options():
     with pytest.raises(ServerConfigError, match="tuning requires"):
         ContextCacheConfig(recurrent_snapshot_pool_bytes=1)
