@@ -3356,7 +3356,9 @@ bool LLMRankRuntime::runBaseModelPrefill(
         "Ragged input embedding reshape failed");
     if (mDeployment.specConfig.has_value())
     {
-        check::check(mPipelineIO->baseHiddenStates.reshape({batch.shape.physicalTokens, baseOutputHiddenDim}),
+        int64_t const hiddenRows
+            = mDeployment.base.compactedPrefillHidden ? batch.shape.numSequences : batch.shape.physicalTokens;
+        check::check(mPipelineIO->baseHiddenStates.reshape({hiddenRows, baseOutputHiddenDim}),
             "Ragged base hidden-state output reshape failed");
     }
     check::check(mPipelineIO->outputHiddenStates.isEmpty()
