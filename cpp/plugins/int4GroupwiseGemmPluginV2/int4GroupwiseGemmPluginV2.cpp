@@ -19,8 +19,11 @@
 #include "common/cudaUtils.h"
 #include "cuteDslInt4Gemm.h"
 #include "cuteDslInt4Gemv.h"
+#include "int4GemvDispatchPolicy.h"
 
 #include <cassert>
+#include <cstdlib>
+#include <cstring>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <mutex>
@@ -59,6 +62,17 @@ inline int64_t leadingVolume(Dims const& dims)
 }
 
 #ifdef CUTE_DSL_INT4_FP16_GEMM_ENABLED
+// EDGELLM_INT4_M1_LARGE_GEMM=0 keeps every M = 1 launch on the GEMV, for A/B runs
+// against the same engine.
+bool m1LargeToGemmEnabled()
+{
+    static bool const sEnabled = [] {
+        char const* const value = std::getenv("EDGELLM_INT4_M1_LARGE_GEMM");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return sEnabled;
+}
+
 inline int64_t computeMaxLockWorkspaceBytes(
     DynamicPluginTensorDesc const* inputs, int32_t nbInputs, int32_t N, int32_t K)
 {
@@ -394,12 +408,11 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
 
         // Decode regime: route small M to the CUDA-core GEMV. At small M the GEMM's
         // tensor-core MMA underfills its M rows, so the GEMV is the better compute
-        // path. It reads the SAME fragment weight buffer (input[1]), so there is no
-        // extra weight and no repack -- one buffer serves prefill and decode.
-        // Threshold kGemvDispatchMaxM=4 (the tensor-core crossover); the kernel
-        // itself supports up to kGemvMaxM=8.
-        constexpr int32_t kGemvDispatchMaxM = 4;
-        if (M >= 1 && M <= kGemvDispatchMaxM && cuteDslInt4GemvSupported(M) && cuteDslInt4GemvLoadModules(mGroupSize))
+        // path except for the large group-32 weights int4RouteToGemv names. It reads
+        // the SAME fragment weight buffer (input[1]), so there is no extra weight and
+        // no repack -- one buffer serves prefill and decode.
+        if (int4RouteToGemv(M, mGemmN, mGemmK, mGroupSize, m1LargeToGemmEnabled()) && cuteDslInt4GemvSupported(M)
+            && cuteDslInt4GemvLoadModules(mGroupSize))
         {
             return cuteDslInt4GemvLaunch(
                 M, inputs[0], inputs[1], inputs[2], outputs[0], mGemmN, mGemmK, mGroupSize, stream);
