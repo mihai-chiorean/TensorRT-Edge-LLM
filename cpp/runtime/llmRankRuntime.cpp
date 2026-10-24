@@ -346,10 +346,11 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     EmbeddingTableResidency const embeddingTableResidency = artifacts.embeddingTableResidency;
     ELLM_CHECK(mEmbedding.isHostResident() == (embeddingTableResidency == EmbeddingTableResidency::kHostMapped),
         "Model artifacts disagree with their embedding table residency");
-    // Speculative and diffusion decoders embed ids sampled on the device, which a host-side gather cannot see.
-    ELLM_CHECK(
-        !mEmbedding.isHostResident() || (!mDeployment.specConfig.has_value() && !mDeployment.base.isDiffusionBackbone),
-        "Host-mapped embedding tables support vanilla decoding only");
+    ELLM_CHECK(!mEmbedding.isHostResident()
+            || supportsHostMappedEmbeddingTables(
+                mDeployment.specConfig.has_value() ? mDeployment.base.specDecodeType : SpecDecodeMode::kNONE,
+                mDeployment.base.isDiffusionBackbone),
+        "Host-mapped embedding tables support vanilla and Gemma 4 MTP decoding only");
     mCheckpointDir = std::move(artifacts.checkpointDir);
     mDraftCheckpointDir = std::move(artifacts.draftCheckpointDir);
     ExternalWeightManager preparedWeights = std::move(artifacts.weights);

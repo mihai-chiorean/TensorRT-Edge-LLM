@@ -66,7 +66,7 @@ public:
         std::string checkpointDir{};
         std::string draftCheckpointDir{};
         //! kHostMapped keeps the token-embedding and PLE sidecars mapped from their files and gathers rows on the
-        //! host each step; it needs single-rank vanilla decoding and the safetensors sidecars.
+        //! host each step; it needs single-rank vanilla or Gemma 4 MTP decoding and the safetensors sidecars.
         EmbeddingTableResidency embeddingTableResidency{EmbeddingTableResidency::kDevice};
         std::vector<int32_t> localRanks{};
         std::unordered_map<int32_t, int32_t> localRankDevices{};
