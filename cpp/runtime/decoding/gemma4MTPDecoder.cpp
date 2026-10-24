@@ -721,17 +721,11 @@ bool Gemma4MTPDecoder::runBaseVerification(DecodingInferenceContext& context)
         }
     }
 
-    check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape(
-                     {activeBatchSize, verifySize, mRuntime.deployment.base.hiddenSize}),
-        "Tensor reshape failed");
-    int32_t const* const hostVerifyIds = tokenIdsForHostTables(
-        mRuntime.preprocess.idsInput, activeBatchSize * verifySize, mHostVerifyTokenIds, context.stream);
-    embedTokens(mRuntime.preprocess.idsInput, hostVerifyIds, context.stream);
     if (mRuntime.deployment.base.pleEnabled)
     {
         check::check(mRuntime.preprocess.gemma4Ple,
             "Gemma4 MTP base config has PLE enabled but the Gemma4 PLE preprocessor is missing.");
-        mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, hostVerifyIds, context.stream);
+        mRuntime.preprocess.gemma4Ple->reshapeOutputsTokenMajor(activeBatchSize * verifySize);
     }
     check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape(
                      {activeBatchSize * verifySize, mRuntime.deployment.base.hiddenSize}),
@@ -772,6 +766,21 @@ bool Gemma4MTPDecoder::runBaseVerification(DecodingInferenceContext& context)
         = mRuntime.base.executor.prepare(kDecodeProfile, verifyDims, mRuntime.base.tensorMap, context.stream);
     if (verifySuccess)
     {
+        // The lookups follow the CPU-side preparation above because with host-mapped tables they wait for the
+        // draft chain to finish; preparing first keeps that work off the critical path.
+        check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape(
+                         {activeBatchSize, verifySize, mRuntime.deployment.base.hiddenSize}),
+            "Tensor reshape failed");
+        int32_t const* const hostVerifyIds = tokenIdsForHostTables(
+            mRuntime.preprocess.idsInput, activeBatchSize * verifySize, mHostVerifyTokenIds, context.stream);
+        embedTokens(mRuntime.preprocess.idsInput, hostVerifyIds, context.stream);
+        if (mRuntime.deployment.base.pleEnabled)
+        {
+            mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, hostVerifyIds, context.stream);
+        }
+        check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape(
+                         {activeBatchSize * verifySize, mRuntime.deployment.base.hiddenSize}),
+            "Tensor reshape failed");
         verifySuccess = mRuntime.base.executor.execute(context.stream);
     }
     if (!verifySuccess)
