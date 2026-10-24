@@ -16,6 +16,7 @@
  */
 
 #include "runtime/config/llmEngineConfig.h"
+#include "runtime/preprocess/hostRowTable.h"
 
 #include "common/pagedKvTypes.h"
 #include "common/specDecodeConfigUtils.h"
@@ -1459,4 +1460,14 @@ TEST(HostMappedEmbeddingPolicyTest, NeedsADecoderThatEmbedsHostIds)
     }
     EXPECT_FALSE(supportsHostMappedEmbeddingTables(SpecDecodeMode::kNONE, /*isDiffusionBackbone=*/true));
     EXPECT_FALSE(supportsHostMappedEmbeddingTables(SpecDecodeMode::kGemma4MTP, /*isDiffusionBackbone=*/true));
+}
+
+TEST(HostMappedEmbeddingPolicyTest, PleOnlyResidencyKeepsTheTokenTableOnTheDevice)
+{
+    EXPECT_FALSE(tokenTableHostMapped(EmbeddingTableResidency::kDevice));
+    EXPECT_FALSE(pleTableHostMapped(EmbeddingTableResidency::kDevice));
+    EXPECT_TRUE(tokenTableHostMapped(EmbeddingTableResidency::kHostMapped));
+    EXPECT_TRUE(pleTableHostMapped(EmbeddingTableResidency::kHostMapped));
+    EXPECT_FALSE(tokenTableHostMapped(EmbeddingTableResidency::kHostMappedPle));
+    EXPECT_TRUE(pleTableHostMapped(EmbeddingTableResidency::kHostMappedPle));
 }

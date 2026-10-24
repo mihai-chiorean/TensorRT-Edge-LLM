@@ -38,7 +38,22 @@ enum class EmbeddingTableResidency
 {
     kDevice,     //!< Tables are copied into device memory at load.
     kHostMapped, //!< Tables stay mapped from their files; each step gathers its rows on the CPU and uploads them.
+    //! Only the PLE table stays mapped; the token-embedding table is copied into device memory. A speculative
+    //! decoder that embeds its draft tokens from the token table then needs no host copy of them.
+    kHostMappedPle,
 };
+
+//! Whether the token-embedding table stays mapped in host memory under `residency`.
+constexpr bool tokenTableHostMapped(EmbeddingTableResidency residency) noexcept
+{
+    return residency == EmbeddingTableResidency::kHostMapped;
+}
+
+//! Whether the PLE table stays mapped in host memory under `residency`.
+constexpr bool pleTableHostMapped(EmbeddingTableResidency residency) noexcept
+{
+    return residency != EmbeddingTableResidency::kDevice;
+}
 
 //! A 2D table read in place from a read-only mapping of its safetensors file, with an optional FP32 scale tensor
 //! that has one row per table row. Rows are gathered on the CPU, so the table's pages stay file-backed and
