@@ -235,8 +235,8 @@ def _read_json(path: str) -> Dict[str, Any]:
 
 
 def _capabilities_for(llm: Union[LLM, TTS]) -> EngineCapabilities:
-    bundle_dir = llm.bundle_dir
     layout = llm.bundle_layout
+    bundle_dir = layout.engine_dir
     candidates = [
         os.path.join(bundle_dir, "config.json"),
         os.path.join(bundle_dir, "base_config.json"),
@@ -419,6 +419,13 @@ class EngineClient:
     @property
     def capabilities(self) -> EngineCapabilities:
         return self._capabilities
+
+    async def context_cache_metrics(self) -> Optional[Dict[str, Any]]:
+        """Context-cache counters for /health; None when reuse is off."""
+        getter = getattr(self._llm, "context_cache_metrics", None)
+        if getter is None:
+            return None
+        return await asyncio.to_thread(getter)
 
     @property
     def active_requests(self) -> int:

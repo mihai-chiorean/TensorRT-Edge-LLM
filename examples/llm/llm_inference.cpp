@@ -99,6 +99,7 @@ enum LLMInferenceOptionId : int
     CHECKPOINT_DIR = 931,
     DRAFT_CHECKPOINT_DIR = 932,
     TP_SIZE = 933,
+    HOST_EMBEDDING_TABLES = 934,
     VISUAL_PRUNE = 935,
     DART_REDUCTION_RATIO = 936,
     DART_PIVOT_IMAGE_TOKENS = 937,
@@ -159,6 +160,7 @@ struct LLMInferenceArgs
     SpecDecodeArgs specDecodeArgs;
     int32_t cpSpecVerifySize{0};
     rt::ContextCacheConfig contextCacheConfig;
+    rt::EmbeddingTableResidency embeddingTableResidency{rt::EmbeddingTableResidency::kDevice};
 
     // Qwen3-Omni audio output options
     bool enableAudioOutput{false};
@@ -405,6 +407,11 @@ void printUsage(char const* programName)
               << std::endl;
     std::cerr << "  --dflashBlockSize         DFlash/JetSpec proposal block size; 0 means infer from engine config"
               << std::endl;
+    std::cerr << "\nMemory Options:" << std::endl;
+    std::cerr << "  --hostEmbeddingTables     Keep the token-embedding and PLE sidecars mapped in host memory and"
+              << std::endl;
+    std::cerr << "                            gather rows on the CPU each step (vanilla decoding, single rank)"
+              << std::endl;
     std::cerr << "\nContext Reuse Options:" << std::endl;
     std::cerr << "  --enableContextReuse      Enable process-local content-addressed context reuse" << std::endl;
     std::cerr << "  --contextCacheMaxRecords  Maximum retained context records (default: 1024)" << std::endl;
@@ -496,6 +503,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"dsparkConfidenceThreshold", required_argument, 0, LLMInferenceOptionId::DSPARK_CONFIDENCE_THRESHOLD},
         {"dsparkMinProposalLen", required_argument, 0, LLMInferenceOptionId::DSPARK_MIN_PROPOSAL_LEN},
         {"dsparkMaxProposalLen", required_argument, 0, LLMInferenceOptionId::DSPARK_MAX_PROPOSAL_LEN},
+        {"hostEmbeddingTables", no_argument, 0, LLMInferenceOptionId::HOST_EMBEDDING_TABLES},
         {"enableContextReuse", no_argument, 0, LLMInferenceOptionId::ENABLE_CONTEXT_REUSE},
         {"contextCacheMaxRecords", required_argument, 0, LLMInferenceOptionId::CONTEXT_CACHE_MAX_RECORDS},
         {"contextCacheRecurrentSnapshotPoolBytes", required_argument, 0,
@@ -785,6 +793,9 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
+        case LLMInferenceOptionId::HOST_EMBEDDING_TABLES:
+            args.embeddingTableResidency = rt::EmbeddingTableResidency::kHostMapped;
+            break;
         case LLMInferenceOptionId::ENABLE_CONTEXT_REUSE: args.contextCacheConfig.enabled = true; break;
         case LLMInferenceOptionId::CONTEXT_CACHE_MAX_RECORDS:
             if (!parseNonNegativeIntegerOption("contextCacheMaxRecords", optarg, args.contextCacheConfig.maxRecords))
@@ -931,6 +942,15 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             return false;
         }
         LOG_INFO("Thinker-Talker streaming enabled (single CUDA stream)");
+    }
+
+    // The Talker reads the Thinker embedding table as a dense device tensor, which a host-mapped table has no copy of.
+    if (args.enableAudioOutput && args.embeddingTableResidency == rt::EmbeddingTableResidency::kHostMapped)
+    {
+        LOG_ERROR(
+            "--hostEmbeddingTables does not support Qwen3-Omni audio output: the Talker reads the Thinker "
+            "embedding table as a dense device tensor");
+        return false;
     }
 
     if (args.debug)
@@ -1155,6 +1175,7 @@ int runParallelInference(LLMInferenceArgs const& args,
         runtimeConfig.parallelConfig = parallelConfig;
         runtimeConfig.checkpointDir = args.checkpointDir;
         runtimeConfig.draftCheckpointDir = args.draftCheckpointDir;
+        runtimeConfig.embeddingTableResidency = args.embeddingTableResidency;
         if (launchMode == rt::ParallelLaunchMode::kMpi)
         {
             runtimeConfig.localRanks = {processRank};
@@ -1607,9 +1628,9 @@ int main(int argc, char* argv[])
         draftingConfig.dsparkMaxProposalLen = args.specDecodeArgs.dsparkMaxProposalLen;
         try
         {
-            runtime
-                = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, args.multimodalEngineDir, loraWeightsMap,
-                    draftingConfig, stream, args.contextCacheConfig, args.checkpointDir, args.draftCheckpointDir);
+            runtime = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, args.multimodalEngineDir,
+                loraWeightsMap, draftingConfig, stream, args.contextCacheConfig, args.checkpointDir,
+                args.draftCheckpointDir, args.embeddingTableResidency);
         }
         catch (std::exception const& e)
         {
@@ -1624,7 +1645,7 @@ int main(int argc, char* argv[])
         try
         {
             runtime = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, args.multimodalEngineDir,
-                loraWeightsMap, stream, args.contextCacheConfig, args.checkpointDir);
+                loraWeightsMap, stream, args.contextCacheConfig, args.checkpointDir, args.embeddingTableResidency);
         }
         catch (std::exception const& e)
         {

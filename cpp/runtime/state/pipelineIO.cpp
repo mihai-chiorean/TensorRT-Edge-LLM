@@ -36,61 +36,6 @@ namespace trt_edgellm
 namespace rt
 {
 
-AsyncHostStagingFence::AsyncHostStagingFence(AsyncHostStagingFence&& other) noexcept
-    : mEvent(std::exchange(other.mEvent, nullptr))
-    , mPending(std::exchange(other.mPending, false))
-{
-}
-
-AsyncHostStagingFence& AsyncHostStagingFence::operator=(AsyncHostStagingFence&& other) noexcept
-{
-    if (this != &other)
-    {
-        release();
-        mEvent = std::exchange(other.mEvent, nullptr);
-        mPending = std::exchange(other.mPending, false);
-    }
-    return *this;
-}
-
-AsyncHostStagingFence::~AsyncHostStagingFence()
-{
-    release();
-}
-
-void AsyncHostStagingFence::wait()
-{
-    if (mPending)
-    {
-        CUDA_CHECK(cudaEventSynchronize(mEvent));
-        mPending = false;
-    }
-}
-
-void AsyncHostStagingFence::record(cudaStream_t stream)
-{
-    if (mEvent == nullptr)
-    {
-        CUDA_CHECK(cudaEventCreateWithFlags(&mEvent, cudaEventDisableTiming));
-    }
-    CUDA_CHECK(cudaEventRecord(mEvent, stream));
-    mPending = true;
-}
-
-void AsyncHostStagingFence::release() noexcept
-{
-    if (mPending && mEvent != nullptr)
-    {
-        static_cast<void>(cudaEventSynchronize(mEvent));
-    }
-    if (mEvent != nullptr)
-    {
-        static_cast<void>(cudaEventDestroy(mEvent));
-    }
-    mEvent = nullptr;
-    mPending = false;
-}
-
 void allocateBasicIO(PipelineIO& io, int32_t maxBatch, int32_t vocabSize)
 {
     // Standard LLM logits are FLOAT for the sampler. DiffusionGemma keeps the

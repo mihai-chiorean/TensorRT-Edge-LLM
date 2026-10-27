@@ -22,6 +22,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Union
 
 _INT32_MAX = 2**31 - 1
 _INT64_MAX = 2**63 - 1
+_DEFAULT_ENCODER_EMBEDDING_CACHE_BUDGET_BYTES = 256 * 1024 * 1024
 
 
 class ServerConfigError(ValueError):
@@ -110,6 +111,11 @@ class ContextCacheConfig:
     max_records: int = 1024
     recurrent_snapshot_pool_bytes: int = 0
     partial_kv_snapshot_pool_bytes: int = 0
+    # Device budget for the content-addressed ViT/audio encoder output cache.
+    # Independent of `enabled` (the runtime keys it only on media engines);
+    # zero disables the cache.
+    encoder_embedding_cache_budget_bytes: int = (
+        _DEFAULT_ENCODER_EMBEDDING_CACHE_BUDGET_BYTES)
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -118,6 +124,7 @@ class ContextCacheConfig:
                 "max_records",
                 "recurrent_snapshot_pool_bytes",
                 "partial_kv_snapshot_pool_bytes",
+                "encoder_embedding_cache_budget_bytes",
         ):
             value = getattr(self, name)
             if isinstance(value,
@@ -128,7 +135,8 @@ class ContextCacheConfig:
             raise ServerConfigError(
                 "context_cache.max_records must fit a signed 32-bit integer")
         for name in ("recurrent_snapshot_pool_bytes",
-                     "partial_kv_snapshot_pool_bytes"):
+                     "partial_kv_snapshot_pool_bytes",
+                     "encoder_embedding_cache_budget_bytes"):
             if getattr(self, name) > _INT64_MAX:
                 raise ServerConfigError(
                     f"context_cache.{name} must fit a signed 64-bit integer")
@@ -157,6 +165,7 @@ class ContextCacheConfig:
             "max_records",
             "recurrent_snapshot_pool_bytes",
             "partial_kv_snapshot_pool_bytes",
+            "encoder_embedding_cache_budget_bytes",
         }
         unsupported = sorted(set(raw) - supported)
         if unsupported:
@@ -187,6 +196,7 @@ class ModelConfig:
     context_cache_config: ContextCacheConfig = field(
         default_factory=ContextCacheConfig)
     enable_in_flight_batching: bool = False
+    host_embedding_tables: bool = False
 
     def __post_init__(self) -> None:
         if (isinstance(self.engine_cache_max_size_gb, bool)
@@ -214,6 +224,7 @@ class ModelConfig:
             "speculative_config": self.speculative_config,
             "context_cache_config": self.context_cache_config,
             "enable_in_flight_batching": self.enable_in_flight_batching,
+            "host_embedding_tables": self.host_embedding_tables,
         }
 
 
@@ -231,6 +242,7 @@ class ApiConfig:
     max_queued_requests: int = DEFAULT_MAX_QUEUED_REQUESTS
     queue_timeout: float = 600.0
     allowed_local_media_path: str = ""
+    allow_remote_media: bool = False
     log_level: str = "info"
 
     def __post_init__(self) -> None:
@@ -283,7 +295,9 @@ def create_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "model",
-        help="Hugging Face model ID or local checkpoint directory",
+        help=("Hugging Face model ID, local checkpoint directory, or a "
+              "directory of pre-built engines (a builder bundle, or the "
+              "llm/ + visual/ tree written by llm_build and visual_build)"),
     )
 
     api = parser.add_argument_group("HTTP server")
@@ -300,13 +314,18 @@ def create_argument_parser() -> argparse.ArgumentParser:
     api.add_argument(
         "--tool-call-parser",
         choices=("auto", "generic", "hermes", "qwen3_xml", "nemotron",
-                 "openai"),
+                 "openai", "gemma4"),
         default="auto",
     )
     api.add_argument("--enable-auto-tool-choice", action="store_true")
     api.add_argument("--max-queued-requests", type=int, default=16)
     api.add_argument("--queue-timeout", type=float, default=600.0)
     api.add_argument("--allowed-local-media-path", default="")
+    api.add_argument(
+        "--allow-remote-media",
+        action="store_true",
+        help="Fetch http(s) media URLs on the server (off by default)",
+    )
     api.add_argument(
         "--log-level",
         choices=("debug", "info", "warning", "error"),
@@ -361,6 +380,14 @@ def create_argument_parser() -> argparse.ArgumentParser:
         "standalone TTS deployment refuses the flag at startup, and a "
         "Qwen3-Omni bundle serves text only (its speech endpoints refuse).",
     )
+    model.add_argument(
+        "--host-embedding-tables",
+        action="store_true",
+        help="Keep the INT8 token-embedding and PLE sidecar tables mapped in "
+        "host memory instead of uploading them to the GPU. Needs a "
+        "pre-built engine tree exported with --int8-embedding; not "
+        "supported with speculative decoding or Qwen3-Omni audio output.",
+    )
     model.add_argument("--context-cache-max-records",
                        type=_non_negative_int,
                        default=1024)
@@ -370,6 +397,14 @@ def create_argument_parser() -> argparse.ArgumentParser:
     model.add_argument("--context-cache-partial-kv-snapshot-pool-bytes",
                        type=_non_negative_int,
                        default=0)
+    model.add_argument(
+        "--context-cache-encoder-embedding-budget-bytes",
+        type=_non_negative_int,
+        default=_DEFAULT_ENCODER_EMBEDDING_CACHE_BUDGET_BYTES,
+        help="Device memory budget for the ViT/audio encoder output cache; "
+        "0 disables it. Applies to media engines regardless of "
+        "--enable-context-reuse.",
+    )
     return parser
 
 
@@ -394,6 +429,8 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
             args.context_cache_recurrent_snapshot_pool_bytes),
         partial_kv_snapshot_pool_bytes=(
             args.context_cache_partial_kv_snapshot_pool_bytes),
+        encoder_embedding_cache_budget_bytes=(
+            args.context_cache_encoder_embedding_budget_bytes),
     )
     model = ModelConfig(
         model=args.model,
@@ -413,6 +450,7 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
         speculative_config=speculative,
         context_cache_config=context_cache,
         enable_in_flight_batching=args.enable_in_flight_batching,
+        host_embedding_tables=args.host_embedding_tables,
     )
     api = ApiConfig(
         host=args.host,
@@ -425,6 +463,7 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
         max_queued_requests=args.max_queued_requests,
         queue_timeout=args.queue_timeout,
         allowed_local_media_path=args.allowed_local_media_path,
+        allow_remote_media=args.allow_remote_media,
         log_level=args.log_level,
     )
     return ServerConfig(model=model, api=api)

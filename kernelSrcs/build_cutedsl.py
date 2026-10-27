@@ -2064,30 +2064,36 @@ _INT4_FP16_GEMM_CONFIGS = [
 ]
 # Quant group size, baked per variant (it sizes the in-kernel scale smem, so it
 # is compile-time, not a runtime arg). The kernel supports {16, 32, 64, 128, ...}
-# (any multiple of 16 mutually divisible with bK=64); only G=128 is baked today.
-# Single knob: set to 32 to build G=32 instead, or make it a list + add a
-# `_g{gs}` suffix to the variant name below to ship both group sizes at once.
-_INT4_FP16_GEMM_GROUP_SIZE = 128
+# (any multiple of 16 mutually divisible with bK=64). Two group sizes are baked:
+# 128 (ModelOpt AWQ) keeps the unsuffixed names, 32 (symmetric Q4_0-style QAT
+# checkpoints) gets a `_g32` suffix. The plugin picks the set by its group_size.
+_INT4_FP16_GROUP_SIZES = (128, 32)
 
-for _bm, _stages, _sk in _INT4_FP16_GEMM_CONFIGS:
-    _tile_tag = f"{_bm}x128x64"
-    KERNEL_VARIANTS.append(
-        KernelVariant(
-            name=f"int4_fp16_gemm_{_tile_tag}_s{_stages}_sk{_sk}",
-            group="int4_fp16_gemm",
-            supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
-            script="int4_fp16_gemm_cutedsl/int4_fp16_gemm_ampere.py",
-            script_args=[
-                "--mnk", "256,512,1024",
-                "--cta_tiler_mnk", f"{_bm},128,64",
-                "--atom_layout_mnk", "1,4,1",
-                "--num_stages", str(_stages),
-                "--split_k", str(_sk),
-                "--group_size", str(_INT4_FP16_GEMM_GROUP_SIZE),
-                "--export_only",
-            ],
+
+def _int4_group_suffix(group_size):
+    return "" if group_size == 128 else f"_g{group_size}"
+
+
+for _gs in _INT4_FP16_GROUP_SIZES:
+    for _bm, _stages, _sk in _INT4_FP16_GEMM_CONFIGS:
+        _tile_tag = f"{_bm}x128x64"
+        KERNEL_VARIANTS.append(
+            KernelVariant(
+                name=f"int4_fp16_gemm_{_tile_tag}_s{_stages}_sk{_sk}{_int4_group_suffix(_gs)}",
+                group="int4_fp16_gemm",
+                supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+                script="int4_fp16_gemm_cutedsl/int4_fp16_gemm_ampere.py",
+                script_args=[
+                    "--mnk", "256,512,1024",
+                    "--cta_tiler_mnk", f"{_bm},128,64",
+                    "--atom_layout_mnk", "1,4,1",
+                    "--num_stages", str(_stages),
+                    "--split_k", str(_sk),
+                    "--group_size", str(_gs),
+                    "--export_only",
+                ],
+            )
         )
-    )
 
 # int4_fp16_gemm group also includes the W4A16 decode GEMV — a CUDA-core kernel
 # for the decode regime (small M) that consumes the SAME offline fragment weight
@@ -2097,26 +2103,26 @@ for _bm, _stages, _sk in _INT4_FP16_GEMM_CONFIGS:
 # M is the baked dimension — one exported function per M in [1, 8] (8 total); N/K
 # stay dynamic.  Single W=8 config; the kernel bakes SKU-independent per-M tuning
 # (UNROLL2/MINB from _gemv_defaults) — no device-SM detection, so the AOT config
-# is identical on every arch.  group_size 128 only for now (the kernel also
-# supports 32).
+# is identical on every arch.  Baked once per group size in _INT4_FP16_GROUP_SIZES
+# (same `_g32` suffix rule as the GEMM).
 # ---------------------------------------------------------------------------
 _INT4_FP16_GEMV_MAX_M = 8
-_INT4_FP16_GEMV_GROUP_SIZE = 128
 
-for _m in range(1, _INT4_FP16_GEMV_MAX_M + 1):
-    KERNEL_VARIANTS.append(
-        KernelVariant(
-            name=f"int4_fp16_gemv_m{_m}",
-            group="int4_fp16_gemm",
-            supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
-            script="int4_fp16_gemm_cutedsl/int4_fp16_gemv_ampere.py",
-            script_args=[
-                "--mnk", f"{_m},512,1024",
-                "--group_size", str(_INT4_FP16_GEMV_GROUP_SIZE),
-                "--export_only",
-            ],
+for _gs in _INT4_FP16_GROUP_SIZES:
+    for _m in range(1, _INT4_FP16_GEMV_MAX_M + 1):
+        KERNEL_VARIANTS.append(
+            KernelVariant(
+                name=f"int4_fp16_gemv_m{_m}{_int4_group_suffix(_gs)}",
+                group="int4_fp16_gemm",
+                supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+                script="int4_fp16_gemm_cutedsl/int4_fp16_gemv_ampere.py",
+                script_args=[
+                    "--mnk", f"{_m},512,1024",
+                    "--group_size", str(_gs),
+                    "--export_only",
+                ],
+            )
         )
-    )
 
 # All known group names (set for O(1) membership check — no manual maintenance
 # needed).
@@ -3087,7 +3093,9 @@ def _build_multi_sm(args, sms):
     arch = detect_arch(args.arch)
     artifact_tag = _multi_sm_artifact_tag(sms)
     output_dir = Path(args.output_dir) / arch / artifact_tag
-    host_target = default_host_target_for_arch(arch, host_arch)
+    host_target = getattr(args, "host_target", None)
+    if host_target is None:
+        host_target = default_host_target_for_arch(arch, host_arch)
     compile_gpu_arches = {sm: default_compile_gpu_arch(sm) for sm in sms}
     variants_by_sm = {sm: select_variants(sm, args.kernels) for sm in sms}
     groups_selected = sorted(
@@ -3253,7 +3261,9 @@ def build(args):
     is_cross_compile = arch != host_arch
     artifact_tag = sm_to_artifact_tag(sm)
     output_dir = Path(args.output_dir) / arch / artifact_tag
-    host_target = default_host_target_for_arch(arch, host_arch)
+    host_target = getattr(args, "host_target", None)
+    if host_target is None:
+        host_target = default_host_target_for_arch(arch, host_arch)
     compile_gpu_arch = default_compile_gpu_arch(sm)
     wrapper_gpu_arch = compile_gpu_arch
 
@@ -3465,6 +3475,14 @@ def main():
         help="Target CPU architecture for generated artifacts: x86_64 or aarch64 "
              "(default: auto-detect current host). If target differs from the build host, "
              "CuTe DSL emits cross-target host objects.",
+    )
+    p.add_argument(
+        "--host-target",
+        default=None,
+        help="CuTe DSL host target for the exported host-side code (e.g. linux-aarch64). "
+             "Default: derived from --arch and the build host. Set it explicitly to "
+             "rebuild one group into an artifact that was cross-compiled, so the "
+             "metadata stays compatible.",
     )
     p.add_argument(
         "-j", "--jobs",

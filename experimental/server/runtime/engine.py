@@ -47,7 +47,10 @@ from typing import (TYPE_CHECKING, Any, Dict, Iterator, List, Mapping,
                     Optional, Sequence, Tuple, Union)
 
 from ..config import DEFAULT_MAX_QUEUED_REQUESTS, ContextCacheConfig
-from ..parsing.tool_calling import (ToolConfig, parse_assistant_output,
+from ..parsing.terminal_tokens import (ended_on_stop, strip_terminal_tokens,
+                                       terminal_special_tokens)
+from ..parsing.tool_calling import (ToolConfig, inject_tool_requirement,
+                                    parse_assistant_output,
                                     validate_tool_request)
 from .engine_layout import BundleLayout, EngineType, inspect_bundle
 
@@ -72,6 +75,25 @@ _DEFAULT_VERIFY_TREE_SIZE = 60
 # Public data classes
 # ---------------------------------------------------------------------------
 
+#: Temperatures below this are greedy for the native sampler
+#: (cpp/sampler/samplingUtils.cpp).
+GREEDY_TEMPERATURE_EPSILON = 1e-3
+GREEDY_TOP_P = 1.0
+GREEDY_TOP_K = 1
+
+
+def normalize_greedy_sampling(temperature: float, top_p: float,
+                              top_k: int) -> Tuple[float, int]:
+    """Pin ``(top_p, top_k)`` to the greedy tuple for a greedy temperature.
+
+    OpenAI clients spell greedy decoding as ``temperature=0`` alone; the
+    native sampler otherwise rewrites the inconsistent triple and warns on
+    every request. Negative temperatures are left for the native range check.
+    """
+    if 0.0 <= temperature < GREEDY_TEMPERATURE_EPSILON:
+        return GREEDY_TOP_P, GREEDY_TOP_K
+    return top_p, top_k
+
 
 @dataclass
 class SamplingParams:
@@ -94,6 +116,10 @@ class SamplingParams:
     skip_special_tokens: bool = True
     reuse_context: bool = True
     cache_generated_tokens: bool = True
+
+    def __post_init__(self) -> None:
+        self.top_p, self.top_k = normalize_greedy_sampling(
+            self.temperature, self.top_p, self.top_k)
 
 
 @dataclass
@@ -165,6 +191,10 @@ class AudioParams:
     max_audio_length: int = 4096
     codec_chunk_frames: int = 10
     talker_prefill_threshold: int = 4
+
+    def __post_init__(self) -> None:
+        self.talker_top_p, self.talker_top_k = normalize_greedy_sampling(
+            self.talker_temperature, self.talker_top_p, self.talker_top_k)
 
 
 #: Sample rate of Omni Code2Wav PCM output.
@@ -794,6 +824,8 @@ def _native_context_cache_config(rt, config: ContextCacheConfig):
     native.max_records = config.max_records
     native.recurrent_snapshot_pool_bytes = config.recurrent_snapshot_pool_bytes
     native.partial_kv_snapshot_pool_bytes = config.partial_kv_snapshot_pool_bytes
+    native.encoder_embedding_cache_budget_bytes = (
+        config.encoder_embedding_cache_budget_bytes)
     return native
 
 
@@ -867,6 +899,7 @@ class LLM:
         context_cache_config: Optional[Union[ContextCacheConfig,
                                              Mapping[str, Any]]] = None,
         enable_in_flight_batching: bool = False,
+        host_embedding_tables: bool = False,
     ):
         if not model:
             raise ValueError("'model' must be provided")
@@ -899,6 +932,7 @@ class LLM:
         self._context_cache_config = ContextCacheConfig.parse(
             context_cache_config)
         self._enable_in_flight_batching = enable_in_flight_batching
+        self._host_embedding_tables = host_embedding_tables
         self._admission_sem = threading.Semaphore(1)
         self._infer_lock = threading.Lock()
         self._close_lock = threading.Lock()
@@ -965,6 +999,9 @@ class LLM:
         self._cache_dir = cache_root(cache_dir)
         self._model_dir = prepared.model_dir
         self._draft_model_dir = prepared.draft_model_dir
+        self._checkpoint_dir = "" if prepared.prebuilt else prepared.model_dir
+        self._draft_checkpoint_dir = ("" if prepared.prebuilt else
+                                      prepared.draft_model_dir)
         runtime_options = _resolve_spec_decode_runtime_options(
             prepared.bundle_dir,
             spec_method,
@@ -994,7 +1031,8 @@ class LLM:
                              f"{self._layout.root!r}")
 
         self._bundle_dir = self._layout.root
-        builder_config = _read_bundle_builder_config(self._bundle_dir)
+        self._engine_dir = self._layout.engine_dir
+        builder_config = _read_bundle_builder_config(self._engine_dir)
         self._max_input_len = _engine_config_value(builder_config,
                                                    "max_input_len",
                                                    self._max_input_len)
@@ -1006,7 +1044,7 @@ class LLM:
             self._max_kv_cache_capacity)
 
         self._media_dir = self._layout.media_dir
-        logger.info("Using cached engine bundle: %s", self._bundle_dir)
+        logger.info("Using engine bundle: %s", self._bundle_dir)
 
     def _load_runtime(self) -> None:
         """Load checkpoint-backed weights once, then initialize the runtime."""
@@ -1021,6 +1059,9 @@ class LLM:
             reason = ifb_unsupported_reason(self._layout)
             if reason:
                 raise _ifb_unsupported_error(reason)
+        host_embedding_tables = getattr(self, "_host_embedding_tables", False)
+        if host_embedding_tables:
+            _check_host_embedding_tables(self._layout, self._engine_dir)
         if self._layout.engine_type == EngineType.SPEC_DECODE:
             logger.info(
                 "Speculative decoding enabled (top_k=%d, step=%d, "
@@ -1031,14 +1072,14 @@ class LLM:
                 self._dflash_block_size,
             )
             self._runtime = self._rt.LLMRuntime(
-                self._bundle_dir,
+                self._engine_dir,
                 self._media_dir,
                 {},
                 self._draft_top_k,
                 self._draft_step,
                 self._verify_tree_size,
-                self._model_dir,
-                self._draft_model_dir,
+                self._checkpoint_dir,
+                self._draft_checkpoint_dir,
                 context_cache_config,
                 self._dflash_block_size,
             )
@@ -1051,12 +1092,13 @@ class LLM:
             # speech_available).
             try:
                 self._engine = self._rt.RequestEngine(
-                    self._bundle_dir,
+                    self._engine_dir,
                     self._media_dir,
                     {},
-                    self._model_dir,
+                    self._checkpoint_dir,
                     context_cache_config,
                     max_batch_size=self._max_batch_size,
+                    host_embedding_tables=host_embedding_tables,
                 )
                 logger.info("In-flight batching enabled (max_batch_size=%d)",
                             self._max_batch_size)
@@ -1081,11 +1123,12 @@ class LLM:
         if (getattr(self, "_engine", None) is None
                 and getattr(self, "_runtime", None) is None):
             self._runtime = self._rt.LLMRuntime(
-                self._bundle_dir,
+                self._engine_dir,
                 self._media_dir,
                 {},
-                self._model_dir,
+                self._checkpoint_dir,
                 context_cache_config,
+                host_embedding_tables=host_embedding_tables,
             )
         if getattr(self, "_runtime", None) is not None:
             self._runtime.capture_decoding_cuda_graph()
@@ -1130,8 +1173,8 @@ class LLM:
 
         self._runtime.load_omni(self._layout.talker_dir,
                                 self._layout.code_predictor_dir,
-                                self._layout.code2wav_dir, self._bundle_dir,
-                                self._model_dir)
+                                self._layout.code2wav_dir, self._engine_dir,
+                                self._checkpoint_dir)
         logger.info("Omni audio output ready.")
 
     def _visual_config(self) -> dict:
@@ -1303,6 +1346,8 @@ class LLM:
                               and self.has_draft_model and apply_chat_template
                               and add_generation_prompt)
         replay_tail_length = -1 if derive_replay_tail else 0
+        if apply_chat_template:
+            messages = inject_tool_requirement(messages, tool_config)
         cpp_messages, image_buffers = self._prepare_messages_for_runtime(
             messages)
 
@@ -1366,7 +1411,13 @@ class LLM:
         *,
         tool_parser: str = "auto",
         reasoning_parser: str = "none",
+        skip_special_tokens: bool = True,
     ) -> CompletionOutput:
+        if (tool_config.parse_output and not skip_special_tokens
+                and ended_on_stop(finish_reason)):
+            # The stop token that ended generation is still at the end.
+            text = strip_terminal_tokens(
+                text, terminal_special_tokens(self._model_dir))
         parsed = parse_assistant_output(
             text,
             tool_config,
@@ -1410,6 +1461,7 @@ class LLM:
             tool_config,
             tool_parser=tool_parser,
             reasoning_parser=reasoning_parser,
+            skip_special_tokens=params.skip_special_tokens,
         )
         if params.num_logprobs > 0 and response.logprobs:
             output.logprobs = _convert_logprobs(response.logprobs[0])
@@ -1914,7 +1966,8 @@ class LLM:
               enable_auto_tool_choice: bool = False,
               max_queued_requests: int = 16,
               queue_timeout: float = 600.0,
-              allowed_local_media_path: Optional[str] = None) -> None:
+              allowed_local_media_path: Optional[str] = None,
+              allow_remote_media: bool = False) -> None:
         """Start the HTTP frontend for this runtime."""
         from ..api.app import run_http_server
         from ..config import ApiConfig
@@ -1931,6 +1984,7 @@ class LLM:
             max_queued_requests=max_queued_requests,
             queue_timeout=queue_timeout,
             allowed_local_media_path=allowed_local_media_path or "",
+            allow_remote_media=allow_remote_media,
         )
         run_http_server(EngineClient(self, config), config)
 
@@ -2018,6 +2072,39 @@ class LLM:
         with self._infer_guard():
             self._ensure_open()
             return self._runtime.get_context_cache_metrics()
+
+    def context_cache_metrics(self) -> Optional[Dict[str, Any]]:
+        """Cumulative context-cache counters as plain values, or None.
+
+        Never waits for a running request: while one holds the runtime, the
+        last snapshot is returned (None before the first read).
+        """
+        if not self.context_cache_enabled or self._runtime is None:
+            return None
+        if not self._infer_lock.acquire(blocking=False):
+            return getattr(self, "_context_cache_snapshot", None)
+        try:
+            self._ensure_open()
+            metrics = self._runtime.get_context_cache_metrics()
+        finally:
+            self._infer_lock.release()
+        if metrics is None:
+            return None
+        result: Dict[str, Any] = {}
+        for name in dir(metrics):
+            if name.startswith("_"):
+                continue
+            value = getattr(metrics, name)
+            if callable(value):
+                continue
+            if hasattr(value, "free") and hasattr(value, "capacity"):
+                value = {
+                    "free": int(value.free),
+                    "capacity": int(value.capacity)
+                }
+            result[name] = value
+        self._context_cache_snapshot = result
+        return result
 
     @property
     def bundle_layout(self) -> BundleLayout:
@@ -2162,12 +2249,35 @@ class TTS:
         run_http_server(EngineClient(self, config), config)
 
 
+def _check_host_embedding_tables(layout, engine_dir: str) -> None:
+    if layout.engine_type == EngineType.SPEC_DECODE:
+        raise ValueError("--host-embedding-tables is not supported with "
+                         "speculative decoding")
+    if layout.has_speech:
+        raise ValueError(
+            "--host-embedding-tables does not support Qwen3-Omni audio "
+            "output: the Talker reads the Thinker embedding table on the GPU")
+    # Only an export with an embedding sidecar (--int8-embedding) can be
+    # host-mapped; engines this server builds from a checkpoint keep the
+    # tables checkpoint-backed.
+    if not os.path.isfile(os.path.join(engine_dir, "embedding.safetensors")):
+        raise ValueError(
+            "--host-embedding-tables needs an engine tree with the "
+            "embedding.safetensors sidecar, as written by an "
+            "--int8-embedding export")
+
+
 def load_model(**kwargs):
     """Select the model-specific runtime from provider checkpoint metadata."""
-    from .engine_build import resolve_model_dir
+    from .engine_build import prebuilt_bundle_layout, resolve_model_dir
 
     original_model = kwargs["model"]
-    resolved = resolve_model_dir(original_model, kwargs.get("cache_dir", ""))
+    prebuilt = prebuilt_bundle_layout(original_model)
+    if prebuilt is not None:
+        resolved = prebuilt.engine_dir
+    else:
+        resolved = resolve_model_dir(original_model,
+                                     kwargs.get("cache_dir", ""))
     with open(os.path.join(resolved, "config.json"), encoding="utf-8") as file:
         model_type = json.load(file).get("model_type")
     if model_type == "qwen3_tts":
@@ -2180,6 +2290,9 @@ def load_model(**kwargs):
         if kwargs.pop("speculative_config", None):
             raise ValueError(
                 "standalone TTS models do not support speculative decoding")
+        if kwargs.pop("host_embedding_tables", False):
+            raise ValueError(
+                "standalone TTS models have no embedding sidecar tables")
         if kwargs.pop("enable_in_flight_batching", False):
             raise _ifb_unsupported_error(
                 ifb_unsupported_reason(None, model_type=model_type))
@@ -2190,7 +2303,10 @@ def load_model(**kwargs):
                 "standalone TTS models do not use a KV context cache")
     else:
         runtime_class = LLM
-    runtime = runtime_class(**{**kwargs, "model": resolved})
+    # A pre-built tree is addressed by its root (llm/ next to visual/); the
+    # resolved llm dir only served the model-type lookup above.
+    model_arg = original_model if prebuilt is not None else resolved
+    runtime = runtime_class(**{**kwargs, "model": model_arg})
     runtime._model_id = _derive_model_id(original_model)
     return runtime
 
@@ -2253,14 +2369,18 @@ def _convert_messages_to_cpp(rt_module, messages: List[Dict[str, Any]]):
             call.type = str(raw_call.get("type") or "function")
             call.name = str(function.get("name") or "")
             arguments = function.get("arguments", {})
-            arguments_is_string = isinstance(arguments, str)
-            if arguments_is_string:
+            if isinstance(arguments, str) and arguments:
                 try:
-                    json.loads(arguments) if arguments else {}
+                    decoded = json.loads(arguments)
                 except json.JSONDecodeError as error:
                     raise ValueError(
                         f"Invalid JSON in assistant tool-call arguments: "
                         f"{error.msg}") from error
+                # OpenAI clients send arguments as a JSON string, while HF
+                # templates (Gemma 4 raises otherwise) expect a mapping.
+                if isinstance(decoded, dict):
+                    arguments = decoded
+            arguments_is_string = isinstance(arguments, str)
             call.arguments_is_string = arguments_is_string
             call.arguments = (arguments if arguments_is_string else json.dumps(
                 arguments, ensure_ascii=False, separators=(",", ":")))
@@ -2409,17 +2529,28 @@ def _load_image_buffers(rt_module,
     # Phase 1: reserve every image up front so the video sampler's budget is
     # order-independent ([image, video] and [video, image] behave identically).
     if budget is not None:
-        from ..media.video_sampling import estimate_image_tokens
+        from ..media.image_preflight import probe_image_dimensions
+        from ..media.video_sampling import (estimate_image_tokens,
+                                            estimate_image_tokens_for_size)
         for item in items:
             if item.get("type") not in ("image", "image_url"):
                 continue
             source = image_sources[id(item)]
+            do_resize = bool(item.get("do_resize", True))
             if isinstance(source, str) and os.path.isfile(source):
                 est = estimate_image_tokens(source,
                                             family,
                                             limits,
-                                            do_resize=bool(
-                                                item.get("do_resize", True)))
+                                            do_resize=do_resize)
+            elif isinstance(source, bytes):
+                # In-memory images were bounded by the preflight probe; the
+                # same header gives the size the C++ resize will see.
+                width, height = probe_image_dimensions(source)
+                est = estimate_image_tokens_for_size(width,
+                                                     height,
+                                                     family,
+                                                     limits,
+                                                     do_resize=do_resize)
             else:
                 est = int(limits.get("max_image_tokens_per_image", 0))
             image_upper += est

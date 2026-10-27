@@ -341,11 +341,11 @@ bool MTPDecoder::runDraftModelPrefill(DecodingInferenceContext& context)
     // Unified embedding lookup (text, or vision by inserting image embeddings at the image
     // placeholder positions). Reuses the shared EmbeddingPreprocessor, which generates the
     // multimodal indices on-device and shares this decoder's embedding table.
-    mRuntime.preprocess.embeddingPreprocessor.embed(
-        mRuntime.preprocess.idsInput, context.visualEmbeddings, std::nullopt, mRuntime.base.pipelineIO, context.stream);
+    mRuntime.preprocess.embeddingPreprocessor.embed(mRuntime.preprocess.idsInput, nullptr, context.visualEmbeddings,
+        std::nullopt, mRuntime.base.pipelineIO, context.stream);
     if (mRuntime.preprocess.gemma4Ple)
     {
-        mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, context.stream);
+        mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, nullptr, context.stream);
     }
 
     int32_t* ctxLenData = mRuntime.base.pipelineIO.hostContextLengths.dataPointer<int32_t>();
@@ -725,7 +725,7 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
         mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
     if (mRuntime.preprocess.gemma4Ple)
     {
-        mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, context.stream);
+        mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, nullptr, context.stream);
     }
 
     int32_t const selectTokenSize = activeBatchSize * mRuntime.deployment.specConfig->verifySize;
@@ -977,7 +977,7 @@ bool MTPDecoder::runDraftModelAcceptToken(DecodingInferenceContext& context)
         mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
     if (mRuntime.preprocess.gemma4Ple)
     {
-        mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, context.stream);
+        mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, nullptr, context.stream);
     }
 
     {

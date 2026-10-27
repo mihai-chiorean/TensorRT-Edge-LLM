@@ -17,6 +17,7 @@
 import asyncio
 import base64
 import json
+import struct
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,8 +25,14 @@ import pytest
 
 from experimental.server.api.errors import ServerOverloadedError
 from experimental.server.config import ApiConfig
-from experimental.server.runtime.engine import (CompletionOutput, LogprobEntry,
-                                                SamplingParams, StreamDelta)
+from experimental.server.runtime.engine import (AudioParams, CompletionOutput,
+                                                LogprobEntry, SamplingParams,
+                                                StreamDelta)
+
+
+def _png_bytes(width, height):
+    return (b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" +
+            struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
 
 
 def _create_app(llm, config=None):
@@ -1930,7 +1937,7 @@ def test_remote_media_fetch_is_size_bounded(monkeypatch):
             return "https://example.com/image.png"
 
         def read(self, _limit):
-            return b"oversized"
+            return _png_bytes(8, 8) + b"oversized"
 
     monkeypatch.setattr(media_source.urllib.request, "urlopen",
                         lambda *_args, **_kwargs: Response())
@@ -1940,7 +1947,8 @@ def test_remote_media_fetch_is_size_bounded(monkeypatch):
             "url": "https://example.com/image.png"
         },
     }
-    assert media_source.resolve_image_message(item) == b"oversized"
+    assert media_source.resolve_image_message(item) == (_png_bytes(8, 8) +
+                                                        b"oversized")
     with pytest.raises(ValueError, match="supported maximum"):
         media_source.fetch_remote_media("https://example.com/image.png",
                                         "image", 4)
@@ -1960,7 +1968,7 @@ def test_image_data_url_reaches_bytes_loader():
             cls.loaded = data
             return Image()
 
-    payload = base64.b64encode(b"encoded-image").decode()
+    payload = base64.b64encode(_png_bytes(64, 48)).decode()
     buffers = _load_image_buffers(Runtime, [{
         "role":
         "user",
@@ -1972,4 +1980,862 @@ def test_image_data_url_reaches_bytes_loader():
         }],
     }])
     assert len(buffers) == 1
-    assert Runtime.loaded == b"encoded-image"
+    assert Runtime.loaded == _png_bytes(64, 48)
+
+
+def test_seed_is_accepted_and_ignored(client_and_llm):
+    client, llm = client_and_llm
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "hi"
+                               }],
+                               "seed": 1234,
+                               "temperature": 0,
+                           })
+    assert response.status_code == 200
+    assert llm.last_sampling_params.top_k == 1
+
+
+def test_unknown_request_fields_are_ignored(client_and_llm):
+    client, _ = client_and_llm
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "hi"
+                               }],
+                               "timings_per_token": True,
+                               "chat_template_kwargs": {
+                                   "enable_thinking": False
+                               },
+                           })
+    assert response.status_code == 200
+
+
+def _gemma_tool():
+    return {
+        "type": "function",
+        "function": {
+            "name": "weather",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string"
+                    }
+                },
+            },
+        },
+    }
+
+
+def _gemma_client(tmp_path, eos_token=""):
+    """A client whose model directory identifies a Gemma 4 runtime bundle."""
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    from experimental.server.parsing.terminal_tokens import \
+        terminal_special_tokens
+
+    llm = _FakeLLM(tmp_path)
+    model_dir = tmp_path / "gemma-4-e4b"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model": "gemma4_text"}',
+                                           encoding="utf-8")
+    if eos_token:
+        (model_dir / "tokenizer_config.json").write_text(json.dumps(
+            {"eos_token": eos_token}),
+                                                         encoding="utf-8")
+    terminal_special_tokens.cache_clear()
+    llm.model_dir = str(model_dir)
+    config = ApiConfig(enable_auto_tool_choice=True)
+    return TestClient(_create_app(llm, config)), llm
+
+
+@pytest.mark.parametrize("output", [
+    "call:weather{location:Berkeley, California}",
+    "<|tool_call>call:unknown{}<tool_call|>It is sunny.",
+    "<|tool_call>call:weather{location:Paris}",
+])
+def test_gemma_tool_protocol_error_never_returns_model_content(
+        tmp_path, output):
+    client, llm = _gemma_client(tmp_path)
+
+    def complete(_request, _params, tool_config, **kwargs):
+        from experimental.server.parsing.tool_calling import \
+            parse_assistant_output
+        kwargs.pop("on_handle", None)
+        parse_assistant_output(output, tool_config, llm.model_dir, **kwargs)
+        raise AssertionError("unreachable")
+
+    llm._complete_prepared_request = complete
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Weather?"
+                               }],
+                               "tools": [_gemma_tool()],
+                           })
+    assert response.status_code == 502
+    error = response.json()["error"]
+    assert error["type"] == "tool_protocol_error"
+    assert error["code"] == "invalid_tool_call"
+    assert error["reason"] in {"malformed", "unauthorized", "incomplete"}
+    assert "Berkeley" not in response.text and "sunny" not in response.text
+
+
+def test_gemma_tool_stream_protocol_error_is_typed_and_terminal(tmp_path):
+    client, llm = _gemma_client(tmp_path)
+    pieces = [
+        "Sure. ", "<|tool_call>call:weather{location:Paris,",
+        "location:London}<tool_call|>", "Done."
+    ]
+
+    def stream(_messages, _params, **_kwargs):
+        for i, piece in enumerate(pieces):
+            yield StreamDelta(text=piece, token_ids=[i], prompt_tokens=7)
+        yield StreamDelta(text="", finished=True, finish_reason="stop")
+
+    llm.generate_stream = stream
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Weather?"
+                               }],
+                               "tools": [_gemma_tool()],
+                               "stream":
+                               True,
+                           })
+    assert response.status_code == 200
+    payloads = _sse_payloads(response)
+    contents = "".join(p["choices"][0]["delta"].get("content") or ""
+                       for p in payloads if p.get("choices"))
+    assert contents == "Sure. "
+    assert "Done." not in response.text and "Paris" not in response.text
+    errors = [p["error"] for p in payloads if "error" in p]
+    assert len(errors) == 1
+    assert errors[0]["type"] == "tool_protocol_error"
+    assert errors[0]["reason"] == "malformed"
+    finish = [
+        p["choices"][0]["finish_reason"] for p in payloads
+        if p.get("choices") and p["choices"][0].get("finish_reason")
+    ]
+    assert finish == ["error"]
+    assert response.text.rstrip().endswith("data: [DONE]")
+
+
+def test_gemma_tool_stream_emits_call_and_drops_trailing_prose(tmp_path):
+    client, llm = _gemma_client(tmp_path)
+    pieces = [
+        "call:weat", "her{location:<|\"|>Berkeley, CA<|\"|>}",
+        "I already looked it up."
+    ]
+
+    def stream(_messages, _params, **_kwargs):
+        for i, piece in enumerate(pieces):
+            yield StreamDelta(text=piece, token_ids=[i], prompt_tokens=7)
+        yield StreamDelta(text="", finished=True, finish_reason="stop")
+
+    llm.generate_stream = stream
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Weather?"
+                               }],
+                               "tools": [_gemma_tool()],
+                               "tool_choice":
+                               "required",
+                               "stream":
+                               True,
+                           })
+    assert response.status_code == 200
+    payloads = _sse_payloads(response)
+    calls = [
+        p["choices"][0]["delta"]["tool_calls"] for p in payloads
+        if p.get("choices") and p["choices"][0]["delta"].get("tool_calls")
+    ]
+    assert calls[0][0]["function"]["name"] == "weather"
+    assert json.loads(calls[1][0]["function"]["arguments"]) == {
+        "location": "Berkeley, CA"
+    }
+    assert "already looked" not in response.text
+    finish = [
+        p["choices"][0]["finish_reason"] for p in payloads
+        if p.get("choices") and p["choices"][0].get("finish_reason")
+    ]
+    assert finish == ["tool_calls"]
+
+
+@pytest.mark.parametrize("pieces", [
+    ["<|tool_call>call:weather{location:Paris"],
+    ["call:weather{location:Paris,", "location:London}"],
+])
+def test_gemma_anthropic_stream_reports_tool_protocol_error(tmp_path, pieces):
+    client, llm = _gemma_client(tmp_path)
+
+    def stream(_messages, _params, **_kwargs):
+        for i, piece in enumerate(pieces):
+            yield StreamDelta(text=piece, token_ids=[i], prompt_tokens=7)
+        yield StreamDelta(text="", finished=True, finish_reason="stop")
+
+    llm.generate_stream = stream
+    response = client.post("/v1/messages",
+                           json={
+                               "model":
+                               "fake-model",
+                               "max_tokens":
+                               64,
+                               "stream":
+                               True,
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Weather?"
+                               }],
+                               "tools": [{
+                                   "name": "weather",
+                                   "input_schema": {
+                                       "type": "object"
+                                   },
+                               }],
+                           })
+    assert response.status_code == 200
+    assert "event: error" in response.text
+    assert "invalid tool call" in response.text
+    assert "Paris" not in response.text and "London" not in response.text
+    assert "message_stop" not in response.text
+
+
+def test_gemma_tool_stream_closes_generation_on_protocol_error(tmp_path):
+    client, llm = _gemma_client(tmp_path)
+    closed = []
+
+    def stream(_messages, _params, **_kwargs):
+        try:
+            yield StreamDelta(text="<|tool_call>call:weather{location:Paris,",
+                              token_ids=[0],
+                              prompt_tokens=7)
+            yield StreamDelta(text="location:London}<tool_call|>",
+                              token_ids=[1])
+            for i in range(2, 1000):
+                yield StreamDelta(text=" more", token_ids=[i])
+            yield StreamDelta(text="", finished=True, finish_reason="stop")
+        finally:
+            closed.append(True)
+
+    llm.generate_stream = stream
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Weather?"
+                               }],
+                               "tools": [_gemma_tool()],
+                               "stream":
+                               True,
+                           })
+    assert response.status_code == 200
+    assert "tool_protocol_error" in response.text
+    assert closed == [True]
+
+
+def test_tool_response_keeps_terminal_spelling_in_content(tmp_path):
+    client, llm = _gemma_client(tmp_path, eos_token="<eos>")
+    llm._complete_prepared_request = lambda *_args, **_kwargs: (
+        CompletionOutput(text="Token: <eos>",
+                         token_ids=[1, 2],
+                         prompt_tokens=7,
+                         finish_reason="tool_calls",
+                         tool_calls=[{
+                             "id": "call_1",
+                             "type": "function",
+                             "function": {
+                                 "name": "weather",
+                                 "arguments": '{"location": "Paris"}',
+                             },
+                         }]))
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Weather?"
+                               }],
+                               "tools": [_gemma_tool()],
+                           })
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == (
+        "Token: <eos>")
+
+
+def test_plain_chat_response_keeps_literal_terminal_spelling(tmp_path):
+    # Without tools the runtime skips special tokens, so this "<turn|>" is
+    # literal text; only <|im_end|> is still removed.
+    client, llm = _gemma_client(tmp_path, eos_token="<turn|>")
+    llm.next_text = "Gemma ends a turn with <turn|>.<|im_end|>"
+    response = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{
+            "role": "user",
+            "content": "How?"
+        }]})
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == (
+        "Gemma ends a turn with <turn|>.")
+
+
+def test_tool_stream_removes_split_terminal_token(tmp_path):
+    client, llm = _gemma_client(tmp_path, eos_token="<turn|>")
+    pieces = ["The cow ", "says moo<", "turn", "|>"]
+
+    def stream(_messages, _params, **_kwargs):
+        for i, piece in enumerate(pieces):
+            yield StreamDelta(text=piece, token_ids=[i], prompt_tokens=7)
+        yield StreamDelta(text="", finished=True, finish_reason="stop")
+
+    llm.generate_stream = stream
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Cow?"
+                               }],
+                               "tools": [_gemma_tool()],
+                               "stream": True,
+                           })
+    assert response.status_code == 200
+    payloads = _sse_payloads(response)
+    contents = [
+        p["choices"][0]["delta"].get("content") for p in payloads
+        if p.get("choices") and p["choices"][0]["delta"].get("content")
+    ]
+    assert "".join(contents) == "The cow says moo"
+    assert len(contents) >= 2
+    assert "<turn|>" not in response.text
+
+
+def test_tool_stream_keeps_terminal_spelling_inside_arguments(tmp_path):
+    client, llm = _gemma_client(tmp_path, eos_token="<eos>")
+    pieces = [
+        "<|tool_call>call:weather{location:<|\"|>x<eos",
+        ">y<|\"|>}<tool_call|>", "<eos>"
+    ]
+
+    def stream(_messages, _params, **_kwargs):
+        for i, piece in enumerate(pieces):
+            yield StreamDelta(text=piece, token_ids=[i], prompt_tokens=7)
+        yield StreamDelta(text="", finished=True, finish_reason="stop")
+
+    llm.generate_stream = stream
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Weather?"
+                               }],
+                               "tools": [_gemma_tool()],
+                               "stream":
+                               True,
+                           })
+    assert response.status_code == 200
+    arguments = "".join(
+        call["function"].get("arguments") or ""
+        for p in _sse_payloads(response) if p.get("choices")
+        for call in p["choices"][0]["delta"].get("tool_calls") or [])
+    assert json.loads(arguments) == {"location": "x<eos>y"}
+
+
+def test_streaming_audio_text_keeps_terminal_spelling_between_deltas(
+        client_and_llm):
+    client, llm = client_and_llm
+
+    def stream(_messages, _params, **_kwargs):
+        yield StreamDelta(text="Token: <|im_end|>",
+                          token_ids=[1],
+                          prompt_tokens=7)
+        yield StreamDelta(text=" is the spelling.<|im_end|>",
+                          token_ids=[2],
+                          prompt_tokens=7,
+                          finished=True,
+                          finish_reason="stop")
+
+    llm.generate_stream_with_audio = stream
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Spell it"
+                               }],
+                               "modalities": ["text", "audio"],
+                               "audio": {
+                                   "voice": "Ryan",
+                                   "format": "pcm16"
+                               },
+                               "stream":
+                               True,
+                           })
+    assert response.status_code == 200, response.text
+    content = "".join(p["choices"][0]["delta"].get("content") or ""
+                      for p in _sse_payloads(response) if p.get("choices"))
+    assert content == "Token: <|im_end|> is the spelling."
+
+
+def test_tool_output_strips_terminal_tokens_before_parsing(tmp_path):
+    from experimental.server.parsing.terminal_tokens import \
+        terminal_special_tokens
+    from experimental.server.parsing.tool_calling import validate_tool_request
+    from experimental.server.runtime.engine import LLM
+
+    model_dir = tmp_path / "gemma-4-e4b"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model": "gemma4_text"}',
+                                           encoding="utf-8")
+    (model_dir / "tokenizer_config.json").write_text(
+        '{"eos_token": "<eos>", "eot_token": "<turn|>"}', encoding="utf-8")
+    terminal_special_tokens.cache_clear()
+    llm = LLM.__new__(LLM)
+    llm._model_dir = str(model_dir)
+    config = validate_tool_request([{
+        "role": "user",
+        "content": "Weather?"
+    }], [_gemma_tool()], "auto")
+
+    def parse(text, skip_special_tokens=False, finish_reason="stop"):
+        return llm._parse_generation_output(
+            text, [1, 2],
+            7,
+            finish_reason,
+            config,
+            skip_special_tokens=skip_special_tokens)
+
+    assert parse("Moo.<turn|>").text == "Moo."
+    # Skipped special tokens leave only literal spellings in the text.
+    assert parse("The stop token is <eos>",
+                 skip_special_tokens=True).text == "The stop token is <eos>"
+    # A length-limited generation did not end on a stop token.
+    assert parse("The stop token is <eos>",
+                 finish_reason="length").text == "The stop token is <eos>"
+    called = parse("Token: <eos><|tool_call>call:weather{location:Paris}"
+                   "<tool_call|><eos>")
+    assert called.text == "Token: <eos>"
+    assert called.tool_calls[0]["function"]["name"] == "weather"
+
+
+@pytest.mark.parametrize("finish_reason,expected", [
+    ("stop", "The stop token is "),
+    ("length", "The stop token is <eos>"),
+])
+def test_tool_stream_strips_terminal_tokens_only_after_a_stop(
+        tmp_path, finish_reason, expected):
+    client, llm = _gemma_client(tmp_path, eos_token="<eos>")
+
+    def stream(_messages, _params, **_kwargs):
+        yield StreamDelta(text="The stop token is <eos>",
+                          token_ids=[0],
+                          prompt_tokens=7)
+        yield StreamDelta(text="", finished=True, finish_reason=finish_reason)
+
+    llm.generate_stream = stream
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Which token?"
+                               }],
+                               "tools": [_gemma_tool()],
+                               "stream":
+                               True,
+                           })
+    assert response.status_code == 200
+    content = "".join(p["choices"][0]["delta"].get("content") or ""
+                      for p in _sse_payloads(response) if p.get("choices"))
+    assert content == expected
+
+
+# ---------------------------------------------------------------------------
+# Greedy sampling normalization
+# ---------------------------------------------------------------------------
+
+
+def test_greedy_temperature_pins_top_p_and_top_k():
+    params = SamplingParams(temperature=0.0, top_p=0.3, top_k=7)
+    assert (params.top_p, params.top_k) == (1.0, 1)
+    params = SamplingParams(temperature=0.0005, top_p=0.3, top_k=7)
+    assert (params.top_p, params.top_k) == (1.0, 1)
+
+
+def test_sampling_temperature_leaves_top_p_and_top_k_alone():
+    params = SamplingParams(temperature=0.7, top_p=0.3, top_k=7)
+    assert (params.top_p, params.top_k) == (0.3, 7)
+    params = SamplingParams(temperature=-1.0, top_p=0.3, top_k=7)
+    assert (params.top_p, params.top_k) == (0.3, 7)
+
+
+def test_audio_params_normalize_greedy_talker_temperature():
+    params = AudioParams(talker_temperature=0.0,
+                         talker_top_p=0.5,
+                         talker_top_k=20)
+    assert (params.talker_top_p, params.talker_top_k) == (1.0, 1)
+
+
+def test_chat_temperature_zero_reaches_the_runtime_as_greedy(client_and_llm):
+    client, llm = client_and_llm
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "hi"
+                               }],
+                               "temperature": 0,
+                               "top_p": 0.4,
+                               "top_k": 9,
+                           })
+    assert response.status_code == 200
+    assert llm.last_sampling_params.top_p == 1.0
+    assert llm.last_sampling_params.top_k == 1
+
+
+# ---------------------------------------------------------------------------
+# /health context-cache metrics
+# ---------------------------------------------------------------------------
+
+
+def test_health_exposes_context_cache_metrics(client_and_llm):
+    client, llm = client_and_llm
+    expected = {
+        "hit_sequences": 3,
+        "reused_tokens": 768,
+        "media_aware_sequences": 4,
+        "base_kv_pages": {
+            "free": 100,
+            "capacity": 128
+        },
+    }
+    llm.context_cache_metrics = lambda: expected
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["context_cache"] == expected
+
+
+def test_health_allows_runtimes_without_context_cache_metrics(client_and_llm):
+    client, _ = client_and_llm
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["context_cache"] is None
+
+
+def _metrics_llm(native):
+    import threading
+
+    from experimental.server.runtime.engine import LLM
+
+    llm = LLM.__new__(LLM)
+    llm._context_cache_config = SimpleNamespace(enabled=True)
+    llm._closed = False
+    llm._infer_lock = threading.Lock()
+    llm._runtime = SimpleNamespace(get_context_cache_metrics=lambda: native)
+    return llm
+
+
+def test_context_cache_metrics_dict_flattens_native_pools():
+
+    class Pool:
+        free = 100
+        capacity = 128
+
+    class Native:
+        hit_sequences = 3
+        reused_tokens = 768
+        base_kv_pages = Pool()
+
+        def method(self):
+            return 1
+
+    llm = _metrics_llm(Native())
+    assert llm.context_cache_metrics() == {
+        "hit_sequences": 3,
+        "reused_tokens": 768,
+        "base_kv_pages": {
+            "free": 100,
+            "capacity": 128
+        },
+    }
+    llm._context_cache_config = SimpleNamespace(enabled=False)
+    assert llm.context_cache_metrics() is None
+
+
+def test_context_cache_metrics_do_not_wait_for_a_running_request():
+
+    class Native:
+        hit_sequences = 1
+
+    llm = _metrics_llm(Native())
+    with llm._infer_lock:
+        assert llm.context_cache_metrics() is None
+    assert llm.context_cache_metrics() == {"hit_sequences": 1}
+    Native.hit_sequences = 2
+    with llm._infer_lock:
+        assert llm.context_cache_metrics() == {"hit_sequences": 1}
+    assert llm.context_cache_metrics() == {"hit_sequences": 2}
+
+
+# ---------------------------------------------------------------------------
+# data: image preflight (dimension / size / format bounds)
+# ---------------------------------------------------------------------------
+
+
+def _jpeg_bytes(width, height):
+    """SOI + a skipped APP0 + SOF0 carrying the dimensions + SOS."""
+    app0 = b"\xff\xe0" + struct.pack(">H", 4) + b"\x00\x00"
+    sof0 = (b"\xff\xc0" + struct.pack(">H", 11) + b"\x08" +
+            struct.pack(">HH", height, width) + b"\x01\x01\x11\x00")
+    return b"\xff\xd8" + app0 + sof0 + b"\xff\xda"
+
+
+def _gif_bytes(width, height):
+    return b"GIF89a" + struct.pack("<HH", width, height) + b"\x00\x00\x00"
+
+
+def _bmp_bytes(width, height):
+    # Negative height marks a top-down bitmap; the probe takes the magnitude.
+    return (b"BM" + b"\x00" * 12 + struct.pack("<I", 40) +
+            struct.pack("<ii", width, -height) + b"\x00" * 4)
+
+
+def _bmp_core_bytes(width, height):
+    return (b"BM" + b"\x00" * 12 + struct.pack("<I", 12) +
+            struct.pack("<HH", width, height) + b"\x00" * 4)
+
+
+def _image_data_url(payload, media_type="image/png"):
+    encoded = base64.b64encode(payload).decode("ascii")
+    return f"data:{media_type};base64,{encoded}"
+
+
+def _preflight():
+    from experimental.server.media import image_preflight
+    return image_preflight
+
+
+@pytest.mark.parametrize("payload_fn,media_type", [
+    (_png_bytes, "image/png"),
+    (_jpeg_bytes, "image/jpeg"),
+    (_gif_bytes, "image/gif"),
+    (_bmp_bytes, "image/bmp"),
+])
+def test_preflight_probes_every_supported_container(payload_fn, media_type):
+    pf = _preflight()
+    data, size = pf.preflight_image_data_url(
+        _image_data_url(payload_fn(640, 480), media_type))
+    assert size == (640, 480)
+    assert data == payload_fn(640, 480)
+
+
+def test_preflight_rejects_oversized_dimension_without_decoding():
+    """A ~50-byte PNG declaring a 60000x60000 canvas must never reach
+    stb_image, which would allocate ~10 GB for it."""
+    pf = _preflight()
+    bomb = _png_bytes(60000, 60000)
+    assert len(bomb) < 100
+    with pytest.raises(ValueError, match="per side"):
+        pf.preflight_image_data_url(_image_data_url(bomb))
+
+
+def test_preflight_does_not_wrap_unsigned_bmp_core_dimensions():
+    pf = _preflight()
+    with pytest.raises(ValueError, match="per side"):
+        pf.preflight_image_data_url(
+            _image_data_url(_bmp_core_bytes(65535, 1), "image/bmp"))
+
+
+@pytest.mark.parametrize("payload", [
+    b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 12) + b"IHDR" +
+    struct.pack(">II", 1, 1),
+    b"\xff\xd8\xff\xc0\x00\x02" + b"\x00" * 8,
+])
+def test_preflight_rejects_malformed_dimension_headers(payload):
+    pf = _preflight()
+    with pytest.raises(ValueError, match="malformed"):
+        pf.preflight_image_data_url(_image_data_url(payload))
+
+
+def test_preflight_rejects_oversized_pixel_area():
+    pf = _preflight()
+    side = pf.MAX_IMAGE_DIMENSION
+    assert side * side > pf.MAX_IMAGE_PIXELS
+    with pytest.raises(ValueError, match="decoded pixels"):
+        pf.preflight_image_data_url(_image_data_url(_png_bytes(side, side)))
+
+
+def test_preflight_accepts_dimensions_on_the_limit():
+    pf = _preflight()
+    side = pf.MAX_IMAGE_DIMENSION
+    height = pf.MAX_IMAGE_PIXELS // side
+    _, size = pf.preflight_image_data_url(
+        _image_data_url(_png_bytes(side, height)))
+    assert size == (side, height)
+
+
+def test_preflight_rejects_oversized_payload():
+    pf = _preflight()
+    oversized = "A" * (-(-pf.MAX_IMAGE_SOURCE_BYTES // 3) * 4 + 4)
+    with pytest.raises(ValueError, match="exceeds the supported maximum"):
+        pf.preflight_image_data_url(f"data:image/png;base64,{oversized}")
+
+
+@pytest.mark.parametrize("payload", [
+    b"RIFF\x00\x00\x00\x00WEBPVP8 ",
+    b"\x00\x01\x02\x03",
+    b"P6\n60000 60000\n255\n",
+])
+def test_preflight_rejects_unmeasurable_formats(payload):
+    """Anything the probe cannot measure is refused rather than passed to the
+    decoder unbounded; a PNM header in particular is a one-line bomb."""
+    pf = _preflight()
+    with pytest.raises(ValueError, match="unsupported image format"):
+        pf.preflight_image_data_url(_image_data_url(payload))
+
+
+@pytest.mark.parametrize("payload", [
+    b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHD",
+    b"GIF89a\x10",
+    b"BM" + b"\x00" * 8,
+    b"\xff\xd8\xff\xc0\x00\x0b",
+])
+def test_preflight_rejects_truncated_headers(payload):
+    pf = _preflight()
+    with pytest.raises(ValueError):
+        pf.preflight_image_data_url(_image_data_url(payload))
+
+
+def test_preflight_rejects_empty_canvas():
+    pf = _preflight()
+    with pytest.raises(ValueError, match="empty canvas"):
+        pf.preflight_image_data_url(_image_data_url(_png_bytes(0, 32)))
+
+
+def test_preflight_errors_never_echo_the_payload():
+    """Error text reaches the client verbatim in a 400 body, so it must carry
+    only measured integers: no media type, no slice of the base64."""
+    pf = _preflight()
+    secret = "SECRETMARKER"
+    urls = [
+        _image_data_url(_png_bytes(60000, 60000), f"image/{secret}"),
+        f"data:image/{secret};base64," + "A" * 40 + secret,
+        _image_data_url(b"\x00\x01" + secret.encode(), f"image/{secret}"),
+    ]
+    for url in urls:
+        with pytest.raises(ValueError) as excinfo:
+            pf.preflight_image_data_url(url)
+        assert secret not in str(excinfo.value)
+
+
+def test_data_url_image_is_charged_to_the_visual_token_budget(monkeypatch):
+    """A data: image is invisible to file probing, so a video in the same
+    request could otherwise claim the whole engine budget."""
+    from experimental.server.media import video_sampling as vs_mod
+    from experimental.server.runtime.engine import _load_image_buffers
+
+    limits = {
+        "model_type": "qwen2_5_vl",
+        "min_image_tokens": 4,
+        "max_image_tokens": 4096,
+        "max_image_tokens_per_image": 4096,
+        "patch_size": 14,
+        "merge_size": 2,
+        "temporal_patch_size": 2,
+    }
+    image_est = vs_mod.estimate_image_tokens_for_size(640, 480, "qwen", limits)
+    assert 0 < image_est < 4096
+    seen = []
+
+    def fake_load_video_buffer(rt, item, family, **kwargs):
+        seen.append(kwargs["budget"])
+        return "video", 0, 0, 0
+
+    monkeypatch.setattr(vs_mod, "load_video_buffer", fake_load_video_buffer)
+
+    class Runtime:
+
+        @staticmethod
+        def load_image_from_bytes(data):
+            return SimpleNamespace(do_resize=True)
+
+    messages = [{
+        "role":
+        "user",
+        "content": [{
+            "type": "image_url",
+            "image_url": {
+                "url": _image_data_url(_png_bytes(640, 480))
+            },
+        }, {
+            "type": "video",
+            "video": "clip.mp4"
+        }],
+    }]
+    _load_image_buffers(Runtime, messages, lambda: "qwen", lambda: limits)
+    assert seen == [4096 - image_est]
+
+
+def test_remote_media_is_refused_unless_enabled(tmp_path):
+    from experimental.server.media.media_source import \
+        enforce_local_media_policy
+
+    messages = [{
+        "role":
+        "user",
+        "content": [{
+            "type": "image_url",
+            "image_url": {
+                "url": "https://example.com/image.png"
+            },
+        }],
+    }]
+    with pytest.raises(PermissionError, match="remote media"):
+        enforce_local_media_policy(messages, "", allow_remote=False)
+    enforce_local_media_policy(messages, "", allow_remote=True)
+
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    llm = _FakeLLM(tmp_path)
+    client = TestClient(_create_app(llm, ApiConfig()))
+    response = client.post("/v1/chat/completions", json={"messages": messages})
+    assert response.status_code == 403
+    assert "remote media" in response.json()["error"]["message"]
+
+
+@pytest.mark.parametrize("item", [
+    {
+        "type": "input_audio",
+        "audio_url": " https://example.com/a.wav"
+    },
+    {
+        "type": "image_url",
+        "image_url": {
+            "url": "photo.png "
+        }
+    },
+    {
+        "type": "video",
+        "frames": ["frame0.png\n"]
+    },
+])
+def test_media_policy_refuses_surrounding_whitespace(tmp_path, monkeypatch,
+                                                     item):
+    from experimental.server.media.media_source import \
+        enforce_local_media_policy
+
+    monkeypatch.chdir(tmp_path)
+    messages = [{"role": "user", "content": [item]}]
+    with pytest.raises(PermissionError, match="whitespace"):
+        enforce_local_media_policy(messages, str(tmp_path), allow_remote=False)

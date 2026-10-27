@@ -115,14 +115,14 @@ The AttentionPlugin integrates into the TensorRT Edge-LLM inference pipeline thr
 **Functional Description**
 - Implements A([M, K]) x B([K, N]) GEMM semantic where A is activation input, B is weights input.
 - Supports INT4 weights-only groupwise quantization GEMM.
-- Supports group size of 128.
+- Supports group size 128 (group size 32 is served by Int4GroupwiseGemmPluginV2).
 - Accumulation is performed in FP16 precision for both GEMM and GEMV kernels.
 - Implements symmetric quantization schema and zero-points is not supported.
 
 **Configuration Parameters**:
 - `N`: Output feature dimensions of the GEMM operation
 - `K`: Inner dimensions of the GEMM operation
-- `GroupSize`: Number of INT4 weight items corresponding to one scaling factor (currently supports 128 only)
+- `GroupSize`: Number of INT4 weight items corresponding to one scaling factor (128)
 
 **Input Tensors**:
 - `GEMMInput`: Input activation tensor for the GEMM computation.
@@ -147,7 +147,11 @@ The Int4GroupwiseGemmPlugin integrates into the TensorRT Edge-LLM inference pipe
 
 ## Int4GroupwiseGemmPluginV2
 
-`Int4GroupwiseGemmPluginV2` is the default INT4 groupwise GEMM backend. It shares the `Int4GroupwiseGemmPlugin` GEMM semantics — INT4 weights-only groupwise quantization, group size 128, FP16 accumulation, and symmetric (zero-point-free) quantization — but dispatches to AOT-compiled CuTe DSL (cuteDSL) W4A16 kernels instead of the AWQ CUDA-C++ kernels.
+`Int4GroupwiseGemmPluginV2` is the default INT4 groupwise GEMM backend. It shares the `Int4GroupwiseGemmPlugin` GEMM semantics — INT4 weights-only groupwise quantization, group size 128 or 32, FP16 accumulation, and symmetric (zero-point-free) quantization — but dispatches to AOT-compiled CuTe DSL (cuteDSL) W4A16 kernels instead of the AWQ CUDA-C++ kernels.
+
+Group-32 checkpoints (symmetric Q4_0-style QAT weights) are served only by this plugin, and only
+when the CuTe DSL artifact carries the `_g32` variants. Of the prebuilt artifacts in
+`kernelSrcs/cuteDSLPrebuilt`, only the sm_87 one carries them.
 
 The fragment layout supports any positive output width. The final 128-channel
 fragment is bounds-predicated by both the GEMM and GEMV kernels, so narrow
@@ -156,7 +160,7 @@ projections retain their native output shape.
 **Configuration Parameters**:
 - `N`: Output feature dimensions of the GEMM operation
 - `K`: Inner dimensions of the GEMM operation
-- `GroupSize`: Number of INT4 weight items corresponding to one scaling factor (currently supports 128 only)
+- `GroupSize`: Number of INT4 weight items corresponding to one scaling factor (128 or 32; the CuTe DSL artifact bakes one kernel set per group size, group 32 as `_g32` variants)
 
 **Input Tensors**:
 - `GEMMInput`: Input activation tensor for the GEMM computation.

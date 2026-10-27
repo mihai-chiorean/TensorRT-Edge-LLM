@@ -16,6 +16,7 @@
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import time
@@ -25,24 +26,25 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from ..config import ApiConfig
 from ..parsing.reasoning import REASONING_PARSERS
+from ..parsing.terminal_tokens import (IM_END_TOKEN, TerminalTokenStripper,
+                                       ended_on_stop, strip_terminal_tokens,
+                                       terminal_special_tokens)
 from ..parsing.tool_calling import (StreamingAssistantOutputParser, ToolConfig,
-                                    _select_parser, list_tool_parsers,
-                                    parse_assistant_output,
+                                    ToolProtocolError, _select_parser,
+                                    list_tool_parsers, parse_assistant_output,
                                     stream_assistant_output,
                                     validate_tool_request)
 from ..runtime.engine import (OMNI_AUDIO_SAMPLE_RATE, AudioParams,
                               SamplingParams)
 from ..runtime.engine_client import EngineClient, PreparedRequest
 from .errors import (InvalidRequestError, ModelNotFoundError, ServerError,
-                     UnsupportedFeatureError)
+                     ToolProtocolResponseError, UnsupportedFeatureError)
 from .protocol import (ChatCompletionChoice, ChatCompletionMessage,
                        ChatCompletionRequest, ChatCompletionResponse,
                        ChatCompletionStreamChoice,
                        ChatCompletionStreamResponse, DeltaMessage, UsageInfo)
 
 logger = logging.getLogger("edgellm.server.chat")
-
-IM_END_TOKEN = "<|im_end|>"
 
 
 @dataclass(frozen=True)
@@ -108,6 +110,7 @@ class OpenAIServingChat:
         self._client = engine_client
         self._config = config
         self._model_dir = engine_client.llm.model_dir
+        self._terminal_tokens = terminal_special_tokens(self._model_dir)
         # Fail during startup instead of after the first request.
         REASONING_PARSERS.resolve(config.reasoning_parser, self._model_dir)
         if config.tool_call_parser not in list_tool_parsers():
@@ -187,6 +190,7 @@ class OpenAIServingChat:
             enforce_local_media_policy(
                 request.messages,
                 self._config.allowed_local_media_path,
+                allow_remote=self._config.allow_remote_media,
             )
         except PermissionError as exc:
             raise ServerError(str(exc), status_code=403) from exc
@@ -265,11 +269,10 @@ class OpenAIServingChat:
         num_logprobs = 0
         if request.logprobs:
             num_logprobs = max(1, request.top_logprobs or 0)
-        greedy = request.temperature == 0
         sampling = SamplingParams(
             temperature=request.temperature,
-            top_p=1.0 if greedy else request.top_p,
-            top_k=1 if greedy else request.top_k,
+            top_p=request.top_p,
+            top_k=request.top_k,
             seed=request.seed,
             max_tokens=request.effective_max_tokens,
             enable_thinking=request.enable_thinking,
@@ -324,10 +327,19 @@ class OpenAIServingChat:
                 reasoning_parser=prepared.reasoning_parser,
                 prepared=engine_request,
             )
+        except ToolProtocolError as exc:
+            logger.warning("Tool protocol violation (%s); no content returned",
+                           exc.reason)
+            raise ToolProtocolResponseError(exc.reason) from exc
         except (KeyError, TypeError, ValueError) as exc:
             raise InvalidRequestError(str(exc)) from exc
 
-        output.text = output.text.replace(IM_END_TOKEN, "")
+        if (not prepared.tool_config.parse_output
+                and ended_on_stop(output.finish_reason)):
+            # Tool output was stripped before parsing, at the end of the
+            # generation rather than the end of the content.
+            output.text = strip_terminal_tokens(
+                output.text, self._terminal_tokens_for(prepared))
         message = ChatCompletionMessage(
             content=(output.text or None)
             if output.tool_calls else output.text,
@@ -383,7 +395,10 @@ class OpenAIServingChat:
                 finish_reason = delta.finish_reason or "stop"
 
         parsed = self.parse_output(
-            "".join(text_parts).replace(IM_END_TOKEN, ""), prepared)
+            strip_terminal_tokens(
+                "".join(text_parts),
+                self._terminal_tokens_for(prepared)
+                if ended_on_stop(finish_reason) else ()), prepared)
         response_id = f"chatcmpl-{uuid.uuid4().hex}"
         message = ChatCompletionMessage(
             content=parsed.content,
@@ -464,6 +479,7 @@ class OpenAIServingChat:
         parser = REASONING_PARSERS.resolve(prepared.reasoning_parser,
                                            self._model_dir)
         stream_parser = parser.stream() if parser else None
+        stripper = self.stream_stripper(prepared)
         completion_tokens = 0
         finish_reason = "stop"
         try:
@@ -481,8 +497,10 @@ class OpenAIServingChat:
                     delta.logprobs,
                     request.top_logprobs is not None,
                 ) if request.logprobs else None
-                if delta.text:
-                    text = delta.text.replace(IM_END_TOKEN, "")
+                text = stripper.feed(delta.text) if delta.text else ""
+                if delta.finished:
+                    text += stripper.flush(ended_on_stop(delta.finish_reason))
+                if text:
                     if stream_parser:
                         for parsed in stream_parser.feed(text):
                             message = DeltaMessage(
@@ -567,6 +585,7 @@ class OpenAIServingChat:
         prompt_tokens = None
         finish_reason = "stop"
         audio_id = f"audio-{response_id}"
+        stripper = self.stream_stripper(prepared)
         try:
             async for delta in self._client.stream_with_audio(
                     request.messages,
@@ -576,8 +595,10 @@ class OpenAIServingChat:
                 completion_tokens += len(delta.token_ids)
                 if delta.prompt_tokens is not None:
                     prompt_tokens = delta.prompt_tokens
-                if delta.text:
-                    text = delta.text.replace(IM_END_TOKEN, "")
+                text = stripper.feed(delta.text) if delta.text else ""
+                if delta.finished:
+                    text += stripper.flush(ended_on_stop(delta.finish_reason))
+                if text:
                     if stream_parser:
                         for parsed in stream_parser.feed(text):
                             field = ("reasoning_content" if parsed.field
@@ -651,6 +672,7 @@ class OpenAIServingChat:
         reasoning = REASONING_PARSERS.resolve(prepared.reasoning_parser,
                                               self._model_dir)
         reasoning_stream = reasoning.stream() if reasoning else None
+        stripper = self.stream_stripper(prepared)
         completion_tokens = 0
         prompt_tokens = None
         finish_reason = "stop"
@@ -686,13 +708,14 @@ class OpenAIServingChat:
                         },
                     }])
 
+        native_stream = self._client.stream(
+            request.messages,
+            prepared.sampling,
+            tools=prepared.tool_config.tools,
+            tool_choice=prepared.tool_config.tool_choice,
+            prepared=engine_stream)
         try:
-            async for delta in self._client.stream(
-                    request.messages,
-                    prepared.sampling,
-                    tools=prepared.tool_config.tools,
-                    tool_choice=prepared.tool_config.tool_choice,
-                    prepared=engine_stream):
+            async for delta in native_stream:
                 completion_tokens += len(delta.token_ids)
                 if delta.prompt_tokens is not None:
                     prompt_tokens = delta.prompt_tokens
@@ -701,8 +724,10 @@ class OpenAIServingChat:
                     delta.logprobs,
                     request.top_logprobs is not None,
                 ) if request.logprobs else None
-                if delta.text:
-                    text = delta.text.replace(IM_END_TOKEN, "")
+                text = stripper.feed(delta.text) if delta.text else ""
+                if delta.finished:
+                    text += stripper.flush(ended_on_stop(delta.finish_reason))
+                if text:
                     for message in messages_for(parser.feed(text)):
                         yield self._chunk(response_id,
                                           created,
@@ -720,6 +745,11 @@ class OpenAIServingChat:
                     finish_reason = delta.finish_reason or "stop"
         except asyncio.CancelledError:
             raise
+        except ToolProtocolError as exc:
+            for chunk in self._tool_protocol_failure(response_id, created,
+                                                     exc):
+                yield chunk
+            return
         except ServerError as exc:
             logger.warning("Streaming tool request failed: %s", exc)
             yield _sse_error(exc)
@@ -731,8 +761,20 @@ class OpenAIServingChat:
             yield _sse_error(error)
             yield "data: [DONE]\n\n"
             return
+        finally:
+            # An early exit leaves the generation running; wait for the
+            # stream's cleanup before the request releases its admission slot.
+            with contextlib.suppress(BaseException):
+                await native_stream.aclose()
 
-        for message in messages_for(parser.flush()):
+        try:
+            flushed = list(messages_for(parser.flush()))
+        except ToolProtocolError as exc:
+            for chunk in self._tool_protocol_failure(response_id, created,
+                                                     exc):
+                yield chunk
+            return
+        for message in flushed:
             yield self._chunk(response_id, created, message)
         if reasoning_stream is not None:
             for parsed in reasoning_stream.flush():
@@ -757,6 +799,35 @@ class OpenAIServingChat:
             )
             yield _sse(usage_chunk)
         yield "data: [DONE]\n\n"
+
+    def _terminal_tokens_for(self, prepared: PreparedChatRequest):
+        """Skipped special tokens cannot be told apart from literal text, so
+        only ``<|im_end|>`` is removed then."""
+        if prepared.sampling.skip_special_tokens:
+            return (IM_END_TOKEN, )
+        return self._terminal_tokens
+
+    def stream_stripper(
+            self, prepared: PreparedChatRequest) -> TerminalTokenStripper:
+        return TerminalTokenStripper(self._terminal_tokens_for(prepared))
+
+    def _tool_protocol_failure(self, response_id: str, created: int,
+                               exc: ToolProtocolError) -> List[str]:
+        """Terminate a tool stream that produced unusable protocol.
+
+        Content already streamed cannot be retracted; the typed error and a
+        final ``finish_reason: "error"`` chunk tell the client that no tool
+        call may be executed from this turn.
+        """
+        logger.warning("Tool protocol violation (%s) in stream", exc.reason)
+        return [
+            _sse_error(ToolProtocolResponseError(exc.reason)),
+            self._chunk(response_id,
+                        created,
+                        DeltaMessage(),
+                        finish_reason="error"),
+            "data: [DONE]\n\n",
+        ]
 
     def _chunk(
         self,

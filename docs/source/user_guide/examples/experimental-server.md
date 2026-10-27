@@ -64,7 +64,7 @@ for delta in llm.generate_stream(
 
 ## Start the Server
 
-Pass the model checkpoint, not an engine path:
+Pass the model checkpoint:
 
 ```bash
 tensorrt-edgellm-serve Qwen/Qwen3.5-0.8B \
@@ -82,8 +82,22 @@ runtime bundles. A launch reuses a bundle only when the base checkpoint,
 optional draft checkpoint, and build profile all match. A cache miss runs
 `tensorrt-edgellm-build --components all` internally and publishes the
 completed bundle atomically. The builder's default policy externalizes the
-weight kinds supported by each component. Direct engine and ONNX paths are
-rejected so the server cannot lose the checkpoint-to-runtime association.
+weight kinds supported by each component. ONNX paths are rejected so the
+server cannot lose the checkpoint-to-runtime association.
+
+A directory of engines that were built outside the cache is served as-is: a
+builder bundle (`llm.engine` at the root), or the tree written by `llm_build`
+and `visual_build` (`llm/llm.engine` next to `visual/visual.engine`). Such a
+bundle carries its own weights, tokenizer, and chat template, so no checkpoint
+is resolved and nothing is built. Pre-built speculative-decoding bundles are
+not served this way; pass the checkpoint instead:
+
+```bash
+tensorrt-edgellm-serve /opt/models/gemma-4-e4b-engines \
+  --max-input-len 8192 \
+  --max-kv-cache-capacity 16384 \
+  --enable-context-reuse
+```
 
 Compiled bundles use a 50 GiB least-recently-used cache by default. Set
 `--engine-cache-max-size-gb` to another positive limit. Use
@@ -184,6 +198,11 @@ tensorrt-edgellm-serve Qwen/Qwen3.5-0.8B \
   --enable-context-reuse \
   --context-cache-max-records 1024
 ```
+
+Media engines (ViT/audio) also keep a content-addressed cache of encoder
+outputs so a repeated image or audio clip skips the encoder. Its device budget
+is `--context-cache-encoder-embedding-budget-bytes` (default 256 MiB, `0`
+disables it); it applies whether or not `--enable-context-reuse` is set.
 
 The Python API accepts the same deployment configuration and exposes native
 reuse metrics:
@@ -339,9 +358,13 @@ the video content block override those defaults.
 OpenAI content blocks accept `image_url`, `video_url`, `input_audio`, and
 `audio_url` forms described in [Input Format](../format/input-format.md). Data
 URLs and files under `--allowed-local-media-path` are supported. Remote HTTP
-and HTTPS sources are downloaded with per-modality size limits and a bounded
-timeout. Local paths remain disabled unless they are under the configured
-allowed path.
+and HTTPS sources are refused unless the server is launched with
+`--allow-remote-media`; when enabled they are downloaded with per-modality
+size limits and a bounded timeout. Local paths remain disabled unless they are
+under the configured allowed path. Images are bounded before they are decoded:
+the container header (PNG, JPEG, GIF, BMP) must declare at most 16384 pixels
+per side and 64 M pixels in total, and formats the probe cannot measure are
+refused.
 
 Nemotron Omni video uses its checkpoint's video patch embedder and dynamic
 aspect-preserving frame grids:

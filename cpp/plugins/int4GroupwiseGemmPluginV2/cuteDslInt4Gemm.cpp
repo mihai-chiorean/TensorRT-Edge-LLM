@@ -52,37 +52,80 @@ namespace
 // autotune within noise (max regret <1.07x) on Orin (SM87) / Thor (SM110) /
 // Spark (SM121), by greedy set-cover over clock-locked traces. Shrinks the
 // plugin's per-shape autotune candidate set 60 -> 16.
-// X(prefix, bM, bN, bK, stages, splitK).
-#define INT4_FP16_GEMM_VARIANTS(X)                                                                                     \
-    X(int4_fp16_gemm_16x128x64_s3_sk1, 16, 128, 64, 3, 1)                                                              \
-    X(int4_fp16_gemm_16x128x64_s4_sk1, 16, 128, 64, 4, 1)                                                              \
-    X(int4_fp16_gemm_16x128x64_s4_sk2, 16, 128, 64, 4, 2)                                                              \
-    X(int4_fp16_gemm_16x128x64_s4_sk4, 16, 128, 64, 4, 4)                                                              \
-    X(int4_fp16_gemm_32x128x64_s2_sk1, 32, 128, 64, 2, 1)                                                              \
-    X(int4_fp16_gemm_32x128x64_s3_sk2, 32, 128, 64, 3, 2)                                                              \
-    X(int4_fp16_gemm_32x128x64_s3_sk4, 32, 128, 64, 3, 4)                                                              \
-    X(int4_fp16_gemm_32x128x64_s4_sk1, 32, 128, 64, 4, 1)                                                              \
-    X(int4_fp16_gemm_64x128x64_s2_sk1, 64, 128, 64, 2, 1)                                                              \
-    X(int4_fp16_gemm_64x128x64_s3_sk1, 64, 128, 64, 3, 1)                                                              \
-    X(int4_fp16_gemm_64x128x64_s3_sk4, 64, 128, 64, 3, 4)                                                              \
-    X(int4_fp16_gemm_64x128x64_s4_sk2, 64, 128, 64, 4, 2)                                                              \
-    X(int4_fp16_gemm_64x128x64_s4_sk4, 64, 128, 64, 4, 4)                                                              \
-    X(int4_fp16_gemm_128x128x64_s2_sk1, 128, 128, 64, 2, 1)                                                            \
-    X(int4_fp16_gemm_128x128x64_s2_sk4, 128, 128, 64, 2, 4)                                                            \
-    X(int4_fp16_gemm_128x128x64_s4_sk1, 128, 128, 64, 4, 1)
+// Each config is baked once per group size: the group-128 set keeps the
+// unsuffixed names, group 32 carries a `_g32` suffix (build_cutedsl.py's
+// _INT4_FP16_GROUP_SIZES). X(prefix, bM, bN, bK, stages, splitK).
+#define INT4_FP16_GEMM_VARIANTS_G(X, SUFFIX)                                                                           \
+    X(int4_fp16_gemm_16x128x64_s3_sk1##SUFFIX, 16, 128, 64, 3, 1)                                                      \
+    X(int4_fp16_gemm_16x128x64_s4_sk1##SUFFIX, 16, 128, 64, 4, 1)                                                      \
+    X(int4_fp16_gemm_16x128x64_s4_sk2##SUFFIX, 16, 128, 64, 4, 2)                                                      \
+    X(int4_fp16_gemm_16x128x64_s4_sk4##SUFFIX, 16, 128, 64, 4, 4)                                                      \
+    X(int4_fp16_gemm_32x128x64_s2_sk1##SUFFIX, 32, 128, 64, 2, 1)                                                      \
+    X(int4_fp16_gemm_32x128x64_s3_sk2##SUFFIX, 32, 128, 64, 3, 2)                                                      \
+    X(int4_fp16_gemm_32x128x64_s3_sk4##SUFFIX, 32, 128, 64, 3, 4)                                                      \
+    X(int4_fp16_gemm_32x128x64_s4_sk1##SUFFIX, 32, 128, 64, 4, 1)                                                      \
+    X(int4_fp16_gemm_64x128x64_s2_sk1##SUFFIX, 64, 128, 64, 2, 1)                                                      \
+    X(int4_fp16_gemm_64x128x64_s3_sk1##SUFFIX, 64, 128, 64, 3, 1)                                                      \
+    X(int4_fp16_gemm_64x128x64_s3_sk4##SUFFIX, 64, 128, 64, 3, 4)                                                      \
+    X(int4_fp16_gemm_64x128x64_s4_sk2##SUFFIX, 64, 128, 64, 4, 2)                                                      \
+    X(int4_fp16_gemm_64x128x64_s4_sk4##SUFFIX, 64, 128, 64, 4, 4)                                                      \
+    X(int4_fp16_gemm_128x128x64_s2_sk1##SUFFIX, 128, 128, 64, 2, 1)                                                    \
+    X(int4_fp16_gemm_128x128x64_s2_sk4##SUFFIX, 128, 128, 64, 2, 4)                                                    \
+    X(int4_fp16_gemm_128x128x64_s4_sk1##SUFFIX, 128, 128, 64, 4, 1)
+#define INT4_FP16_GEMM_VARIANTS_G128(X) INT4_FP16_GEMM_VARIANTS_G(X, )
+// The `_g32` set exists only in artifacts generated with both group sizes.
+#ifdef CUTE_DSL_INT4_FP16_GEMM_G32_ENABLED
+#define INT4_FP16_GEMM_VARIANTS_G32(X) INT4_FP16_GEMM_VARIANTS_G(X, _g32)
+#else
+#define INT4_FP16_GEMM_VARIANTS_G32(X)
+#endif
 
-// Module storage, loaded once.
+// Module storage, loaded once per group size.
 #define DECL_MODULE(prefix, bM, bN, bK, st, sk) prefix##_Kernel_Module_t g_##prefix{};
-INT4_FP16_GEMM_VARIANTS(DECL_MODULE)
+INT4_FP16_GEMM_VARIANTS_G128(DECL_MODULE)
+INT4_FP16_GEMM_VARIANTS_G32(DECL_MODULE)
 #undef DECL_MODULE
 
-bool gLoaded = false;
+bool gLoadedG128 = false;
+bool gLoadedG32 = false;
 std::mutex gLoadMutex;
 
+// The tactic table is group-size independent: the same 16 tile configs exist for
+// both baked group sizes.
 #define VARIANT_ROW(prefix, bM, bN, bK, st, sk) CuteDslInt4Variant{bM, bN, bK, st, sk},
-CuteDslInt4Variant const kVariants[] = {INT4_FP16_GEMM_VARIANTS(VARIANT_ROW)};
+CuteDslInt4Variant const kVariants[] = {INT4_FP16_GEMM_VARIANTS_G128(VARIANT_ROW)};
 #undef VARIANT_ROW
+
+#define LOAD_MODULE(prefix, bM, bN, bK, st, sk)                                                                        \
+    prefix##_Kernel_Module_Load(&g_##prefix);                                                                          \
+    ok = ok && (g_##prefix.module != nullptr);
+
+bool loadModulesG128()
+{
+    bool ok = true;
+    INT4_FP16_GEMM_VARIANTS_G128(LOAD_MODULE)
+    return ok;
+}
+
+bool loadModulesG32()
+{
+    bool ok = true;
+    INT4_FP16_GEMM_VARIANTS_G32(LOAD_MODULE)
+    return ok;
+}
+#undef LOAD_MODULE
 } // namespace
+
+bool cuteDslInt4GroupSizeSupported(int32_t groupSize)
+{
+#ifdef CUTE_DSL_INT4_FP16_GEMM_G32_ENABLED
+    if (groupSize == 32)
+    {
+        return true;
+    }
+#endif
+    return groupSize == 128;
+}
 
 int32_t cuteDslInt4NumVariants()
 {
@@ -118,26 +161,26 @@ int64_t cuteDslInt4LockCount(int32_t M, int32_t N, int32_t bM, int32_t bN)
     return static_cast<int64_t>(divUp(M, bM)) * divUp(N, bN);
 }
 
-bool cuteDslInt4GemmLoadModules()
+bool cuteDslInt4GemmLoadModules(int32_t groupSize)
 {
+    if (!cuteDslInt4GroupSizeSupported(groupSize))
+    {
+        return false;
+    }
     std::lock_guard<std::mutex> lock(gLoadMutex);
-    if (gLoaded)
+    bool& loaded = (groupSize == 32) ? gLoadedG32 : gLoadedG128;
+    if (loaded)
     {
         return true;
     }
     cudaFree(nullptr); // ensure a current context for the (driver-API on CUDA<12.8) loads
     (void) cudaGetLastError();
-    bool ok = true;
-#define LOAD_MODULE(prefix, bM, bN, bK, st, sk)                                                                        \
-    prefix##_Kernel_Module_Load(&g_##prefix);                                                                          \
-    ok = ok && (g_##prefix.module != nullptr);
-    INT4_FP16_GEMM_VARIANTS(LOAD_MODULE)
-#undef LOAD_MODULE
+    bool const ok = (groupSize == 32) ? loadModulesG32() : loadModulesG128();
     if (!ok || cudaGetLastError() != cudaSuccess)
     {
         return false;
     }
-    gLoaded = true;
+    loaded = true;
     return true;
 }
 
@@ -158,13 +201,14 @@ bool cuteDslInt4GemmLoadModules()
     } while (0)
 
 int32_t cuteDslInt4GemmLaunch(CuteDslInt4Variant const& v, void const* A, void const* fragW, void const* scales,
-    void* C, void* locks, int32_t M, int32_t N, int32_t K, int32_t swizzle, cudaStream_t stream)
+    void* C, void* locks, int32_t M, int32_t N, int32_t K, int32_t groupSize, int32_t swizzle, cudaStream_t stream)
 {
-    if (!gLoaded)
+    bool const loaded = (groupSize == 32) ? gLoadedG32 : (groupSize == 128) ? gLoadedG128 : false;
+    if (!loaded)
     {
         return -1;
     }
-    int32_t const scaleRows = divUp(K, 128); // group_size == 128 for these variants
+    int32_t const scaleRows = divUp(K, groupSize);
 #define DISPATCH(prefix, bm, bn, bk, st, sk)                                                                           \
     if (v.bM == (bm) && v.bN == (bn) && v.bK == (bk) && v.stages == (st) && v.splitK == (sk))                          \
     {                                                                                                                  \
@@ -184,14 +228,23 @@ int32_t cuteDslInt4GemmLaunch(CuteDslInt4Variant const& v, void const* A, void c
         SET_1D(tL, locks, nTiles);                                                                                     \
         return cute_dsl_##prefix##_wrapper(&g_##prefix, &tA, &tW, &tS, &tC, &tWs, &tL, swizzle, stream);               \
     }
-    INT4_FP16_GEMM_VARIANTS(DISPATCH)
+    if (groupSize == 32)
+    {
+        INT4_FP16_GEMM_VARIANTS_G32(DISPATCH)
+    }
+    else
+    {
+        INT4_FP16_GEMM_VARIANTS_G128(DISPATCH)
+    }
 #undef DISPATCH
     return -1;
 }
 
 #undef SET_2D
 #undef SET_1D
-#undef INT4_FP16_GEMM_VARIANTS
+#undef INT4_FP16_GEMM_VARIANTS_G
+#undef INT4_FP16_GEMM_VARIANTS_G128
+#undef INT4_FP16_GEMM_VARIANTS_G32
 
 } // namespace plugins
 } // namespace trt_edgellm

@@ -721,7 +721,7 @@ bool Gemma4MTPDecoder::runBaseVerification(DecodingInferenceContext& context)
     {
         check::check(mRuntime.preprocess.gemma4Ple,
             "Gemma4 MTP base config has PLE enabled but the Gemma4 PLE preprocessor is missing.");
-        mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, context.stream);
+        mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, nullptr, context.stream);
     }
     check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape(
                      {activeBatchSize * verifySize, mRuntime.deployment.base.hiddenSize}),

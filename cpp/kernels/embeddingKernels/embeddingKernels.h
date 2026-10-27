@@ -48,12 +48,16 @@ namespace kernel
 //! \param[in] imageEmbeds Image embeddings [totalImageTokens, hiddenSize] (FP16), or std::nullopt
 //! \param[in] audioTokenId Token ID marking audio positions, or std::nullopt if no audio input
 //! \param[in] audioEmbeds Audio embeddings [totalAudioTokens, hiddenSize] (FP16), or std::nullopt
+//! \param[in] stagedVocabSize When set, embeddingTable and scales hold one row per position instead of one per
+//!                            vocabulary entry: row i is the table row of position i, gathered beforehand (for
+//!                            example on the host). Token ids are still range-checked against this vocabulary size.
 //! \note imageTokenId and audioTokenId must differ when both are provided.
 //! \throws std::runtime_error if tensor shapes or data types are invalid, or FP8 is not supported
 void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTable, rt::OptionalInputTensor scales,
     rt::Tensor& output, cudaStream_t stream, rt::OptionalInputTensor multimodalIndices = std::nullopt,
     std::optional<int32_t> imageTokenId = std::nullopt, rt::OptionalInputTensor imageEmbeds = std::nullopt,
-    std::optional<int32_t> audioTokenId = std::nullopt, rt::OptionalInputTensor audioEmbeds = std::nullopt);
+    std::optional<int32_t> audioTokenId = std::nullopt, rt::OptionalInputTensor audioEmbeds = std::nullopt,
+    std::optional<int32_t> stagedVocabSize = std::nullopt);
 
 //! \brief Assemble deepstack embeddings by extracting image token embeddings from deepstack features
 //!
@@ -116,9 +120,11 @@ void generateVisionBlockIds(
 //! \param[in] audioTokenId Optional audio token ID to zero-fill (-1 = unused)
 //! \param[in] stream CUDA stream for execution
 //! \param[in] scales FP32 scales with shape [vocabSize, numLayers]; required for an INT8 table, std::nullopt otherwise
+//! \param[in] stagedVocabSize When set, pleTable and scales hold one row per position (row i belongs to position i)
+//!                            rather than one per vocabulary entry; ids are range-checked against this size
 void gemma4PleGather(rt::Tensor const& inputIds, rt::Tensor const& pleTable, rt::Tensor& outputBuffer,
     int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, cudaStream_t stream,
-    rt::OptionalInputTensor scales = std::nullopt);
+    rt::OptionalInputTensor scales = std::nullopt, std::optional<int32_t> stagedVocabSize = std::nullopt);
 
 } // namespace kernel
 } // namespace trt_edgellm
