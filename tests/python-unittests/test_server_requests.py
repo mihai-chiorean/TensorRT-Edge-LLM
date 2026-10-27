@@ -2048,6 +2048,19 @@ def test_context_cache_metrics_dict_flattens_native_pools():
     assert llm.context_cache_metrics() is None
 
 
+def test_context_cache_metrics_return_none_after_close():
+
+    class Native:
+        hit_sequences = 1
+
+    llm = _metrics_llm(Native())
+    llm._closed = True
+    assert llm.context_cache_metrics() is None
+    llm._closed = False
+    llm._runtime = None
+    assert llm.context_cache_metrics() is None
+
+
 def test_context_cache_metrics_do_not_wait_for_a_running_request():
 
     class Native:

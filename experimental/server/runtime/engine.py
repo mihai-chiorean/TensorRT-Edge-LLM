@@ -2030,8 +2030,12 @@ class LLM:
         if not self._infer_lock.acquire(blocking=False):
             return getattr(self, "_context_cache_snapshot", None)
         try:
-            self._ensure_open()
-            metrics = self._runtime.get_context_cache_metrics()
+            # /health can race with close(); report no metrics instead of
+            # raising once the runtime is gone.
+            runtime = self._runtime
+            if self._closed or runtime is None:
+                return None
+            metrics = runtime.get_context_cache_metrics()
         finally:
             self._infer_lock.release()
         if metrics is None:
