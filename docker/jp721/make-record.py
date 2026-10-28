@@ -99,7 +99,7 @@ def main() -> None:
         },
         "build_host": {
             "hostname":
-            "spark-094a",
+            read(rec / "build-host.txt") or "unknown",
             "arch":
             "aarch64",
             "docker":
@@ -162,7 +162,8 @@ def main() -> None:
             "nvidia": container.get("dpkg_nvidia"),
             "toolchain": container.get("dpkg_toolchain"),
         },
-        "versions": container.get("versions"),
+        "versions":
+        container.get("versions"),
         "source": {
             "repo": "https://github.com/mihai-chiorean/TensorRT-Edge-LLM.git",
             "branch": "feat/jp72-sm87-0.11.0",
@@ -191,16 +192,22 @@ def main() -> None:
             "cmake_cache_selected":
             container.get("cmake_cache_selected"),
         },
-        "phases": container.get("phases"),
-        "container": container.get("container"),
-        "venv_freeze": container.get("venv_freeze"),
+        "phases": [
+            json.loads(p.read_text())
+            for p in sorted((rec / "phases").glob("*.json"))
+        ],
+        "container":
+        container.get("container"),
+        "venv_freeze":
+        container.get("venv_freeze"),
         "outputs": {
             "builder": manifest(out_root / "builder",
                                 rec / "builder-files.txt"),
             "runtime": manifest(out_root / "runtime",
                                 rec / "runtime-files.txt"),
         },
-        "elf_dependencies": json.loads(read(rec / "elf-needed.json") or "[]"),
+        "elf_dependencies":
+        json.loads(read(rec / "elf-needed.json") or "[]"),
     }
     target.write_text(json.dumps(record, indent=2) + "\n")
     print(f"wrote {target}")

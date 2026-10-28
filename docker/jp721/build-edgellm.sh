@@ -59,9 +59,10 @@ phase() {
 preflight() {
     set -x
     : "no GPU device nodes, no driver, no NVIDIA container runtime hooks"
-    ! ls /dev/nvidia* 2>/dev/null
-    ! command -v nvidia-smi
-    ! ldconfig -p | grep -q 'libcuda\.so'
+    # `! cmd` is exempt from `set -e`; refuse explicitly.
+    if ls /dev/nvidia* 2>/dev/null; then echo "GPU device nodes present" >&2; exit 1; fi
+    if command -v nvidia-smi; then echo "nvidia-smi present" >&2; exit 1; fi
+    if ldconfig -p | grep -q 'libcuda\.so'; then echo "libcuda.so on the loader path" >&2; exit 1; fi
     test -z "${NVIDIA_VISIBLE_DEVICES:-}"
     test -z "${NVIDIA_DRIVER_CAPABILITIES:-}"
     ls -la /dev
@@ -117,8 +118,12 @@ check_configure() {
     grep -E "^CUDART_LIB:[^=]+=${CUDA_TARGET_LIB}/libcudart\.so\$" "${cache}"
     grep -E "^NVRTC_DYNAMIC_LIB:[^=]+=${CUDA_TARGET_LIB}/libnvrtc\.so\$" "${cache}"
     : "no native-architecture detection and no device probe ran"
-    ! grep -iE 'ARCHITECTURES_NATIVE|=native' "${cache}"
-    ! grep -iE 'nvidia-smi|detected GPU|Autodetected CUDA architecture' "${LOGS}/configure.log"
+    if grep -iE 'ARCHITECTURES_NATIVE|=native' "${cache}"; then
+        echo "native CUDA architecture detection in CMakeCache.txt" >&2; exit 1
+    fi
+    if grep -iE 'nvidia-smi|detected GPU|Autodetected CUDA architecture' "${LOGS}/configure.log"; then
+        echo "configure probed a GPU" >&2; exit 1
+    fi
     grep -E 'CuTe DSL: (extracting|arch=)' "${LOGS}/configure.log"
     grep -E 'NVRTC JIT ENABLED' "${LOGS}/configure.log"
     grep -E 'Found TensorRT' "${LOGS}/configure.log"
@@ -239,6 +244,10 @@ print(f"expected={expected or 'n/a'}")
 print(f"match={'yes' if expected and d == expected else ('no' if expected else 'n/a')}")
 PY
     cat "${REC}/source-tree-digest.txt"
+    if grep -qx 'match=no' "${REC}/source-tree-digest.txt"; then
+        echo "source tree digest does not match EXPECTED_SOURCE_TREE_SHA256" >&2
+        exit 1
+    fi
     set +x
 }
 
@@ -290,7 +299,6 @@ out = {
         "git": v("git --version | awk '{print $3}'"),
         "binutils_ld": v("ld --version | head -1"),
     },
-    "phases": [json.load(open(p)) for p in sorted(rec.glob("phases/*.json"))],
     "apt_source_line": (rec / "apt-source.list").read_text().strip(),
     "apt_pins": (rec / "apt-pins.txt").read_text().split(),
     "dpkg_nvidia": [dict(zip(("package", "version", "arch"), l.split("\t")))
@@ -309,6 +317,7 @@ PY
 }
 
 main() {
+    rm -f "${REC}"/phases/*.json
     phase preflight preflight
     phase configure configure
     phase check-configure check_configure

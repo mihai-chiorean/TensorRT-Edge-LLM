@@ -35,7 +35,9 @@ echo "=== docker build done in $((t1 - t0))s"
 sha256sum "${HERE}/Dockerfile" "${HERE}/build-edgellm.sh" "${HERE}/elf-needed.py" \
     "${HERE}/build.sh" > "${REC}/docker-inputs.sha256"
 docker image inspect "${IMAGE}" > "${REC}/docker-image.json"
-docker image inspect ubuntu:24.04 > "${REC}/docker-base-image.json" 2>/dev/null || true
+BASE_IMAGE=$(sed -n 's/^ARG BASE_IMAGE=//p' "${HERE}/Dockerfile")
+docker image inspect "${BASE_IMAGE}" > "${REC}/docker-base-image.json" 2>/dev/null || true
+hostname > "${REC}/build-host.txt"
 docker version > "${REC}/docker-version.txt"
 printf '{"image_build_wall_seconds":%s,"image":"%s"}\n' "$((t1 - t0))" "${IMAGE}" \
     > "${REC}/docker-build-timing.json"
@@ -43,6 +45,7 @@ printf '{"image_build_wall_seconds":%s,"image":"%s"}\n' "$((t1 - t0))" "${IMAGE}
 docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
 
 # Memory sampler: docker stats every 10 s while the build container runs.
+: > "${REC}/logs/docker-stats.log"
 (
     sleep 20
     while [ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER}" 2>/dev/null)" = true ]; do

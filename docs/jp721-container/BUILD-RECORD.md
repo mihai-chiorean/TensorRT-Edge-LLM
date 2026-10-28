@@ -311,3 +311,26 @@ python3 make-record.py ~/trt-edge-build/record ~/trt-edge-build/out build-record
 Network access is needed for apt, the git clone and pip; the apt layer is
 fully pinned, the clone is pinned by commit, and pip is pinned by
 `requirements-server.txt` except for the `huggingface-hub` range.
+
+## Script changes after this record
+
+The record above came from the scripts at `c565ff7`. Later changes to
+`build.sh`, `build-edgellm.sh` and `make-record.py` do not change the
+compile, but they change what the record checks and captures:
+
+- The negative preflight and configure checks (no GPU device nodes, no
+  `nvidia-smi`, no `libcuda.so`, no native architecture detection) now fail
+  the phase. Before, they were written as `! cmd`, which `set -e` ignores.
+- A nonempty `EXPECTED_SOURCE_TREE_SHA256` that does not match now fails
+  `verify-outputs`. Before, it only printed `match=no`.
+- `make-record.py` reads the phase files after the run, so the `record` phase
+  belongs to the same run. Stale phase files are removed at the start. In
+  this record the `record` phase entry comes from an earlier run.
+- The base-image provenance is read from the digest-pinned `BASE_IMAGE`, the
+  build host name comes from `hostname` on the host, and the `docker stats`
+  log is truncated at the start of each run.
+
+A clean rerun with the new scripts on the same host (`cda4fc1`, 8 CPUs,
+12 GiB) passed every phase. It reproduced the source-tree digest
+`c1520a35…22cf` with a 3,803 MiB `docker stats` peak. A rerun with a wrong
+expected digest failed `verify-outputs` with exit code 1.
