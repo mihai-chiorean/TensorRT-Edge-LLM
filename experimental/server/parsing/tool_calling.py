@@ -28,6 +28,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
+from ..runtime.engine_layout import runtime_config_path
 from .reasoning import REASONING_PARSERS
 
 logger = logging.getLogger("edgellm.server.parsing")
@@ -1551,7 +1552,7 @@ def list_tool_parsers() -> List[str]:
 def _parser_name_for_model(model_dir: str) -> str:
     model_type = ""
     try:
-        with open(os.path.join(model_dir, "config.json")) as f:
+        with open(runtime_config_path(model_dir)) as f:
             config = json.load(f)
         # Gemma 4 runtime configs identify the family under "model".
         model_type = str(

@@ -35,6 +35,9 @@ AUDIO_ENGINE_FILE = "audio_encoder.engine"
 CODE2WAV_ENGINE_FILE = "code2wav.engine"
 SPEC_BASE_ENGINE_FILE = "spec_base.engine"
 SPEC_DRAFT_ENGINE_FILE = "spec_draft.engine"
+LLM_CONFIG_FILE = "config.json"
+SPEC_BASE_CONFIG_FILE = "base_config.json"
+SPEC_DRAFT_CONFIG_FILE = "draft_config.json"
 
 
 @dataclass(frozen=True)
@@ -73,6 +76,19 @@ class BundleLayout:
         return bool(self.audio_dir and "asr" in self.audio_model_type.lower())
 
 
+def runtime_config_path(engine_dir: str) -> str:
+    """Return the runtime config of an LLM engine directory.
+
+    A speculative engine directory has no ``config.json``; its base engine
+    config describes the served model.
+    """
+    path = os.path.join(engine_dir, LLM_CONFIG_FILE)
+    if os.path.isfile(path):
+        return path
+    base_path = os.path.join(engine_dir, SPEC_BASE_CONFIG_FILE)
+    return base_path if os.path.isfile(base_path) else path
+
+
 def is_onnx_dir(path: str) -> bool:
     """Return whether ``path`` is an ONNX export directory."""
     return os.path.isfile(os.path.join(path, ONNX_MODEL_FILE))
@@ -106,6 +122,15 @@ def classify_model_source(path: str) -> str:
         if is_onnx_dir(path):
             return "onnx_dir"
     return "model"
+
+
+def is_prebuilt_engine_tree(path: str) -> bool:
+    """Whether ``path`` holds built LLM engines, at its root or under llm/."""
+    if not os.path.isdir(path):
+        return False
+    return any(
+        detect_engine_type(directory) != EngineType.UNKNOWN
+        for directory in (path, os.path.join(path, "llm")))
 
 
 def _component_dir(root: str, name: str, engine_file: str) -> Optional[str]:

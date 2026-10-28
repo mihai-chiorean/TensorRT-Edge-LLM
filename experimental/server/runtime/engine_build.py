@@ -122,11 +122,17 @@ def prebuilt_bundle_layout(model: str) -> Optional[engine_layout.BundleLayout]:
     layout = engine_layout.inspect_bundle(model)
     if layout.engine_type == engine_layout.EngineType.UNKNOWN:
         return None
-    if layout.engine_type != engine_layout.EngineType.LLM:
-        raise ValueError(
-            f"{model!r} holds pre-built {layout.engine_type.value} engines; "
-            "only pre-built LLM bundles without a draft engine can be served "
-            "directly. Pass the checkpoint to build a speculative bundle.")
+    if layout.engine_type == engine_layout.EngineType.SPEC_DECODE:
+        missing = [
+            name for name in (engine_layout.SPEC_BASE_CONFIG_FILE,
+                              engine_layout.SPEC_DRAFT_CONFIG_FILE)
+            if not os.path.isfile(os.path.join(layout.engine_dir, name))
+        ]
+        if missing:
+            raise ValueError(
+                f"pre-built speculative bundle {layout.engine_dir!r} is "
+                f"missing {', '.join(missing)}; the spec_base and spec_draft "
+                "engines need the configs written next to them by llm_build")
     return layout
 
 
