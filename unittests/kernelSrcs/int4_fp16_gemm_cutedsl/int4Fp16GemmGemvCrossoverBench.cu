@@ -39,6 +39,7 @@ static inline cudaError_t cudaLibraryUnload(cudaLibrary_t lib)
 #endif // CUDA_VERSION < 12800
 #endif // TRT_EDGELLM_CUDA_LIBRARY_T_COMPAT
 
+#include "common/cudaUtils.h"
 #include "cutedsl_all.h"
 
 #include <algorithm>
@@ -568,8 +569,9 @@ TEST(Int4Fp16GemmGemvCrossoverBench, TimingTable)
                 };
                 // Serial split-K reduces into C and needs zeroed locks before every launch (as the plugin does),
                 // so the memset is part of the timed region. One sample replays a CUDA graph of the rotating
-                // launches, as the runtime replays the engine, so host submission gaps are not timed.
-                int32_t const launchesPerSample = std::max(kLaunchesPerSample, copies);
+                // launches, as the runtime replays the engine, so host submission gaps are not timed. The graph
+                // holds whole rotations, so consecutive replays keep every copy's reuse distance.
+                int32_t const launchesPerSample = copies * ((kLaunchesPerSample + copies - 1) / copies);
                 auto timed = [&](auto const& launch) -> float {
                     cudaGraph_t graph{};
                     cudaGraphExec_t graphExec{};
@@ -583,7 +585,7 @@ TEST(Int4Fp16GemmGemvCrossoverBench, TimingTable)
                         launched = launched && launch(problemFor(i % copies)) == 0;
                     }
                     bool const captured = cudaStreamEndCapture(stream, &graph) == cudaSuccess;
-                    if (!launched || !captured || cudaGraphInstantiate(&graphExec, graph, 0) != cudaSuccess)
+                    if (!launched || !captured || trt_edgellm::instantiateCudaGraph(&graphExec, graph) != cudaSuccess)
                     {
                         if (graph != nullptr)
                         {
