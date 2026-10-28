@@ -187,6 +187,19 @@ def test_host_embedding_tables_flag_reaches_llm_kwargs():
     assert config.model.llm_kwargs()["host_embedding_tables"] is True
 
 
+def test_host_ple_table_flag_reaches_llm_kwargs():
+    assert not parse_server_config(["model"]).model.host_ple_table
+    config = parse_server_config(["model", "--host-ple-table"])
+    assert config.model.llm_kwargs()["host_ple_table"] is True
+    assert config.model.llm_kwargs()["host_embedding_tables"] is False
+
+
+def test_host_table_flags_are_mutually_exclusive():
+    with pytest.raises(ServerConfigError, match="pass only one"):
+        parse_server_config(
+            ["model", "--host-embedding-tables", "--host-ple-table"])
+
+
 def test_context_cache_config_rejects_ignored_or_invalid_options():
     with pytest.raises(ServerConfigError, match="tuning requires"):
         ContextCacheConfig(recurrent_snapshot_pool_bytes=1)
@@ -349,6 +362,8 @@ def test_native_mtp_uses_base_checkpoint():
 @pytest.mark.parametrize("payload", [
     '{"method":"mtp","num_speculative_tokens":2}',
     '{"method":"mtp"}',
+    '{"method":"mtp","num_speculative_tokens":3,"draft_top_k":2,'
+    '"verify_tree_size":7}',
     '{"method":"eagle3","model":"org/draft-ckpt"}',
 ])
 def test_speculative_config_parse_is_idempotent(payload):
@@ -421,3 +436,45 @@ def test_muse_glimmer_reasoning_parser_splits_atem_channels(tmp_path):
                    if delta.field == "reasoning") == "plan"
     assert "".join(delta.text for delta in deltas
                    if delta.field == "content") == "answer"
+
+
+def test_speculative_config_selects_the_mtp_tree_shape():
+    config = parse_server_config([
+        "/opt/models/gemma-4-e4b-mtp",
+        "--speculative-config",
+        ('{"method":"mtp","num_speculative_tokens":3,"draft_top_k":2,'
+         '"verify_tree_size":7}'),
+    ])
+    kwargs = config.model.llm_kwargs()
+    assert (kwargs["draft_top_k"], kwargs["draft_step"],
+            kwargs["verify_tree_size"]) == (2, 3, 7)
+
+
+def test_speculative_config_agrees_with_matching_flags():
+    config = parse_server_config([
+        "model",
+        "--draft-top-k",
+        "2",
+        "--speculative-config",
+        '{"method":"mtp","draft_top_k":2}',
+    ])
+    assert config.model.draft_top_k == 2
+
+
+@pytest.mark.parametrize("flags,payload,match", [
+    (["--draft-top-k", "1"], '{"method":"mtp","draft_top_k":2}',
+     "draft_top_k=2 conflicts with --draft-top-k 1"),
+    (["--verify-tree-size", "5"], '{"method":"mtp","verify_tree_size":7}',
+     "verify_tree_size=7 conflicts with --verify-tree-size 5"),
+    (["--draft-step", "4"], '{"method":"mtp","num_speculative_tokens":3}',
+     "num_speculative_tokens=3 conflicts with --draft-step 4"),
+])
+def test_speculative_config_rejects_conflicting_flags(flags, payload, match):
+    with pytest.raises(ServerConfigError, match=match):
+        parse_server_config(["model", *flags, "--speculative-config", payload])
+
+
+@pytest.mark.parametrize("key", ["draft_top_k", "verify_tree_size"])
+def test_speculative_config_rejects_invalid_tree_sizes(key):
+    with pytest.raises(ServerConfigError, match=key):
+        SpeculativeConfig.parse({"method": "mtp", key: 0})

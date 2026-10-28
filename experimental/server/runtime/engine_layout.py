@@ -35,6 +35,9 @@ AUDIO_ENGINE_FILE = "audio_encoder.engine"
 CODE2WAV_ENGINE_FILE = "code2wav.engine"
 SPEC_BASE_ENGINE_FILE = "spec_base.engine"
 SPEC_DRAFT_ENGINE_FILE = "spec_draft.engine"
+LLM_CONFIG_FILE = "config.json"
+SPEC_BASE_CONFIG_FILE = "base_config.json"
+SPEC_DRAFT_CONFIG_FILE = "draft_config.json"
 
 
 @dataclass(frozen=True)
@@ -71,6 +74,19 @@ class BundleLayout:
     @property
     def has_transcription(self) -> bool:
         return bool(self.audio_dir and "asr" in self.audio_model_type.lower())
+
+
+def runtime_config_path(engine_dir: str) -> str:
+    """Return the runtime config of an LLM engine directory.
+
+    A speculative engine directory has no ``config.json``; its base engine
+    config describes the served model.
+    """
+    path = os.path.join(engine_dir, LLM_CONFIG_FILE)
+    if os.path.isfile(path):
+        return path
+    base_path = os.path.join(engine_dir, SPEC_BASE_CONFIG_FILE)
+    return base_path if os.path.isfile(base_path) else path
 
 
 def is_onnx_dir(path: str) -> bool:

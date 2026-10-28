@@ -31,11 +31,17 @@ class ServerConfigError(ValueError):
 
 @dataclass(frozen=True)
 class SpeculativeConfig:
-    """Speculative model pair and runtime proposal length."""
+    """Speculative model pair and runtime drafting shape.
+
+    ``draft_top_k`` and ``verify_tree_size`` select a branching draft tree;
+    omitted, the method's linear default applies.
+    """
 
     method: str
     num_speculative_tokens: Optional[int] = None
     draft_model: str = ""
+    draft_top_k: Optional[int] = None
+    verify_tree_size: Optional[int] = None
 
     @classmethod
     def parse(
@@ -51,6 +57,8 @@ class SpeculativeConfig:
                 # reject as a malformed model id. MTP is the only method that
                 # legitimately has none, so re-parsing must round-trip.
                 "model": value.draft_model or None,
+                "draft_top_k": value.draft_top_k,
+                "verify_tree_size": value.verify_tree_size,
             }
         elif isinstance(value, str):
             try:
@@ -64,7 +72,10 @@ class SpeculativeConfig:
             raise ServerConfigError(
                 "--speculative-config must be a JSON object")
 
-        supported_keys = {"method", "num_speculative_tokens", "model"}
+        supported_keys = {
+            "method", "num_speculative_tokens", "model", "draft_top_k",
+            "verify_tree_size"
+        }
         unsupported = sorted(set(raw) - supported_keys)
         if unsupported:
             raise ServerConfigError("unsupported --speculative-config keys: " +
@@ -75,13 +86,15 @@ class SpeculativeConfig:
             raise ServerConfigError(
                 "--speculative-config.method must be one of eagle3, mtp, "
                 "dflash, jetspec, or dspark")
-        num_tokens = raw.get("num_speculative_tokens")
-        if num_tokens is not None and (isinstance(num_tokens, bool)
-                                       or not isinstance(num_tokens, int)
-                                       or num_tokens < 1):
-            raise ServerConfigError(
-                "--speculative-config.num_speculative_tokens must be a "
-                "positive integer")
+        sizes = {}
+        for key in ("num_speculative_tokens", "draft_top_k",
+                    "verify_tree_size"):
+            size = raw.get(key)
+            if size is not None and (isinstance(size, bool)
+                                     or not isinstance(size, int) or size < 1):
+                raise ServerConfigError(
+                    f"--speculative-config.{key} must be a positive integer")
+            sizes[key] = size
         draft_model = raw.get("model")
         if draft_model is not None and (not isinstance(draft_model, str)
                                         or not draft_model.strip()):
@@ -94,8 +107,10 @@ class SpeculativeConfig:
                 f"--speculative-config.method {method!r} requires "
                 "speculative-config.model")
         return cls(method=method,
-                   num_speculative_tokens=num_tokens,
-                   draft_model=draft_model or "")
+                   num_speculative_tokens=sizes["num_speculative_tokens"],
+                   draft_model=draft_model or "",
+                   draft_top_k=sizes["draft_top_k"],
+                   verify_tree_size=sizes["verify_tree_size"])
 
 
 #: Requests that may wait behind the running batch before the server refuses
@@ -197,8 +212,13 @@ class ModelConfig:
         default_factory=ContextCacheConfig)
     enable_in_flight_batching: bool = False
     host_embedding_tables: bool = False
+    host_ple_table: bool = False
 
     def __post_init__(self) -> None:
+        if self.host_embedding_tables and self.host_ple_table:
+            raise ServerConfigError(
+                "--host-embedding-tables already keeps the PLE table in host "
+                "memory; pass only one of it and --host-ple-table")
         if (isinstance(self.engine_cache_max_size_gb, bool)
                 or not math.isfinite(self.engine_cache_max_size_gb)
                 or self.engine_cache_max_size_gb <= 0):
@@ -225,6 +245,7 @@ class ModelConfig:
             "context_cache_config": self.context_cache_config,
             "enable_in_flight_batching": self.enable_in_flight_batching,
             "host_embedding_tables": self.host_embedding_tables,
+            "host_ple_table": self.host_ple_table,
         }
 
 
@@ -364,7 +385,15 @@ def create_argument_parser() -> argparse.ArgumentParser:
     model.add_argument("--verify-tree-size", type=_positive_int)
     model.add_argument("--max-verify-tree-size", type=_positive_int)
     model.add_argument("--max-draft-tree-size", type=_positive_int)
-    model.add_argument("--speculative-config", default="")
+    model.add_argument(
+        "--speculative-config",
+        default="",
+        help="JSON object with method (eagle3, mtp, dflash, jetspec, dspark) "
+        "and optional model, num_speculative_tokens (draft depth), "
+        "draft_top_k and verify_tree_size. A pre-built speculative bundle "
+        "selects its method from base_config.json when this is omitted; "
+        "Gemma 4 MTP then drafts a linear chain of 4 tokens.",
+    )
     model.add_argument(
         "--enable-context-reuse",
         action="store_true",
@@ -385,8 +414,17 @@ def create_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Keep the INT8 token-embedding and PLE sidecar tables mapped in "
         "host memory instead of uploading them to the GPU. Needs a "
-        "pre-built engine tree exported with --int8-embedding; not "
-        "supported with speculative decoding or Qwen3-Omni audio output.",
+        "pre-built engine tree exported with --int8-embedding. Speculative "
+        "decoding supports it only for Gemma 4 MTP; Qwen3-Omni audio output "
+        "does not support it.",
+    )
+    model.add_argument(
+        "--host-ple-table",
+        action="store_true",
+        help="Keep only the INT8 PLE sidecar table mapped in host memory; the "
+        "token-embedding table is uploaded to the GPU. Needs the "
+        "ple_embedding.safetensors sidecar. Mutually exclusive with "
+        "--host-embedding-tables.",
     )
     model.add_argument("--context-cache-max-records",
                        type=_non_negative_int,
@@ -419,9 +457,30 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
 
     speculative = SpeculativeConfig.parse(args.speculative_config)
     draft_step = args.draft_step
-    if (speculative and speculative.method in {"eagle3", "mtp"}
-            and speculative.num_speculative_tokens is not None):
-        draft_step = speculative.num_speculative_tokens
+    draft_top_k = args.draft_top_k
+    verify_tree_size = args.verify_tree_size
+    if speculative:
+        overrides = [("draft_top_k", speculative.draft_top_k, draft_top_k),
+                     ("verify_tree_size", speculative.verify_tree_size,
+                      verify_tree_size)]
+        if speculative.method in {"eagle3", "mtp"}:
+            overrides.append(("num_speculative_tokens",
+                              speculative.num_speculative_tokens, draft_step))
+        for key, from_config, from_flag in overrides:
+            if (from_config is not None and from_flag is not None
+                    and from_config != from_flag):
+                flag = ("--draft-step" if key == "num_speculative_tokens" else
+                        "--" + key.replace("_", "-"))
+                raise ServerConfigError(
+                    f"--speculative-config.{key}={from_config} conflicts "
+                    f"with {flag} {from_flag}")
+        if speculative.draft_top_k is not None:
+            draft_top_k = speculative.draft_top_k
+        if speculative.verify_tree_size is not None:
+            verify_tree_size = speculative.verify_tree_size
+        if (speculative.method in {"eagle3", "mtp"}
+                and speculative.num_speculative_tokens is not None):
+            draft_step = speculative.num_speculative_tokens
     context_cache = ContextCacheConfig(
         enabled=args.enable_context_reuse,
         max_records=args.context_cache_max_records,
@@ -442,15 +501,16 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
         max_kv_cache_capacity=args.max_kv_cache_capacity,
         max_image_tokens=args.max_image_tokens,
         max_image_tokens_per_image=args.max_image_tokens_per_image,
-        draft_top_k=args.draft_top_k,
+        draft_top_k=draft_top_k,
         draft_step=draft_step,
-        verify_tree_size=args.verify_tree_size,
+        verify_tree_size=verify_tree_size,
         max_verify_tree_size=args.max_verify_tree_size,
         max_draft_tree_size=args.max_draft_tree_size,
         speculative_config=speculative,
         context_cache_config=context_cache,
         enable_in_flight_batching=args.enable_in_flight_batching,
         host_embedding_tables=args.host_embedding_tables,
+        host_ple_table=args.host_ple_table,
     )
     api = ApiConfig(
         host=args.host,

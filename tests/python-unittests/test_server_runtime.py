@@ -803,7 +803,7 @@ def test_runtime_load_forwards_context_cache_config(monkeypatch, engine_type):
     assert native.encoder_embedding_cache_budget_bytes == 512
     if engine_type == EngineType.SPEC_DECODE:
         assert captured["args"][-1] == 0
-        assert captured["kwargs"] == {}
+        assert captured["kwargs"] == {"host_embedding_tables": False}
     else:
         assert captured["kwargs"] == {"host_embedding_tables": False}
 
@@ -874,12 +874,169 @@ def test_host_embedding_tables_rejected_for_omni_audio(monkeypatch, tmp_path):
     assert "kwargs" not in captured
 
 
-def test_host_embedding_tables_rejected_for_speculative_decoding(monkeypatch):
+def _write_spec_engine_dir(engine_dir, method):
+    (engine_dir / "base_config.json").write_text(
+        json.dumps({"spec_decode_type": method}))
+    (engine_dir / "embedding.safetensors").write_bytes(b"")
+    (engine_dir / "ple_embedding.safetensors").write_bytes(b"")
+
+
+def test_host_embedding_tables_rejected_for_other_speculative_decoders(
+        monkeypatch, tmp_path):
+    _write_spec_engine_dir(tmp_path, "eagle3")
     captured = {}
-    llm = _host_tables_llm(monkeypatch, EngineType.SPEC_DECODE, captured)
-    with pytest.raises(ValueError, match="speculative decoding"):
+    llm = _host_tables_llm(monkeypatch, EngineType.SPEC_DECODE, captured,
+                           tmp_path)
+    with pytest.raises(ValueError, match="only for Gemma 4 MTP"):
         llm._load_runtime()
     assert "kwargs" not in captured
+
+
+def test_host_embedding_tables_reach_the_gemma4_mtp_runtime(
+        monkeypatch, tmp_path):
+    _write_spec_engine_dir(tmp_path, "gemma4_mtp")
+    captured = {}
+    llm = _host_tables_llm(monkeypatch, EngineType.SPEC_DECODE, captured,
+                           tmp_path)
+    llm._load_runtime()
+    assert captured["kwargs"] == {"host_embedding_tables": True}
+
+
+def test_host_ple_table_reaches_the_speculative_runtime(monkeypatch, tmp_path):
+    _write_spec_engine_dir(tmp_path, "eagle3")
+    captured = {}
+    llm = _host_tables_llm(monkeypatch, EngineType.SPEC_DECODE, captured,
+                           tmp_path)
+    llm._host_embedding_tables = False
+    llm._host_ple_table = True
+    llm._load_runtime()
+    assert captured["kwargs"] == {
+        "host_embedding_tables": False,
+        "host_ple_table": True,
+    }
+
+
+def test_host_ple_table_requires_the_ple_sidecar(monkeypatch, tmp_path):
+    captured = {}
+    llm = _host_tables_llm(monkeypatch, EngineType.LLM, captured, tmp_path)
+    llm._host_embedding_tables = False
+    llm._host_ple_table = True
+    with pytest.raises(ValueError, match="ple_embedding.safetensors sidecar"):
+        llm._load_runtime()
+    assert "kwargs" not in captured
+
+
+def test_host_table_flags_are_mutually_exclusive():
+    with pytest.raises(ValueError, match="pass only one"):
+        LLM("unused", host_embedding_tables=True, host_ple_table=True)
+
+
+@pytest.mark.parametrize("method,step", [("gemma4_mtp", 4), ("mtp", 6)])
+def test_mtp_default_depth_follows_the_compiled_method(tmp_path, method, step):
+    (tmp_path / "base_config.json").write_text(
+        json.dumps({
+            "spec_decode_type": method,
+            "builder_config": {
+                "max_verify_tree_size": 16
+            },
+        }))
+    (tmp_path / "draft_config.json").write_text(
+        json.dumps({"builder_config": {
+            "max_draft_tree_size": 16
+        }}))
+
+    options = _resolve_spec_decode_runtime_options(str(tmp_path), method, None,
+                                                   None, None, None)
+
+    assert (options.top_k, options.step, options.verify_size) == (1, step,
+                                                                  step + 1)
+
+
+def _gemma4_mtp_request_llm(monkeypatch):
+    from experimental.server.runtime import engine as engine_module
+
+    class NativeValue:
+
+        def __init__(self, **values):
+            self.__dict__.update(values)
+
+    llm = _bare_llm(SimpleNamespace(has_draft_model=lambda: True))
+    llm._rt = SimpleNamespace(
+        LLMGenerationRequest=NativeValue,
+        Request=NativeValue,
+        ToolChoice=NativeValue,
+        ToolChoiceMode=SimpleNamespace(NONE="none",
+                                       AUTO="auto",
+                                       REQUIRED="required",
+                                       FUNCTION="function"),
+        ContextCacheLookupPolicy=SimpleNamespace(USE_CACHE="use",
+                                                 BYPASS="bypass"),
+        ContextCacheCommitPolicy=SimpleNamespace(
+            INCLUDING_GENERATED_TOKENS="all", PREFILL_STATE_ONLY="prefill"),
+    )
+    llm._context_cache_config = ContextCacheConfig()
+    llm._spec_decode_type = "gemma4_mtp"
+    llm._prepare_messages_for_runtime = lambda _messages: ([], [])
+    monkeypatch.setattr(engine_module, "_load_audio_buffers",
+                        lambda *_args: [])
+    return llm
+
+
+_HELLO = [{"role": "user", "content": "hello"}]
+
+
+def test_gemma4_mtp_serves_sampled_requests_greedily(monkeypatch, caplog):
+    llm = _gemma4_mtp_request_llm(monkeypatch)
+    with caplog.at_level("WARNING", logger="edgellm.server"):
+        request = llm._make_generation_request(
+            _HELLO, SamplingParams(temperature=0.7, top_p=0.9, top_k=50))
+        llm._make_generation_request(_HELLO, SamplingParams(temperature=0.7))
+    assert (request.temperature, request.top_p, request.top_k) == (0.0, 1.0, 1)
+    assert sum("verifies greedily" in record.message
+               for record in caplog.records) == 1
+
+
+def test_gemma4_mtp_keeps_greedy_and_invalid_temperatures(monkeypatch):
+    llm = _gemma4_mtp_request_llm(monkeypatch)
+    greedy = llm._make_generation_request(_HELLO,
+                                          SamplingParams(temperature=0.0))
+    assert (greedy.temperature, greedy.top_k) == (0.0, 1)
+    negative = llm._make_generation_request(_HELLO,
+                                            SamplingParams(temperature=-1.0))
+    assert negative.temperature == -1.0
+
+
+def test_gemma4_mtp_refuses_disable_spec_decode(monkeypatch):
+    llm = _gemma4_mtp_request_llm(monkeypatch)
+    with pytest.raises(ValueError, match="disable_spec_decode"):
+        llm._make_generation_request(
+            _HELLO, SamplingParams(temperature=0.0, disable_spec_decode=True))
+
+
+def test_other_speculative_decoders_keep_sampling(monkeypatch):
+    llm = _gemma4_mtp_request_llm(monkeypatch)
+    llm._spec_decode_type = "dspark"
+    request = llm._make_generation_request(
+        _HELLO, SamplingParams(temperature=0.7, disable_spec_decode=True))
+    assert request.temperature == 0.7
+    assert request.disable_spec_decode
+
+
+def test_handle_request_logs_draft_acceptance(caplog):
+    response = SimpleNamespace(spec_verify_counts=[12],
+                               spec_acceptance_lengths=[3.25])
+    llm = _bare_llm(SimpleNamespace(handle_request=lambda _request: response))
+    with caplog.at_level("INFO", logger="edgellm.server"):
+        assert llm._handle_request(object()) is response
+    assert "verify_steps=12 acceptance=3.25" in caplog.text
+
+    caplog.clear()
+    vanilla = SimpleNamespace(spec_verify_counts=[0],
+                              spec_acceptance_lengths=[0.0])
+    llm = _bare_llm(SimpleNamespace(handle_request=lambda _request: vanilla))
+    with caplog.at_level("INFO", logger="edgellm.server"):
+        llm._handle_request(object())
+    assert "[spec-decode]" not in caplog.text
 
 
 # ---------------------------------------------------------------------------

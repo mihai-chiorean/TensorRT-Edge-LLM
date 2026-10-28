@@ -52,7 +52,8 @@ from ..parsing.terminal_tokens import (ended_on_stop, strip_terminal_tokens,
 from ..parsing.tool_calling import (ToolConfig, inject_tool_requirement,
                                     parse_assistant_output,
                                     validate_tool_request)
-from .engine_layout import BundleLayout, EngineType, inspect_bundle
+from .engine_layout import (SPEC_BASE_CONFIG_FILE, BundleLayout, EngineType,
+                            inspect_bundle, runtime_config_path)
 
 logger = logging.getLogger("edgellm.server")
 
@@ -70,6 +71,8 @@ _DEFAULT_MAX_KV_CACHE_CAPACITY = 8192
 _DEFAULT_DRAFT_TOP_K = 10
 _DEFAULT_DRAFT_STEP = 6
 _DEFAULT_VERIFY_TREE_SIZE = 60
+# Linear depth 4 was the fastest Gemma 4 E4B MTP shape on Orin (AGX, 2026-10).
+_DEFAULT_GEMMA4_MTP_DRAFT_STEP = 4
 
 # ---------------------------------------------------------------------------
 # Public data classes
@@ -483,7 +486,9 @@ def _resolve_spec_decode_runtime_options(
 
     if engine_method in {"mtp", "gemma4_mtp"}:
         top_k = draft_top_k or 1
-        step = num_speculative_tokens or draft_step or _DEFAULT_DRAFT_STEP
+        default_step = (_DEFAULT_GEMMA4_MTP_DRAFT_STEP if engine_method
+                        == "gemma4_mtp" else _DEFAULT_DRAFT_STEP)
+        step = num_speculative_tokens or draft_step or default_step
         verify_size = _resolve_tree_size(engine_method, top_k,
                                          verify_tree_size, max_verify_size,
                                          step + 1)
@@ -560,6 +565,44 @@ def _resolve_spec_decode_runtime_options(
         return _SpecDecodeRuntimeOptions(top_k, 1, verify_size)
 
     raise ValueError(f"unsupported speculative engine mode {engine_method!r}")
+
+
+def _log_spec_decode_metrics(response) -> None:
+    """Log draft acceptance per request; vanilla responses report no steps."""
+    verify_counts = list(getattr(response, "spec_verify_counts", ()) or ())
+    if not any(verify_counts):
+        return
+    acceptance = list(getattr(response, "spec_acceptance_lengths", ()) or ())
+    logger.info("[spec-decode] request: verify_steps=%s acceptance=%s",
+                ",".join(str(count) for count in verify_counts),
+                ",".join(f"{length:.2f}" for length in acceptance))
+
+
+def _prebuilt_spec_method(layout: BundleLayout, requested: str) -> str:
+    """Return the speculative method a pre-built bundle was compiled for.
+
+    The draft engine is part of the bundle, so its presence alone enables
+    speculative decoding; a requested method must match the compiled one,
+    which ``_resolve_spec_decode_runtime_options`` verifies.
+    """
+    if layout.engine_type != EngineType.SPEC_DECODE:
+        if requested != "none":
+            raise ValueError(
+                f"speculative method {requested!r} was requested, but the "
+                f"pre-built bundle {layout.engine_dir!r} has no "
+                "spec_base/spec_draft engine pair")
+        return requested
+    if requested != "none":
+        return requested
+    method = _read_json(os.path.join(layout.engine_dir,
+                                     SPEC_BASE_CONFIG_FILE)).get(
+                                         "spec_decode_type", "none")
+    if not isinstance(method, str) or method == "none":
+        raise ValueError(
+            f"pre-built speculative bundle {layout.engine_dir!r} does not "
+            "name its method (base_config.json spec_decode_type); pass "
+            "--speculative-config")
+    return method
 
 
 def _ensure_plugin_path() -> None:
@@ -900,6 +943,7 @@ class LLM:
                                              Mapping[str, Any]]] = None,
         enable_in_flight_batching: bool = False,
         host_embedding_tables: bool = False,
+        host_ple_table: bool = False,
     ):
         if not model:
             raise ValueError("'model' must be provided")
@@ -932,7 +976,12 @@ class LLM:
         self._context_cache_config = ContextCacheConfig.parse(
             context_cache_config)
         self._enable_in_flight_batching = enable_in_flight_batching
+        if host_embedding_tables and host_ple_table:
+            raise ValueError(
+                "host_embedding_tables already keeps the PLE table in host "
+                "memory; pass only one of it and host_ple_table")
         self._host_embedding_tables = host_embedding_tables
+        self._host_ple_table = host_ple_table
         self._admission_sem = threading.Semaphore(1)
         self._infer_lock = threading.Lock()
         self._close_lock = threading.Lock()
@@ -970,6 +1019,8 @@ class LLM:
                               draft_model_dir=spec.draft_model)
             spec_method = spec.method
             num_speculative_tokens = spec.num_speculative_tokens
+            draft_top_k = draft_top_k or spec.draft_top_k
+            verify_tree_size = verify_tree_size or spec.verify_tree_size
 
         resolved_top_k = draft_top_k or (10 if spec_method == "eagle3" else 1)
         tree_base = (resolved_top_k > 1 and options.builder_spec_type
@@ -1002,8 +1053,18 @@ class LLM:
         self._checkpoint_dir = "" if prepared.prebuilt else prepared.model_dir
         self._draft_checkpoint_dir = ("" if prepared.prebuilt else
                                       prepared.draft_model_dir)
+        layout = inspect_bundle(prepared.bundle_dir)
+        if prepared.prebuilt:
+            spec_method = _prebuilt_spec_method(layout, spec_method)
+        self._spec_decode_type = ""
+        if layout.engine_type == EngineType.SPEC_DECODE:
+            self._spec_decode_type = str(
+                _read_json(
+                    os.path.join(layout.engine_dir,
+                                 SPEC_BASE_CONFIG_FILE)).get(
+                                     "spec_decode_type", ""))
         runtime_options = _resolve_spec_decode_runtime_options(
-            prepared.bundle_dir,
+            layout.engine_dir,
             spec_method,
             num_speculative_tokens,
             draft_top_k,
@@ -1060,8 +1121,14 @@ class LLM:
             if reason:
                 raise _ifb_unsupported_error(reason)
         host_embedding_tables = getattr(self, "_host_embedding_tables", False)
+        host_ple_table = getattr(self, "_host_ple_table", False)
         if host_embedding_tables:
             _check_host_embedding_tables(self._layout, self._engine_dir)
+        if host_ple_table:
+            _check_host_ple_table(self._engine_dir)
+        residency = {"host_embedding_tables": host_embedding_tables}
+        if host_ple_table:
+            residency["host_ple_table"] = True
         if self._layout.engine_type == EngineType.SPEC_DECODE:
             logger.info(
                 "Speculative decoding enabled (top_k=%d, step=%d, "
@@ -1082,6 +1149,7 @@ class LLM:
                 self._draft_checkpoint_dir,
                 context_cache_config,
                 self._dflash_block_size,
+                **residency,
             )
         elif self._use_ifb():
             # In-flight batching: the engine owns the runtime and the one
@@ -1098,7 +1166,7 @@ class LLM:
                     self._checkpoint_dir,
                     context_cache_config,
                     max_batch_size=self._max_batch_size,
-                    host_embedding_tables=host_embedding_tables,
+                    **residency,
                 )
                 logger.info("In-flight batching enabled (max_batch_size=%d)",
                             self._max_batch_size)
@@ -1128,7 +1196,7 @@ class LLM:
                 {},
                 self._checkpoint_dir,
                 context_cache_config,
-                host_embedding_tables=host_embedding_tables,
+                **residency,
             )
         if getattr(self, "_runtime", None) is not None:
             self._runtime.capture_decoding_cuda_graph()
@@ -1380,11 +1448,41 @@ class LLM:
             self._rt, tool_config)
         request.parallel_tool_calls = tool_config.parallel_tool_calls
         request.disable_spec_decode = params.disable_spec_decode
+        if getattr(self, "_spec_decode_type", "") == "gemma4_mtp":
+            self._apply_gemma4_mtp_request_limits(request, params)
         request.skip_special_tokens = params.skip_special_tokens
         request.num_logprobs = params.num_logprobs
         _set_context_cache_request_policies(self._rt, request, params)
         request.context_cache_replay_tail_length = replay_tail_length
         return request
+
+    def _apply_gemma4_mtp_request_limits(self, request,
+                                         params: SamplingParams) -> None:
+        """Hold a request to what a Gemma 4 MTP verification engine serves.
+
+        The base engine cannot decode without its draft, and verification is
+        argmax-only: the linear decoder silently decodes greedily and the tree
+        decoder refuses sampled requests. Sampled requests are therefore
+        served greedily on both shapes, with one warning per process.
+        """
+        if params.disable_spec_decode:
+            raise ValueError(
+                "disable_spec_decode is not supported by a Gemma 4 MTP "
+                "deployment: its base engine only runs with the draft. Serve "
+                "a standalone target bundle for target-only decoding.")
+        # A negative temperature is left for the native range check.
+        if (params.temperature < GREEDY_TEMPERATURE_EPSILON
+                or params.top_k == GREEDY_TOP_K):
+            return
+        if not getattr(self, "_warned_spec_greedy", False):
+            self._warned_spec_greedy = True
+            logger.warning(
+                "Gemma 4 MTP verifies greedily: sampled requests "
+                "(temperature=%g, top_p=%g, top_k=%d) are served with greedy "
+                "decoding", params.temperature, params.top_p, params.top_k)
+        request.temperature = 0.0
+        request.top_p = GREEDY_TOP_P
+        request.top_k = GREEDY_TOP_K
 
     def _count_prepared_prompt_tokens(self, request) -> Optional[int]:
         """Count tokens only for an explicit token-count API request."""
@@ -1565,6 +1663,7 @@ class LLM:
         if (cache_config is not None and cache_config.enabled
                 and self._runtime is not None):
             self._log_context_reuse_metrics()
+        _log_spec_decode_metrics(response)
         return response
 
     def close(self) -> None:
@@ -2256,8 +2355,16 @@ class TTS:
 
 def _check_host_embedding_tables(layout, engine_dir: str) -> None:
     if layout.engine_type == EngineType.SPEC_DECODE:
-        raise ValueError("--host-embedding-tables is not supported with "
-                         "speculative decoding")
+        method = _read_json(os.path.join(engine_dir,
+                                         SPEC_BASE_CONFIG_FILE)).get(
+                                             "spec_decode_type", "")
+        # Other speculative decoders embed draft tokens from the device copy
+        # of the token table.
+        if method != "gemma4_mtp":
+            raise ValueError(
+                "--host-embedding-tables supports speculative decoding only "
+                f"for Gemma 4 MTP bundles, not {method!r}; use "
+                "--host-ple-table to keep only the PLE table in host memory")
     if layout.has_speech:
         raise ValueError(
             "--host-embedding-tables does not support Qwen3-Omni audio "
@@ -2272,6 +2379,15 @@ def _check_host_embedding_tables(layout, engine_dir: str) -> None:
             "--int8-embedding export")
 
 
+def _check_host_ple_table(engine_dir: str) -> None:
+    if not os.path.isfile(os.path.join(engine_dir,
+                                       "ple_embedding.safetensors")):
+        raise ValueError(
+            "--host-ple-table needs an engine tree with the "
+            "ple_embedding.safetensors sidecar, as written by an "
+            "--int8-embedding export of a model with per-layer embeddings")
+
+
 def load_model(**kwargs):
     """Select the model-specific runtime from provider checkpoint metadata."""
     from .engine_build import prebuilt_bundle_layout, resolve_model_dir
@@ -2283,7 +2399,7 @@ def load_model(**kwargs):
     else:
         resolved = resolve_model_dir(original_model,
                                      kwargs.get("cache_dir", ""))
-    with open(os.path.join(resolved, "config.json"), encoding="utf-8") as file:
+    with open(runtime_config_path(resolved), encoding="utf-8") as file:
         model_type = json.load(file).get("model_type")
     if model_type == "qwen3_tts":
         runtime_class = TTS
@@ -2295,7 +2411,8 @@ def load_model(**kwargs):
         if kwargs.pop("speculative_config", None):
             raise ValueError(
                 "standalone TTS models do not support speculative decoding")
-        if kwargs.pop("host_embedding_tables", False):
+        if (kwargs.pop("host_embedding_tables", False)
+                or kwargs.pop("host_ple_table", False)):
             raise ValueError(
                 "standalone TTS models have no embedding sidecar tables")
         if kwargs.pop("enable_in_flight_batching", False):
