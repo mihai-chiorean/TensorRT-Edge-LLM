@@ -232,3 +232,14 @@ def test_direct_builder_unions_generation_config_stop_tokens(tmp_path):
     config = {}
     _apply_generic_token_ids(config, {}, str(tmp_path))
     assert config["eos_token_id"] == [7]
+
+
+@pytest.mark.parametrize("filename", ["config.json", "generation_config.json"])
+def test_direct_builder_rejects_nonobject_configs(tmp_path, filename):
+    pytest.importorskip("torch")
+    from experimental.builder.core.artifacts.runtime_artifacts import \
+        _apply_generic_token_ids
+
+    (tmp_path / filename).write_text("[]")
+    with pytest.raises(ValueError, match=r"must contain an object"):
+        _apply_generic_token_ids({}, {}, str(tmp_path))
