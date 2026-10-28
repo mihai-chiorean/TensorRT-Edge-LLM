@@ -43,8 +43,12 @@ INT4_SIDECAR_VERSION = "1"
 INT4_SIDECAR_FORMAT = "int4_symmetric_group32_packed"
 INT4_SIDECAR_ROLES = ("embedding", "ple_embedding")
 # "absmax": d = amax / 7, codes in [-7, 7].
-# "q4_0_grid": d = max(max / 7, -min / 8), codes in [-8, 7]. Reproduces tables
-# that already lie on a symmetric Q4_0 group grid (QAT Q4_0 checkpoints).
+# "q4_0_grid": codes in [-8, 7] with a signed step per group, since Q4_0 maps
+# the largest-magnitude value to -8 and so stores a negative d when that value
+# is positive. Candidates d = max(max / 7, -min / 8) and
+# d = -max(max / 8, -min / 7); the one with the smaller FP16 reconstruction
+# error is kept (ties keep the positive step). Reproduces tables that already
+# lie on a Q4_0 group grid (QAT Q4_0 checkpoints).
 INT4_SCALE_MODES = ("absmax", "q4_0_grid")
 
 
@@ -70,6 +74,25 @@ def int4_sidecar_metadata(tensor_role: str) -> dict[str, str]:
         "trt_edge_llm_quantization_version": INT4_SIDECAR_VERSION,
         "trt_edge_llm_tensor_role": tensor_role,
     }
+
+
+def _int4_quantize_groups(
+        grouped: torch.Tensor, group_step: torch.Tensor,
+        code_min: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Round ``grouped`` against the FP16 form of ``group_step`` (the scale the
+    runtime sees); a zero step becomes scale 1.0."""
+    group_scales = torch.where(group_step != 0, group_step,
+                               torch.ones_like(group_step)).to(torch.float16)
+    quantized = torch.round(grouped / group_scales.float().unsqueeze(2))
+    return group_scales, quantized.clamp(code_min, INT4_SYMMETRIC_MAX)
+
+
+def _int4_group_error(grouped: torch.Tensor, group_scales: torch.Tensor,
+                      quantized: torch.Tensor) -> torch.Tensor:
+    """Squared error of the runtime's FP16 decode, summed per group."""
+    decoded = (quantized * group_scales.float().unsqueeze(2)).to(
+        torch.float16).float()
+    return (decoded - grouped).square().sum(dim=2)
 
 
 def quantize_embedding_to_int4(
@@ -129,19 +152,29 @@ def quantize_embedding_to_int4(
 
         grouped = weight_fp32.view(row_end - row_start, num_groups, group_size)
         if scale_mode == "absmax":
-            group_step = grouped.abs().amax(dim=2) / INT4_SYMMETRIC_MAX
-            code_min = -INT4_SYMMETRIC_MAX
+            group_scales, quantized = _int4_quantize_groups(
+                grouped,
+                grouped.abs().amax(dim=2) / INT4_SYMMETRIC_MAX,
+                -INT4_SYMMETRIC_MAX)
         else:
-            group_step = torch.maximum(
-                grouped.amax(dim=2) / INT4_SYMMETRIC_MAX,
-                -grouped.amin(dim=2) / (INT4_SYMMETRIC_MAX + 1))
+            group_max = grouped.amax(dim=2)
+            group_min = grouped.amin(dim=2)
             code_min = -(INT4_SYMMETRIC_MAX + 1)
-        group_scales = torch.where(group_step > 0, group_step,
-                                   torch.ones_like(group_step))
-        # Quantize against the scale the runtime will see.
-        group_scales = group_scales.to(torch.float16)
-        quantized = torch.round(grouped / group_scales.float().unsqueeze(2))
-        quantized = quantized.clamp(code_min, INT4_SYMMETRIC_MAX)
+            pos_scales, pos_quantized = _int4_quantize_groups(
+                grouped,
+                torch.maximum(group_max / INT4_SYMMETRIC_MAX,
+                              -group_min / (INT4_SYMMETRIC_MAX + 1)), code_min)
+            neg_scales, neg_quantized = _int4_quantize_groups(
+                grouped, -torch.maximum(group_max / (INT4_SYMMETRIC_MAX + 1),
+                                        -group_min / INT4_SYMMETRIC_MAX),
+                code_min)
+            use_negative = _int4_group_error(
+                grouped, neg_scales,
+                neg_quantized) < _int4_group_error(grouped, pos_scales,
+                                                   pos_quantized)
+            group_scales = torch.where(use_negative, neg_scales, pos_scales)
+            quantized = torch.where(use_negative.unsqueeze(2), neg_quantized,
+                                    pos_quantized)
         offset = (quantized + 8).to(torch.uint8).view(row_end - row_start,
                                                       width)
         packed[row_start:row_end] = offset[:, 0::2] | (offset[:, 1::2] << 4)

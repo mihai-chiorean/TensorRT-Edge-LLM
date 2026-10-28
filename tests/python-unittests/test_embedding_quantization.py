@@ -487,6 +487,56 @@ def test_int4_q4_0_grid_mode_reproduces_grid_tables_exactly():
     assert not torch.equal(absmax, weight)
 
 
+def _signed_q4_0_table(rows, width, group_size=32):
+    """GGML-style Q4_0 groups: the largest-magnitude value is code -8, so
+    ``d = max / -8`` is negative whenever that value is positive."""
+    torch.manual_seed(4)
+    num_groups = width // group_size
+    codes = torch.randint(-7, 8, (rows, num_groups, group_size))
+    codes[:, :, 0] = -8
+    steps = torch.tensor([0.125, 0.0390625, 0.5, 0.01171875])
+    step = steps[torch.randint(0, len(steps), (rows, num_groups))]
+    sign = torch.ones(rows, num_groups)
+    sign[:, 0::2] = -1.0
+    return (codes * (sign * step).unsqueeze(2)).view(rows,
+                                                     width).to(torch.float16)
+
+
+def test_int4_q4_0_grid_mode_keeps_negative_group_steps():
+    weight = _signed_q4_0_table(6, 128)
+
+    packed, scales = embedding_quantization.quantize_embedding_to_int4(
+        weight, scale_mode="q4_0_grid")
+    dequantized = embedding_quantization.dequantize_int4_embedding(
+        packed, scales)
+
+    assert torch.equal(dequantized, weight)
+    assert (scales[:, 0::2] < 0).all()
+    assert (scales[:, 1::2] > 0).all()
+
+
+def test_int4_q4_0_grid_mode_picks_the_lower_error_sign():
+    torch.manual_seed(5)
+    weight = torch.randn(16, 128).to(torch.float16)
+
+    packed, scales = embedding_quantization.quantize_embedding_to_int4(
+        weight, scale_mode="q4_0_grid")
+    error = (embedding_quantization.dequantize_int4_embedding(
+        packed, scales).float() - weight.float()).square().view(16, 4,
+                                                                32).sum(2)
+
+    grouped = weight.float().view(16, 4, 32)
+    for sign, step in (
+        (1.0, torch.maximum(grouped.amax(2) / 7, -grouped.amin(2) / 8)),
+        (-1.0, torch.maximum(grouped.amax(2) / 8, -grouped.amin(2) / 7)),
+    ):
+        scale = (sign * step).to(torch.float16).float()
+        codes = torch.round(grouped / scale.unsqueeze(2)).clamp(-8, 7)
+        candidate = (codes * scale.unsqueeze(2)).to(
+            torch.float16).float() - grouped
+        assert (error <= candidate.square().sum(2)).all()
+
+
 def test_int4_default_scale_mode_is_absmax():
     torch.manual_seed(3)
     weight = torch.randn(4, 64).to(torch.float16)

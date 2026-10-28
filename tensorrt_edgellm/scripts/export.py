@@ -4179,9 +4179,10 @@ def main() -> None:
         choices=("absmax", "q4_0_grid"),
         default="absmax",
         help=("Scale rule for --int4-embedding. 'absmax': amax / 7, codes in "
-              "[-7, 7]. 'q4_0_grid': max(max / 7, -min / 8), codes in "
-              "[-8, 7]; reproduces tables that already lie on a Q4_0 "
-              "group-32 grid, such as QAT Q4_0 checkpoints."),
+              "[-7, 7]. 'q4_0_grid': codes in [-8, 7] with a signed step "
+              "per group (Q4_0 steps can be negative); reproduces tables "
+              "that already lie on a Q4_0 group-32 grid, such as QAT Q4_0 "
+              "checkpoints."),
     )
     p.add_argument(
         "--reduced-vocab-dir",
