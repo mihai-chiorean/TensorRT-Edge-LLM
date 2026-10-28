@@ -251,6 +251,19 @@ def test_over_rank_adapter_fails_before_writing(tmp_path, onnx_dir):
     assert not out.exists()
 
 
+def test_provenance_failure_writes_nothing(tmp_path, onnx_dir):
+    adapter = _write_adapter(tmp_path / "adapter")
+    (onnx_dir / "config.json").write_text("{not json")
+    out = tmp_path / "out"
+
+    with pytest.raises(ValueError):
+        process_lora_weights_and_save(str(adapter),
+                                      str(out),
+                                      onnx_dir=str(onnx_dir),
+                                      max_lora_rank=16)
+    assert not out.exists()
+
+
 @pytest.mark.parametrize("key, value", [
     ("use_rslora", True),
     ("use_dora", True),

@@ -1068,11 +1068,6 @@ def process_lora_weights_and_save(
             processed_tensors[f"{stem}.lora_A.weight"] = tensors["A"]
             processed_tensors[f"{stem}.lora_B.weight"] = tensors["B"]
 
-    os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir,
-                               'processed_adapter_model.safetensors')
-    save_file(processed_tensors, output_path)
-
     provenance = {
         "source_adapter_dir": os.path.abspath(input_dir),
         "adapter_model_sha256": _sha256(safetensor_path),
@@ -1092,6 +1087,11 @@ def process_lora_weights_and_save(
         provenance["engine"] = _engine_provenance(onnx_dir)
     output_config = dict(config)
     output_config["edgellm_lora_processing"] = provenance
+
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir,
+                               'processed_adapter_model.safetensors')
+    save_file(processed_tensors, output_path)
     with open(os.path.join(output_dir, 'config.json'), 'w') as out:
         json.dump(output_config, out, indent=2)
 
