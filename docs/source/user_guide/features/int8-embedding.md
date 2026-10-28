@@ -84,9 +84,15 @@ MTP decoding. The Gemma 4 MTP decoder samples its draft tokens on the device, so
 with host-mapped tables it copies those ids back to the host before each lookup:
 once per assistant step that feeds a token to the next step, and once for the
 verify tokens. Each copy waits for the stream, so a round of draft depth K
-synchronizes K + 1 times instead of once. Other speculative decoders and diffusion
-decoders are rejected. `llm_inference` rejects the flag together with Qwen3-Omni
-audio output, because the Talker also reads the dense table.
+synchronizes K + 1 times instead of once. `--hostPleTable`
+(`EmbeddingTableResidency::kHostMappedPle`) maps only the PLE table and copies
+the token table into device memory; the assistant embeds its draft tokens from
+the token table alone, so a round then synchronizes twice: once for the verify
+tokens' PLE rows and once for the accepted tokens. Other speculative decoders
+and diffusion decoders are rejected. `llm_inference` rejects
+`--hostEmbeddingTables` together with Qwen3-Omni audio output, because the
+Talker also reads the dense token table. `--hostPleTable` keeps that table in
+device memory, so it is accepted with audio output.
 
 ## Limitations
 

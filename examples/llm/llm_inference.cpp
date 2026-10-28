@@ -106,7 +106,8 @@ enum LLMInferenceOptionId : int
     DART_PIVOT_TEXT_TOKENS = 938,
     VISUAL_PRUNE_ALGO = 939,
     ENCODER_CACHE_BUDGET_BYTES = 940,
-    CP_SPEC_VERIFY_SIZE = 941
+    CP_SPEC_VERIFY_SIZE = 941,
+    HOST_PLE_TABLE = 942
 };
 
 // Struct to hold speculative decoding arguments (used by both EAGLE and MTP)
@@ -413,6 +414,12 @@ void printUsage(char const* programName)
     std::cerr << "                            gather rows on the CPU each step (vanilla or Gemma 4 MTP decoding, single"
               << std::endl;
     std::cerr << "                            rank)" << std::endl;
+    std::cerr
+        << "  --hostPleTable            Keep only the PLE sidecar mapped in host memory; the token-embedding table"
+        << std::endl;
+    std::cerr << "                            stays on the device, so Gemma 4 MTP drafting needs no host copy of its"
+              << std::endl;
+    std::cerr << "                            draft tokens" << std::endl;
     std::cerr << "\nContext Reuse Options:" << std::endl;
     std::cerr << "  --enableContextReuse      Enable process-local content-addressed context reuse" << std::endl;
     std::cerr << "  --contextCacheMaxRecords  Maximum retained context records (default: 1024)" << std::endl;
@@ -505,6 +512,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"dsparkMinProposalLen", required_argument, 0, LLMInferenceOptionId::DSPARK_MIN_PROPOSAL_LEN},
         {"dsparkMaxProposalLen", required_argument, 0, LLMInferenceOptionId::DSPARK_MAX_PROPOSAL_LEN},
         {"hostEmbeddingTables", no_argument, 0, LLMInferenceOptionId::HOST_EMBEDDING_TABLES},
+        {"hostPleTable", no_argument, 0, LLMInferenceOptionId::HOST_PLE_TABLE},
         {"enableContextReuse", no_argument, 0, LLMInferenceOptionId::ENABLE_CONTEXT_REUSE},
         {"contextCacheMaxRecords", required_argument, 0, LLMInferenceOptionId::CONTEXT_CACHE_MAX_RECORDS},
         {"contextCacheRecurrentSnapshotPoolBytes", required_argument, 0,
@@ -796,6 +804,12 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             break;
         case LLMInferenceOptionId::HOST_EMBEDDING_TABLES:
             args.embeddingTableResidency = rt::EmbeddingTableResidency::kHostMapped;
+            break;
+        case LLMInferenceOptionId::HOST_PLE_TABLE:
+            if (args.embeddingTableResidency != rt::EmbeddingTableResidency::kHostMapped)
+            {
+                args.embeddingTableResidency = rt::EmbeddingTableResidency::kHostMappedPle;
+            }
             break;
         case LLMInferenceOptionId::ENABLE_CONTEXT_REUSE: args.contextCacheConfig.enabled = true; break;
         case LLMInferenceOptionId::CONTEXT_CACHE_MAX_RECORDS:
