@@ -463,6 +463,33 @@ TEST_F(ContextCacheSpecCoordinatorTests, BatchRowsResolveDifferentPairedReuseLen
     EXPECT_EQ(mCoordinator->finish(consumer.request), ContextCacheCoordinatorStatus::kOk);
 }
 
+TEST_F(ContextCacheSpecCoordinatorTests, CancelledSlotHoldsItsLedgerWhileItsPeerVerifies)
+{
+    constexpr int32_t kInputLength{2 * kTOKENS_PER_PAGE};
+    std::vector<int32_t> other = makeTokens(kInputLength);
+    other.front() = 99;
+    auto request = beginBatch({makeTokens(kInputLength), std::move(other)});
+    ASSERT_EQ(mCoordinator->preparePrefill(request.request), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    std::vector<int32_t> lookahead{9001, 9002};
+    std::vector<ContextCacheSequenceAdvance> prefill{ContextCacheSequenceAdvance{&lookahead[0], 1, kInputLength},
+        ContextCacheSequenceAdvance{&lookahead[1], 1, kInputLength}};
+    std::vector<int32_t> prefillCommon{kInputLength, kInputLength};
+    ASSERT_EQ(mCoordinator->finalizePrefillPublication(request.request, prefill, &prefillCommon),
+        ContextCacheCoordinatorStatus::kOk);
+
+    ASSERT_EQ(mCoordinator->prepareDecodeStep(request.request, specHeadroom()), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    std::vector<int32_t> accepted{41, 42};
+    std::vector<ContextCacheSequenceAdvance> step{ContextCacheSequenceAdvance{accepted.data(), 2, kInputLength + 2},
+        ContextCacheSequenceAdvance{nullptr, 0, ContextCacheSequenceAdvance::kHoldCommittedStateLength}};
+    std::vector<int32_t> crookedCommon{kInputLength, kInputLength + 1};
+    EXPECT_THROW(mCoordinator->completeDecodeStep(request.request, step, {}, &crookedCommon), std::runtime_error);
+    std::vector<int32_t> common{kInputLength, kInputLength};
+    EXPECT_EQ(mCoordinator->completeDecodeStep(request.request, step, {}, &common), ContextCacheCoordinatorStatus::kOk);
+    EXPECT_EQ(mCoordinator->finish(request.request), ContextCacheCoordinatorStatus::kOk);
+}
+
 TEST_F(ContextCacheSpecCoordinatorTests, EagleRequestDoesNotConsumeBaseOnlyRecord)
 {
     constexpr int32_t kInputLength{2 * kTOKENS_PER_PAGE};
@@ -610,6 +637,39 @@ TEST_F(ContextCacheGemma4MtpCoordinatorTests, DecodeUsesCommittedBaseBoundaryWit
         accepted.data(), static_cast<int32_t>(accepted.size()), kInputLength + static_cast<int32_t>(accepted.size())}};
     EXPECT_EQ(
         mCoordinator->completeDecodeStep(request.request, decodeAdvances, {}), ContextCacheCoordinatorStatus::kOk);
+}
+
+TEST_F(ContextCacheGemma4MtpCoordinatorTests, CancelledVerifyStepHoldsTheLedgerAndKeepsThePrefixReusable)
+{
+    // A client disconnect latches kCancelled before a verify step; the decoder then appends nothing and the runtime
+    // reports the hold sentinel without assistant state lengths.
+    constexpr int32_t kInputLength{2 * kTOKENS_PER_PAGE};
+    auto request = begin(makeTokens(kInputLength));
+    publishPrefill(request, kInputLength);
+
+    ASSERT_EQ(
+        mCoordinator->prepareDecodeStep(request.request, DecodingKvHeadroom{5, 0}), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    std::vector<int32_t> accepted{41, 42};
+    std::vector<ContextCacheSequenceAdvance> verified{
+        ContextCacheSequenceAdvance{accepted.data(), 2, kInputLength + 2}};
+    ASSERT_EQ(mCoordinator->completeDecodeStep(request.request, verified, {}), ContextCacheCoordinatorStatus::kOk);
+
+    ASSERT_EQ(
+        mCoordinator->prepareDecodeStep(request.request, DecodingKvHeadroom{5, 0}), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    std::vector<ContextCacheSequenceAdvance> crooked{ContextCacheSequenceAdvance{nullptr, 0, kInputLength + 2}};
+    EXPECT_THROW(mCoordinator->completeDecodeStep(request.request, crooked, {}), std::runtime_error);
+    std::vector<ContextCacheSequenceAdvance> held{
+        ContextCacheSequenceAdvance{nullptr, 0, ContextCacheSequenceAdvance::kHoldCommittedStateLength}};
+    EXPECT_EQ(mCoordinator->completeDecodeStep(request.request, held, {}), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(mCoordinator->finish(request.request), ContextCacheCoordinatorStatus::kOk);
+
+    std::vector<int32_t> continuation = makeTokens(kInputLength);
+    continuation.push_back(77);
+    auto next = begin(std::move(continuation));
+    EXPECT_EQ(next.prefillStarts, std::vector<int32_t>{kInputLength});
+    EXPECT_EQ(mCoordinator->finish(next.request), ContextCacheCoordinatorStatus::kOk);
 }
 
 TEST_F(ContextCacheGemma4MtpCoordinatorTests, AdmissionReservesFullVerifyWindowBeforeFirstDecode)
