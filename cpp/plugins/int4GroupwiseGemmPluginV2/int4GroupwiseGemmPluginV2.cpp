@@ -73,6 +73,17 @@ bool m1LargeToGemmEnabled()
     return sEnabled;
 }
 
+// EDGELLM_INT4_MULTIROW_GEMM=0 restores the GEMV for every M in [2, 4], for A/B
+// runs against the same engine.
+bool multiRowToGemmEnabled()
+{
+    static bool const sEnabled = [] {
+        char const* const value = std::getenv("EDGELLM_INT4_MULTIROW_GEMM");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return sEnabled;
+}
+
 inline int64_t computeMaxLockWorkspaceBytes(
     DynamicPluginTensorDesc const* inputs, int32_t nbInputs, int32_t N, int32_t K)
 {
@@ -406,13 +417,13 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
             return -1;
         }
 
-        // Decode regime: route small M to the CUDA-core GEMV. At small M the GEMM's
-        // tensor-core MMA underfills its M rows, so the GEMV is the better compute
-        // path except for the large group-32 weights int4RouteToGemv names. It reads
-        // the SAME fragment weight buffer (input[1]), so there is no extra weight and
-        // no repack -- one buffer serves prefill and decode.
-        if (int4RouteToGemv(M, mGemmN, mGemmK, mGroupSize, m1LargeToGemmEnabled()) && cuteDslInt4GemvSupported(M)
-            && cuteDslInt4GemvLoadModules(mGroupSize))
+        // Decode regime: int4RouteToGemv picks the CUDA-core GEMV or the GEMM for
+        // small M. The GEMV reads the SAME fragment weight buffer (input[1]), so there
+        // is no extra weight and no repack -- one buffer serves prefill and decode. A
+        // small M routed to the GEMM runs the tactic TensorRT autotuned at the
+        // profile's optimum M.
+        if (int4RouteToGemv(M, mGemmN, mGemmK, mGroupSize, m1LargeToGemmEnabled(), multiRowToGemmEnabled())
+            && cuteDslInt4GemvSupported(M) && cuteDslInt4GemvLoadModules(mGroupSize))
         {
             return cuteDslInt4GemvLaunch(
                 M, inputs[0], inputs[1], inputs[2], outputs[0], mGemmN, mGemmK, mGroupSize, stream);
