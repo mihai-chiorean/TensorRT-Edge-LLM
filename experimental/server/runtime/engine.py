@@ -2025,36 +2025,37 @@ class LLM:
         Never waits for a running request: while one holds the runtime, the
         last snapshot is returned (None before the first read).
         """
-        if not self.context_cache_enabled or self._runtime is None:
+        if (not self.context_cache_enabled or self._closed
+                or self._runtime is None):
             return None
         if not self._infer_lock.acquire(blocking=False):
             return getattr(self, "_context_cache_snapshot", None)
+        # The snapshot is published under the lock so a slower reader cannot
+        # overwrite newer counters; /health can also race with close().
         try:
-            # /health can race with close(); report no metrics instead of
-            # raising once the runtime is gone.
             runtime = self._runtime
             if self._closed or runtime is None:
                 return None
             metrics = runtime.get_context_cache_metrics()
+            if metrics is None:
+                return None
+            result: Dict[str, Any] = {}
+            for name in dir(metrics):
+                if name.startswith("_"):
+                    continue
+                value = getattr(metrics, name)
+                if callable(value):
+                    continue
+                if hasattr(value, "free") and hasattr(value, "capacity"):
+                    value = {
+                        "free": int(value.free),
+                        "capacity": int(value.capacity)
+                    }
+                result[name] = value
+            self._context_cache_snapshot = result
+            return result
         finally:
             self._infer_lock.release()
-        if metrics is None:
-            return None
-        result: Dict[str, Any] = {}
-        for name in dir(metrics):
-            if name.startswith("_"):
-                continue
-            value = getattr(metrics, name)
-            if callable(value):
-                continue
-            if hasattr(value, "free") and hasattr(value, "capacity"):
-                value = {
-                    "free": int(value.free),
-                    "capacity": int(value.capacity)
-                }
-            result[name] = value
-        self._context_cache_snapshot = result
-        return result
 
     @property
     def bundle_layout(self) -> BundleLayout:

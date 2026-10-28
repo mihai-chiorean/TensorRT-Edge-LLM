@@ -2057,8 +2057,14 @@ def test_context_cache_metrics_return_none_after_close():
     llm._closed = True
     assert llm.context_cache_metrics() is None
     llm._closed = False
-    llm._runtime = None
+    assert llm.context_cache_metrics() == {"hit_sequences": 1}
+    # A request holds the runtime: the cached snapshot is served while open,
+    # never after close().
+    assert llm._infer_lock.acquire(blocking=False)
+    assert llm.context_cache_metrics() == {"hit_sequences": 1}
+    llm._closed = True
     assert llm.context_cache_metrics() is None
+    llm._infer_lock.release()
 
 
 def test_context_cache_metrics_do_not_wait_for_a_running_request():
