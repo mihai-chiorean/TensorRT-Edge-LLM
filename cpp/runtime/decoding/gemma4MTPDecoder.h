@@ -92,6 +92,12 @@ private:
     bool acceptAndCommit(DecodingInferenceContext& context);
     bool updateNextSeed(DecodingInferenceContext& context);
 
+    //! Copies `count` device token ids into `hostIds` and waits for them, when a host-mapped table needs them;
+    //! returns nullptr otherwise.
+    int32_t const* tokenIdsForHostTables(Tensor const& deviceIds, int64_t count, Tensor& hostIds, cudaStream_t stream);
+    //! Token-embedding lookup into the base pipeline's inputsEmbeds; `hostIds` is required for a host-mapped table.
+    void embedTokens(Tensor const& tokenIds, int32_t const* hostIds, cudaStream_t stream);
+
     DecodingRuntimeContext& mRuntime;
     std::unique_ptr<EngineExecutor> mDraftExecutor;
     TensorMap mDraftTensorMap;
@@ -109,6 +115,9 @@ private:
     Tensor mHostAcceptLengths;    //!< [B] INT32 host staging.
     Tensor mHostAcceptedTokenIds; //!< [B, specDraftStep + 1] INT32 host staging.
     Tensor mArgmaxScratch;        //!< [B * (specDraftStep + 1)] INT32 accept argmax scratch.
+    //! Host copies of device-sampled ids for host-mapped tables: [B] per draft step and [B, verifySize] per verify.
+    Tensor mHostDraftStepTokenIds;
+    Tensor mHostVerifyTokenIds;
     RaggedExecutionBatch mRaggedMetadataScratch;
 
     bool mUseTree{false};

@@ -58,6 +58,10 @@ void appendSampledTokens(DecodingInferenceContext& context, int32_t const* sampl
 //! bound region is a contiguous prefix of the allocation, so shape.volume() is sufficient.
 void zeroActiveRegion(Tensor& tensor, cudaStream_t stream);
 
+//! @brief Copy the first `count` device token ids into the pinned `hostIds` and wait for the copy to land.
+//! For row lookups that gather on the host from ids sampled on the device. Returns `hostIds`' data.
+int32_t const* copyTokenIdsToHost(Tensor const& deviceIds, int64_t count, Tensor& hostIds, cudaStream_t stream);
+
 //! @brief Copy accepted tokens from device buffers into the host-side context token lists.
 //! The caller must commit the same accept lengths to persistent base state before calling this function.
 //! On return, hostAcceptLengths holds the number of tokens actually appended per slot.
