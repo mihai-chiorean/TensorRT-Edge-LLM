@@ -380,6 +380,15 @@ Jetson AGX Orin 32 GB (JetPack 7.2 / CUDA 13.2 / TensorRT 10.16.2):
    (`json_object`, `json_schema`) or `guided_decoding` on the request.
    `--enable-in-flight-batching` exists but gains nothing at batch size 1.
 
-6. **Unit tests** gain `unittests/unitTestScheduler`; the INT8 sidecar tests
+6. **Python environment.** `requirements-server.txt` no longer lists
+   `pybind11`; it moved to the `native-build` extra. On a fresh venv install
+   it before step 5 (`pip install pybind11==3.0.4`), otherwise the
+   `import pybind11` line there fails. The server modules moved as well, so
+   check 4 under "Verification performed" imports
+   `experimental.server.runtime.engine` and `experimental.server.api.app`
+   instead of `experimental.server.engine` and
+   `experimental.server.api_server`.
+
+7. **Unit tests** gain `unittests/unitTestScheduler`; the INT8 sidecar tests
    are in `unitTestKernelsMisc` and the media-boundary reuse test in
    `unitTestContextCache`.

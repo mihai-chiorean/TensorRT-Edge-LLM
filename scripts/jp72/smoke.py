@@ -92,11 +92,19 @@ for raw in r:
         arrivals.append((time.time() - t0, "[DONE]"))
         break
     obj = json.loads(payload)
+    if "error" in obj:
+        sys.exit("streaming completion failed: %r" % (obj["error"], ))
     ch = obj.get("choices") or [{}]
+    if ch[0].get("finish_reason") == "error":
+        sys.exit("streaming completion finished with finish_reason=error")
     d = (ch[0].get("delta") or {}).get("content")
     if d:
         deltas.append(d)
         arrivals.append((time.time() - t0, d))
+if not arrivals or arrivals[-1][1] != "[DONE]":
+    sys.exit("streaming completion ended without [DONE]")
+if not deltas:
+    sys.exit("streaming completion produced no content")
 print("n_sse_events_with_content:", len(deltas))
 print("first 12 arrivals (t_sec, delta):")
 for t, d in arrivals[:12]:
