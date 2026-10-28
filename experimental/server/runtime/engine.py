@@ -1012,8 +1012,10 @@ class LLM:
         num_speculative_tokens = None
         if speculative_config:
             from ..config import SpeculativeConfig
+            from .engine_layout import is_prebuilt_engine_tree
 
-            spec = SpeculativeConfig.parse(speculative_config)
+            spec = SpeculativeConfig.parse(
+                speculative_config, prebuilt=is_prebuilt_engine_tree(model))
             options = replace(options,
                               spec_type=spec.method,
                               draft_model_dir=spec.draft_model)
@@ -1125,7 +1127,7 @@ class LLM:
         if host_embedding_tables:
             _check_host_embedding_tables(self._layout, self._engine_dir)
         if host_ple_table:
-            _check_host_ple_table(self._engine_dir)
+            _check_host_ple_table(self._layout, self._engine_dir)
         residency = {"host_embedding_tables": host_embedding_tables}
         if host_ple_table:
             residency["host_ple_table"] = True
@@ -2353,18 +2355,22 @@ class TTS:
         run_http_server(EngineClient(self, config), config)
 
 
+def _check_speculative_host_tables(layout, engine_dir: str, flag: str) -> None:
+    """The native runtime host-maps tables only for vanilla or Gemma 4 MTP
+    decoding (``supportsHostMappedEmbeddingTables``)."""
+    if layout.engine_type != EngineType.SPEC_DECODE:
+        return
+    method = _read_json(os.path.join(engine_dir, SPEC_BASE_CONFIG_FILE)).get(
+        "spec_decode_type", "")
+    if method != "gemma4_mtp":
+        raise ValueError(
+            f"{flag} supports speculative decoding only for Gemma 4 MTP "
+            f"bundles, not {method!r}")
+
+
 def _check_host_embedding_tables(layout, engine_dir: str) -> None:
-    if layout.engine_type == EngineType.SPEC_DECODE:
-        method = _read_json(os.path.join(engine_dir,
-                                         SPEC_BASE_CONFIG_FILE)).get(
-                                             "spec_decode_type", "")
-        # Other speculative decoders embed draft tokens from the device copy
-        # of the token table.
-        if method != "gemma4_mtp":
-            raise ValueError(
-                "--host-embedding-tables supports speculative decoding only "
-                f"for Gemma 4 MTP bundles, not {method!r}; use "
-                "--host-ple-table to keep only the PLE table in host memory")
+    _check_speculative_host_tables(layout, engine_dir,
+                                   "--host-embedding-tables")
     if layout.has_speech:
         raise ValueError(
             "--host-embedding-tables does not support Qwen3-Omni audio "
@@ -2379,7 +2385,8 @@ def _check_host_embedding_tables(layout, engine_dir: str) -> None:
             "--int8-embedding export")
 
 
-def _check_host_ple_table(engine_dir: str) -> None:
+def _check_host_ple_table(layout, engine_dir: str) -> None:
+    _check_speculative_host_tables(layout, engine_dir, "--host-ple-table")
     if not os.path.isfile(os.path.join(engine_dir,
                                        "ple_embedding.safetensors")):
         raise ValueError(

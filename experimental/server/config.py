@@ -20,6 +20,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Sequence, Union
 
+from .runtime.engine_layout import is_prebuilt_engine_tree
+
 _INT32_MAX = 2**31 - 1
 _INT64_MAX = 2**63 - 1
 _DEFAULT_ENCODER_EMBEDDING_CACHE_BUDGET_BYTES = 256 * 1024 * 1024
@@ -44,9 +46,15 @@ class SpeculativeConfig:
     verify_tree_size: Optional[int] = None
 
     @classmethod
-    def parse(
-        cls, value: Union[str, Mapping[str, Any], "SpeculativeConfig", None]
-    ) -> Optional["SpeculativeConfig"]:
+    def parse(cls,
+              value: Union[str, Mapping[str, Any], "SpeculativeConfig", None],
+              *,
+              prebuilt: bool = False) -> Optional["SpeculativeConfig"]:
+        """Validate a speculative configuration.
+
+        ``prebuilt`` marks a pre-built engine tree, whose draft engine is part
+        of the bundle, so no paired method needs a draft ``model``.
+        """
         if not value:
             return None
         if isinstance(value, cls):
@@ -54,8 +62,8 @@ class SpeculativeConfig:
                 "method": value.method,
                 "num_speculative_tokens": value.num_speculative_tokens,
                 # An absent draft model is stored as "", which re-parsing would
-                # reject as a malformed model id. MTP is the only method that
-                # legitimately has none, so re-parsing must round-trip.
+                # reject as a malformed model id. MTP and pre-built trees
+                # legitimately have none, so re-parsing must round-trip.
                 "model": value.draft_model or None,
                 "draft_top_k": value.draft_top_k,
                 "verify_tree_size": value.verify_tree_size,
@@ -101,8 +109,8 @@ class SpeculativeConfig:
             raise ServerConfigError(
                 "--speculative-config.model must be a checkpoint path or "
                 "Hugging Face model ID")
-        if method in {"eagle3", "dflash", "jetspec", "dspark"
-                      } and not draft_model:
+        if (method in {"eagle3", "dflash", "jetspec", "dspark"}
+                and not draft_model and not prebuilt):
             raise ServerConfigError(
                 f"--speculative-config.method {method!r} requires "
                 "speculative-config.model")
@@ -423,7 +431,8 @@ def create_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Keep only the INT8 PLE sidecar table mapped in host memory; the "
         "token-embedding table is uploaded to the GPU. Needs the "
-        "ple_embedding.safetensors sidecar. Mutually exclusive with "
+        "ple_embedding.safetensors sidecar; speculative decoding supports "
+        "it only for Gemma 4 MTP. Mutually exclusive with "
         "--host-embedding-tables.",
     )
     model.add_argument("--context-cache-max-records",
@@ -455,7 +464,9 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
     if args.queue_timeout <= 0:
         raise ServerConfigError("--queue-timeout must be positive")
 
-    speculative = SpeculativeConfig.parse(args.speculative_config)
+    speculative = SpeculativeConfig.parse(args.speculative_config,
+                                          prebuilt=is_prebuilt_engine_tree(
+                                              args.model))
     draft_step = args.draft_step
     draft_top_k = args.draft_top_k
     verify_tree_size = args.verify_tree_size

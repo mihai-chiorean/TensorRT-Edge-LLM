@@ -706,3 +706,23 @@ def test_reasoning_parser_reads_a_speculative_base_config(tmp_path):
     _write_json(engines / "base_config.json",
                 _engine_config(model="qwen3", spec="eagle3"))
     assert REASONING_PARSERS.resolve("auto", str(engines)) is not None
+
+
+def test_prebuilt_paired_bundle_takes_a_model_free_speculative_config(
+        tmp_path, monkeypatch):
+    from experimental.server.runtime.engine import load_model
+
+    bundle = _prebuilt_gemma4_mtp_tree(tmp_path / "engines")
+    base_config = bundle / "llm" / "base_config.json"
+    _write_json(
+        base_config,
+        json.loads(base_config.read_text()) | {"spec_decode_type": "eagle3"})
+    monkeypatch.setattr("experimental.server.runtime.engine._import_runtime",
+                        lambda: _FakeBindings)
+    llm = load_model(model=str(bundle),
+                     cache_dir=str(tmp_path / "cache"),
+                     speculative_config={
+                         "method": "eagle3",
+                         "num_speculative_tokens": 3
+                     })
+    assert llm._runtime.args[3:5] == (10, 3)

@@ -902,8 +902,8 @@ def test_host_embedding_tables_reach_the_gemma4_mtp_runtime(
     assert captured["kwargs"] == {"host_embedding_tables": True}
 
 
-def test_host_ple_table_reaches_the_speculative_runtime(monkeypatch, tmp_path):
-    _write_spec_engine_dir(tmp_path, "eagle3")
+def test_host_ple_table_reaches_the_gemma4_mtp_runtime(monkeypatch, tmp_path):
+    _write_spec_engine_dir(tmp_path, "gemma4_mtp")
     captured = {}
     llm = _host_tables_llm(monkeypatch, EngineType.SPEC_DECODE, captured,
                            tmp_path)
@@ -914,6 +914,19 @@ def test_host_ple_table_reaches_the_speculative_runtime(monkeypatch, tmp_path):
         "host_embedding_tables": False,
         "host_ple_table": True,
     }
+
+
+def test_host_ple_table_rejected_for_other_speculative_decoders(
+        monkeypatch, tmp_path):
+    _write_spec_engine_dir(tmp_path, "dflash")
+    captured = {}
+    llm = _host_tables_llm(monkeypatch, EngineType.SPEC_DECODE, captured,
+                           tmp_path)
+    llm._host_embedding_tables = False
+    llm._host_ple_table = True
+    with pytest.raises(ValueError, match="--host-ple-table supports"):
+        llm._load_runtime()
+    assert "kwargs" not in captured
 
 
 def test_host_ple_table_requires_the_ple_sidecar(monkeypatch, tmp_path):

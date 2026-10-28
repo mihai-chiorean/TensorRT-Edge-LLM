@@ -124,6 +124,15 @@ def classify_model_source(path: str) -> str:
     return "model"
 
 
+def is_prebuilt_engine_tree(path: str) -> bool:
+    """Whether ``path`` holds built LLM engines, at its root or under llm/."""
+    if not os.path.isdir(path):
+        return False
+    return any(
+        detect_engine_type(directory) != EngineType.UNKNOWN
+        for directory in (path, os.path.join(path, "llm")))
+
+
 def _component_dir(root: str, name: str, engine_file: str) -> Optional[str]:
     path = os.path.join(root, name)
     return path if os.path.isfile(os.path.join(path, engine_file)) else None

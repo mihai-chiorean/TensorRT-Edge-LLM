@@ -478,3 +478,18 @@ def test_speculative_config_rejects_conflicting_flags(flags, payload, match):
 def test_speculative_config_rejects_invalid_tree_sizes(key):
     with pytest.raises(ServerConfigError, match=key):
         SpeculativeConfig.parse({"method": "mtp", key: 0})
+
+
+def test_prebuilt_tree_needs_no_draft_model(tmp_path):
+    (tmp_path / "llm").mkdir()
+    for name in ("spec_base.engine", "spec_draft.engine"):
+        (tmp_path / "llm" / name).touch()
+    config = parse_server_config([
+        str(tmp_path),
+        "--speculative-config",
+        '{"method":"dflash","num_speculative_tokens":4}',
+    ])
+    spec = config.model.speculative_config
+    assert spec.method == "dflash"
+    assert not spec.draft_model
+    assert SpeculativeConfig.parse(spec, prebuilt=True) == spec
