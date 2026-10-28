@@ -237,6 +237,15 @@ def _match_nvfp4_gemm(graph: gs.Graph):
 
 
 _PRE_QUANT_SCALE_SUFFIX = ".pre_quant_scale"
+_QUANTIZER_SCALE_MARKERS = ("pre_quant_scale", "input_quantizer", "smooth")
+
+
+def _is_quantizer_constant(operand) -> bool:
+    """A constant named after a ModelOpt quantizer or smoothing scale."""
+    if not isinstance(operand, gs.Constant):
+        return False
+    name = (operand.name or "").lower()
+    return any(marker in name for marker in _QUANTIZER_SCALE_MARKERS)
 
 
 def _unsmoothed_int4_activation(node: gs.Node) -> gs.Tensor:
@@ -251,8 +260,10 @@ def _unsmoothed_int4_activation(node: gs.Node) -> gs.Tensor:
     Exports without activation smoothing in the graph (GPTQ, column-packed
     AWQ, or a plugin fed by a graph input such as
     ``per_layer_model_projection`` on ``inputs_embeds``) use the plugin input
-    directly. A scaling op that cannot be classified is an error: taking the
-    scaled tensor would silently bind the adapter to the wrong activation.
+    directly, and so does a ``Mul`` by an architectural constant such as an
+    RMSNorm weight. A ``Mul`` by a quantizer-named constant that is not a
+    ``*.pre_quant_scale`` is an error: taking the scaled tensor would
+    silently bind the adapter to the wrong activation.
     """
     activation = node.inputs[0]
     if not activation.inputs:
@@ -270,11 +281,13 @@ def _unsmoothed_int4_activation(node: gs.Node) -> gs.Tensor:
             scale = constants[0]
             return next(operand for operand in producer.inputs
                         if operand is not scale)
-        raise ValueError(
-            f"INT4 GEMM {node.name} is fed by Mul {producer.name} with "
-            f"constant operand(s) {[c.name for c in constants]} that are not "
-            "a *.pre_quant_scale; cannot locate the unsmoothed activation "
-            "for the LoRA branch")
+        if any(_is_quantizer_constant(c) for c in constants):
+            raise ValueError(
+                f"INT4 GEMM {node.name} is fed by Mul {producer.name} with "
+                f"constant operand(s) {[c.name for c in constants]} that are "
+                "not a *.pre_quant_scale; cannot locate the unsmoothed "
+                "activation for the LoRA branch")
+        return activation
     if producer.op == "Cast":
         cast_input = producer.inputs[0]
         if "input_quantizer" in (cast_input.name or "") and cast_input.inputs:
@@ -282,7 +295,7 @@ def _unsmoothed_int4_activation(node: gs.Node) -> gs.Tensor:
             if mul_node.op == "Mul":
                 return mul_node.inputs[0]
         if cast_input.inputs and cast_input.inputs[0].op == "Mul" and any(
-                isinstance(operand, gs.Constant)
+                _is_quantizer_constant(operand)
                 for operand in cast_input.inputs[0].inputs):
             raise ValueError(
                 f"INT4 GEMM {node.name} is fed by Cast {producer.name} over "

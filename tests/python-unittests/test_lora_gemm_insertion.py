@@ -285,6 +285,24 @@ def _int4_legacy_awq_graph():
                     outputs=[output])
 
 
+def _int4_cast_over_mul_graph(scale_name):
+    """``Cast(Mul(x, constant))`` feeding the plugin, where the ``Mul`` output
+    carries no quantizer name (an FP32 RMSNorm weight multiply, for one)."""
+    hidden = gs.Variable("hidden", dtype=np.float32, shape=["tokens", 16])
+    scale = gs.Constant(scale_name, values=np.full((16, ), 2.0, np.float32))
+    normed = gs.Variable("normed", dtype=np.float32, shape=["tokens", 16])
+    casted = gs.Variable("casted", dtype=np.float16, shape=["tokens", 16])
+    nodes = [
+        gs.Node(op="Mul", inputs=[hidden, scale], outputs=[normed]),
+        gs.Node(op="Cast", attrs={"to": 10}, inputs=[normed],
+                outputs=[casted]),
+    ]
+    plugin_nodes, output = _int4_plugin(casted)
+    return gs.Graph(nodes=nodes + plugin_nodes,
+                    inputs=[hidden],
+                    outputs=[output])
+
+
 def _int4_graph_input_graph():
     """``per_layer_model_projection`` style: the plugin reads a graph input."""
     hidden = gs.Variable("inputs_embeds",
@@ -369,10 +387,46 @@ def test_int4_unsmoothed_product_activation_is_used_directly():
     assert matches[0].input.name == "product"
 
 
-def test_int4_unrecognized_scaling_mul_is_rejected():
-    graph = _int4_awq_graph(scale_name="node_scale")
+_NORM_WEIGHT = "model.layers.0.input_layernorm.weight"
 
+
+def test_int4_architectural_mul_activation_is_used_directly(tmp_path):
+    graph = _int4_awq_graph(scale_name=_NORM_WEIGHT)
+
+    matches = _match_int4_gemm(graph)
+
+    assert len(matches) == 1
+    assert matches[0].input.name == "smoothed"
+
+    onnx.save(gs.export_onnx(graph), tmp_path / "model.onnx")
+    insert_lora_and_save(str(tmp_path))
+    _, nodes = _lora_nodes(tmp_path)
+
+    assert nodes[f"{_INT4_GEMM_NAME}/lora_matmul_A"].inputs[0].name == \
+        "smoothed"
+
+
+def test_int4_cast_over_architectural_mul_is_used_directly():
+    matches = _match_int4_gemm(_int4_cast_over_mul_graph(_NORM_WEIGHT))
+
+    assert len(matches) == 1
+    assert matches[0].input.name == "casted"
+
+
+@pytest.mark.parametrize("scale_name", [
+    f"_model.{_INT4_STEM}.input_quantizer._pre_quant_scale",
+    f"_model.{_INT4_STEM}.pre_quant_scale_folded",
+    "smooth_scale",
+])
+def test_int4_unrecognized_scaling_mul_is_rejected(scale_name):
     with pytest.raises(ValueError, match="pre_quant_scale"):
+        _match_int4_gemm(_int4_awq_graph(scale_name=scale_name))
+
+
+def test_int4_cast_over_unrecognized_scaling_mul_is_rejected():
+    graph = _int4_cast_over_mul_graph(f"_model.{_INT4_STEM}.pre_quant_scale")
+
+    with pytest.raises(ValueError, match="unrecognized scaling Mul"):
         _match_int4_gemm(graph)
 
 
