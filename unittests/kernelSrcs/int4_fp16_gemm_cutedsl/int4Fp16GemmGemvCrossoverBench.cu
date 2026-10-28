@@ -567,24 +567,46 @@ TEST(Int4Fp16GemmGemvCrossoverBench, TimingTable)
                         dC.ptr, dLocks.ptr, M, N, K, groupSize};
                 };
                 // Serial split-K reduces into C and needs zeroed locks before every launch (as the plugin does),
-                // so the memset is part of the timed region.
+                // so the memset is part of the timed region. One sample replays a CUDA graph of the rotating
+                // launches, as the runtime replays the engine, so host submission gaps are not timed.
+                int32_t const launchesPerSample = std::max(kLaunchesPerSample, copies);
                 auto timed = [&](auto const& launch) -> float {
-                    int32_t copy = 0;
+                    cudaGraph_t graph{};
+                    cudaGraphExec_t graphExec{};
+                    if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess)
+                    {
+                        return -1.f;
+                    }
+                    bool launched = true;
+                    for (int32_t i = 0; i < launchesPerSample; ++i)
+                    {
+                        launched = launched && launch(problemFor(i % copies)) == 0;
+                    }
+                    bool const captured = cudaStreamEndCapture(stream, &graph) == cudaSuccess;
+                    if (!launched || !captured || cudaGraphInstantiate(&graphExec, graph, 0) != cudaSuccess)
+                    {
+                        if (graph != nullptr)
+                        {
+                            cudaGraphDestroy(graph);
+                        }
+                        (void) cudaGetLastError();
+                        return -1.f;
+                    }
                     auto batchMs = [&]() -> float {
                         cudaEventRecord(start, stream);
-                        for (int32_t i = 0; i < kLaunchesPerSample; ++i)
+                        if (cudaGraphLaunch(graphExec, stream) != cudaSuccess)
                         {
-                            if (launch(problemFor(copy)) != 0)
-                            {
-                                return -1.f;
-                            }
-                            copy = (copy + 1) % copies;
+                            return -1.f;
                         }
                         cudaEventRecord(stop, stream);
                         cudaEventSynchronize(stop);
                         float elapsedMs{};
                         cudaEventElapsedTime(&elapsedMs, start, stop);
                         return elapsedMs;
+                    };
+                    auto release = [&]() {
+                        cudaGraphExecDestroy(graphExec);
+                        cudaGraphDestroy(graph);
                     };
                     float const warmupMs = firstKernelOfShape ? kShapeWarmupMs : kWarmupMs;
                     firstKernelOfShape = false;
@@ -593,6 +615,7 @@ TEST(Int4Fp16GemmGemvCrossoverBench, TimingTable)
                         float const ms = batchMs();
                         if (ms < 0.f)
                         {
+                            release();
                             return -1.f;
                         }
                         warmedMs += ms;
@@ -603,10 +626,12 @@ TEST(Int4Fp16GemmGemvCrossoverBench, TimingTable)
                         float const ms = batchMs();
                         if (ms < 0.f)
                         {
+                            release();
                             return -1.f;
                         }
-                        perLaunchUs.push_back(ms * 1000.f / kLaunchesPerSample);
+                        perLaunchUs.push_back(ms * 1000.f / launchesPerSample);
                     }
+                    release();
                     std::sort(perLaunchUs.begin(), perLaunchUs.end());
                     return perLaunchUs[perLaunchUs.size() / 2];
                 };
