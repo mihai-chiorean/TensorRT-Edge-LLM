@@ -1670,6 +1670,24 @@ TEST_F(DeploymentConfigTest, Gemma4MTPMatchingPoolGeometryValidatesOk)
     EXPECT_NO_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath}, std::nullopt));
 }
 
+// A base exported with shared-KV suffix compaction emits one prefill hidden row per sequence, and the drafter's
+// first seed must be read from that row instead of the last prompt row.
+TEST_F(DeploymentConfigTest, Gemma4MTPBaseReportsCompactedPrefillHidden)
+{
+    auto const draftPath = writeJsonToTempFile(makeGemma4MTPDraftConfig(), "draft");
+    auto const legacyPath = writeJsonToTempFile(makeGemma4MTPBaseConfig(), "base");
+    DeploymentConfig const legacy
+        = createDeploymentConfig(legacyPath, std::optional<std::filesystem::path>{draftPath}, std::nullopt);
+    EXPECT_FALSE(legacy.base.compactedPrefillHidden);
+
+    Json compacted = makeGemma4MTPBaseConfig();
+    compacted["compacted_prefill_hidden"] = true;
+    auto const compactedPath = writeJsonToTempFile(compacted, "base");
+    DeploymentConfig const bundle
+        = createDeploymentConfig(compactedPath, std::optional<std::filesystem::path>{draftPath}, std::nullopt);
+    EXPECT_TRUE(bundle.base.compactedPrefillHidden);
+}
+
 TEST_F(DeploymentConfigTest, Gemma4MTPTreeValidatesOk)
 {
     auto const basePath = writeJsonToTempFile(makeGemma4MTPBaseConfig(), "base");

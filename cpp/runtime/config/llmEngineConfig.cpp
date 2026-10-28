@@ -331,6 +331,7 @@ void parseGemma4MTPFields(Json const& configJson, LLMEngineConfig& cfg)
     cfg.constantDraftPositions = configJson.value("constant_draft_positions", false);
     cfg.returnsFeedbackHidden = configJson.value("returns_feedback_hidden", false);
     cfg.assistantHiddenSize = configJson.value("assistant_hidden_size", 0);
+    cfg.compactedPrefillHidden = configJson.value("compacted_prefill_hidden", false);
 
     if (!configJson.contains("kv_sharing_map"))
     {

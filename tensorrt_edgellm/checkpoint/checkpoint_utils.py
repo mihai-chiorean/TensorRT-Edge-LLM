@@ -708,6 +708,8 @@ def build_runtime_llm_config_dict(
 
     if config.gemma4_mtp_base:
         out.update({
+            "compacted_prefill_hidden":
+            bool(getattr(model, "emits_compacted_mtp_prefill_hidden", False)),
             "base_model_hidden_size":
             config.hidden_size,
             "layer_types":

@@ -235,6 +235,8 @@ struct LLMEngineConfig
     bool constantDraftPositions{false}; //!< Assistant draft position IDs stay constant through a chain.
     bool returnsFeedbackHidden{false};  //!< Assistant emits backbone-space feedback hidden states.
     int32_t assistantHiddenSize{0};     //!< Assistant internal hidden dim, when distinct from hiddenSize.
+    //! Base emits prefill hidden states only at logits_indices (one row per sequence), not for every prompt row.
+    bool compactedPrefillHidden{false};
     std::vector<Gemma4MTPKVSharingEntry> gemma4MTPKVSharingMap{}; //!< Assistant -> target KV sharing map.
 
     //! DSpark Markov/confidence sidecar metadata.
