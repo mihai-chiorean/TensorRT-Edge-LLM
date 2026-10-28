@@ -73,6 +73,14 @@ def _eos_token_ids(value: Any, source: str) -> "list[int]":
         "nonnegative integer or a nonempty list of nonnegative integers")
 
 
+def _load_json_object(path: str) -> Dict[str, Any]:
+    with open(path) as json_file:
+        value = json.load(json_file)
+    if not isinstance(value, dict):
+        raise ValueError(f"{path} must contain an object")
+    return value
+
+
 def _apply_generic_token_ids(config: Dict[str, Any], root: Dict[str, Any],
                              runtime_model_dir: str) -> None:
     thinker = root.get("thinker_config") or {}
@@ -101,16 +109,14 @@ def _apply_generic_token_ids(config: Dict[str, Any], root: Dict[str, Any],
     if not eos_ids:
         runtime_config_path = os.path.join(runtime_model_dir, "config.json")
         if os.path.isfile(runtime_config_path):
-            with open(runtime_config_path) as runtime_config_file:
-                eos_ids = _eos_token_ids(
-                    json.load(runtime_config_file).get("eos_token_id"),
-                    runtime_config_path)
+            eos_ids = _eos_token_ids(
+                _load_json_object(runtime_config_path).get("eos_token_id"),
+                runtime_config_path)
     generation_path = os.path.join(runtime_model_dir, "generation_config.json")
     if os.path.isfile(generation_path):
-        with open(generation_path) as generation_file:
-            eos_ids += _eos_token_ids(
-                json.load(generation_file).get("eos_token_id"),
-                "generation_config.json")
+        eos_ids += _eos_token_ids(
+            _load_json_object(generation_path).get("eos_token_id"),
+            "generation_config.json")
     if eos_ids:
         config["eos_token_id"] = list(dict.fromkeys(eos_ids))
 

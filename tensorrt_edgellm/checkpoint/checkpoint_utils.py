@@ -236,6 +236,8 @@ def load_checkpoint_config_dicts(
                 raw = json.load(_f)
         except (OSError, ImportError, ValueError):
             pass
+    if not isinstance(raw, dict):
+        raise ValueError("config.json must contain an object")
 
     try:
         config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
