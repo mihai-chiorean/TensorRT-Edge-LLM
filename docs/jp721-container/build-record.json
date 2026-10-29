@@ -1,0 +1,3399 @@
+{
+  "generated_at": "2026-10-07T22:19:27+00:00",
+  "target": {
+    "device": "Jetson AGX Orin / Orin NX (sm_87)",
+    "jetpack": "7.2.1 (nvidia-jetpack 7.2.1-b49)",
+    "l4t": "R39.2",
+    "cuda": "13.2 (13.2.86)",
+    "tensorrt": "10.16.2.10",
+    "cudnn": "9.20.0.46",
+    "cuda_architectures": "87"
+  },
+  "build_host": {
+    "hostname": "spark-094a",
+    "arch": "aarch64",
+    "docker": "Version:           29.6.2",
+    "gpu_passthrough": false
+  },
+  "docker": {
+    "dockerfile_sha256": "0d6bca044676342dad60e6953c3add79d6bf93187b7aa12e5d7cc8b8d8816332",
+    "build_edgellm_sh_sha256": "5b34950a7929dfbb95ce5f54c2570f5c054309add54f1611bf0acee4d5c11c37",
+    "image": "trt-edge-llm/jp721-build:cda4fc1",
+    "image_id": "sha256:0572e32c9aaf46df1e940af94bd15646cd9f7199a4328ba4c7ee6271a069ff5f",
+    "image_created": "2026-10-07T15:16:58.022455425-07:00",
+    "image_size_bytes": 9168165769,
+    "base_image_repo_digest": "ubuntu@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55",
+    "base_image_id": "sha256:95d16dfcd4ab8b61154e2280ab9fe4afa2ef03e5eefa8a689e86571e8a1b32cf",
+    "image_build_wall_seconds": 127,
+    "container_run_wall_seconds": 118,
+    "container_exit_code": 0,
+    "container_limits": {
+      "cpus": "10",
+      "memory": "14g",
+      "make_jobs": 8,
+      "NanoCpus": 10000000000,
+      "Memory": 15032385536,
+      "MemorySwap": 15032385536
+    },
+    "container_isolation": {
+      "Runtime": "runc",
+      "DeviceRequests": null,
+      "Devices": [],
+      "Privileged": false,
+      "env": [
+        "JOBS=8",
+        "HOST_UID=1000",
+        "HOST_GID=1000",
+        "EXPECTED_SOURCE_TREE_SHA256=c1520a35d4e72839ec6a2ecbc2681b9b674c1c28ab98e7fd66700ad2b04522cf",
+        "PATH=/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "DEBIAN_FRONTEND=noninteractive"
+      ]
+    },
+    "docker_stats_peak_mem": "3434 MiB"
+  },
+  "apt": {
+    "source_line": "deb [arch=arm64 signed-by=/usr/share/keyrings/nvidia-jetson-ota.gpg] https://repo.download.nvidia.com/jetson/common r39.2 main",
+    "key_url": "https://repo.download.nvidia.com/jetson/jetson-ota-public.asc",
+    "key_fingerprint": "3C6D1FF3100C8C3ABB0869C0E6543461A9996195",
+    "pins": [
+      "cuda-cccl-13-2=13.2.86-1",
+      "cuda-crt-13-2=13.2.86-1",
+      "cuda-cudart-13-2=13.2.86-1",
+      "cuda-cudart-dev-13-2=13.2.86-1",
+      "cuda-culibos-13-2=13.2.86-1",
+      "cuda-culibos-dev-13-2=13.2.86-1",
+      "cuda-cuobjdump-13-2=13.2.86-1",
+      "cuda-driver-dev-13-2=13.2.86-1",
+      "cuda-nvcc-13-2=13.2.86-1",
+      "cuda-nvrtc-13-2=13.2.86-1",
+      "cuda-nvrtc-dev-13-2=13.2.86-1",
+      "cuda-toolkit-13-2-config-common=13.2.86-1",
+      "cuda-toolkit-13-config-common=13.2.86-1",
+      "cuda-toolkit-config-common=13.2.86-1",
+      "libcudnn9-cuda-13=9.20.0.46-1",
+      "libcudnn9-dev-cuda-13=9.20.0.46-1",
+      "libcudnn9-headers-cuda-13=9.20.0.46-1",
+      "libcurand-13-2=10.4.2.66-1",
+      "libcurand-dev-13-2=10.4.2.66-1",
+      "libnvinfer-dev=10.16.2.10-1+cuda13.2",
+      "libnvinfer-headers-dev=10.16.2.10-1+cuda13.2",
+      "libnvinfer-headers-plugin-dev=10.16.2.10-1+cuda13.2",
+      "libnvinfer-safe-headers-dev=10.16.2.10-1+cuda13.2",
+      "libnvinfer10=10.16.2.10-1+cuda13.2",
+      "libnvonnxparsers-dev=10.16.2.10-1+cuda13.2",
+      "libnvonnxparsers10=10.16.2.10-1+cuda13.2",
+      "libnvptxcompiler-13-2=13.2.86-1",
+      "libnvvm-13-2=13.2.86-1"
+    ]
+  },
+  "packages": {
+    "nvidia": [
+      {
+        "package": "cuda-cccl-13-2",
+        "version": "13.2.86-1",
+        "arch": "arm64"
+      },
+      {
+        "package": "cuda-crt-13-2",
+        "version": "13.2.86-1",
+        "arch": "arm64"
+      },
+      {
+        "package": "cuda-cudart-13-2",
+        "version": "13.2.86-1",
+        "arch": "arm64"
+      },
+      {
+        "package": "cuda-cudart-dev-13-2",
+        "version": "13.2.86-1",
+        "arch": "arm64"
+      },
+      {
+        "package": "cuda-culibos-13-2",
+        "version": "13.2.86-1",
+        "arch": "arm64"
+      },
+      {
+        "package": "cuda-culibos-dev-13-2",
+        "version": "13.2.86-1",
+        "arch": "arm64"
+      },
+      {
+        "package": "cuda-cuobjdump-13-2",
+        "version": "13.2.86-1",
+        "arch": "arm64"
+      },
+      {
+        "package": "cuda-driver-dev-13-2",
+        "version": "13.2.86-1",
+        "arch": "arm64"
+      },
+      {
+        "package": "cuda-nvcc-13-2",
+        "version": "13.2.86-1",
+        "arch": "arm64"
+      },
+      {
+        "package": "cuda-nvrtc-13-2",
+        "version": "13.2.86-1",
+        "arch": "arm64"
+      },
+      {
+        "package": "cuda-nvrtc-dev-13-2",
+        "version": "13.2.86-1",
+        "arch": "arm64"
+      },
+      {
+        "package": "cuda-toolkit-13-2-config-common",
+        "version": "13.2.86-1",
+        "arch": "all"
+      },
+      {
+        "package": "cuda-toolkit-13-config-common",
+        "version": "13.2.86-1",
+        "arch": "all"
+      },
+      {
+        "package": "cuda-toolkit-config-common",
+        "version": "13.2.86-1",
+        "arch": "all"
+      },
+      {
+        "package": "libcudnn9-cuda-13",
+        "version": "9.20.0.46-1",
+        "arch": "arm64"
+      },
+      {
+        "package": "libcudnn9-dev-cuda-13",
+        "version": "9.20.0.46-1",
+        "arch": "arm64"
+      },
+      {
+        "package": "libcudnn9-headers-cuda-13",
+        "version": "9.20.0.46-1",
+        "arch": "arm64"
+      },
+      {
+        "package": "libcurand-13-2",
+        "version": "10.4.2.66-1",
+        "arch": "arm64"
+      },
+      {
+        "package": "libcurand-dev-13-2",
+        "version": "10.4.2.66-1",
+        "arch": "arm64"
+      },
+      {
+        "package": "libnvinfer-dev",
+        "version": "10.16.2.10-1+cuda13.2",
+        "arch": "arm64"
+      },
+      {
+        "package": "libnvinfer-headers-dev",
+        "version": "10.16.2.10-1+cuda13.2",
+        "arch": "arm64"
+      },
+      {
+        "package": "libnvinfer-headers-plugin-dev",
+        "version": "10.16.2.10-1+cuda13.2",
+        "arch": "arm64"
+      },
+      {
+        "package": "libnvinfer-safe-headers-dev",
+        "version": "10.16.2.10-1+cuda13.2",
+        "arch": "arm64"
+      },
+      {
+        "package": "libnvinfer10",
+        "version": "10.16.2.10-1+cuda13.2",
+        "arch": "arm64"
+      },
+      {
+        "package": "libnvonnxparsers-dev",
+        "version": "10.16.2.10-1+cuda13.2",
+        "arch": "arm64"
+      },
+      {
+        "package": "libnvonnxparsers10",
+        "version": "10.16.2.10-1+cuda13.2",
+        "arch": "arm64"
+      },
+      {
+        "package": "libnvptxcompiler-13-2",
+        "version": "13.2.86-1",
+        "arch": "arm64"
+      },
+      {
+        "package": "libnvvm-13-2",
+        "version": "13.2.86-1",
+        "arch": "arm64"
+      }
+    ],
+    "toolchain": [
+      {
+        "package": "binutils",
+        "version": "2.42-4ubuntu2.10"
+      },
+      {
+        "package": "cmake",
+        "version": "3.28.3-1build7"
+      },
+      {
+        "package": "cpp",
+        "version": "4:13.2.0-7ubuntu1"
+      },
+      {
+        "package": "g++",
+        "version": "4:13.2.0-7ubuntu1"
+      },
+      {
+        "package": "gcc",
+        "version": "4:13.2.0-7ubuntu1"
+      },
+      {
+        "package": "git",
+        "version": "1:2.43.0-1ubuntu7.3"
+      },
+      {
+        "package": "libc6:arm64",
+        "version": "2.39-0ubuntu8.9"
+      },
+      {
+        "package": "libstdc++6:arm64",
+        "version": "14.2.0-4ubuntu2~24.04.1"
+      },
+      {
+        "package": "make",
+        "version": "4.3-4.1build2"
+      },
+      {
+        "package": "python3",
+        "version": "3.12.3-0ubuntu2.1"
+      }
+    ]
+  },
+  "versions": {
+    "gcc": "13.3.0",
+    "gxx": "13.3.0",
+    "cmake": "3.28.3",
+    "nvcc": "V13.2.86",
+    "python_system": "3.12.3",
+    "python_venv": "3.12.3",
+    "git": "2.43.0",
+    "binutils_ld": "GNU ld (GNU Binutils for Ubuntu) 2.42"
+  },
+  "source": {
+    "repo": "https://github.com/mihai-chiorean/TensorRT-Edge-LLM.git",
+    "branch": "feat/jp72-sm87-0.11.0",
+    "fork_commit": "cda4fc1821d1bd0941a755a515269ba928bba7d7",
+    "upstream_base_commit": "95515c2",
+    "upstream_base_tag": "v0.11.0",
+    "submodules": [
+      "2fb879e512ed208f83c6aa4d4c96b958789edf49 3rdParty/NVTX (2fb879e)",
+      "f132c893119698e10daef8525d0ad7a3f05176f2 3rdParty/googletest (f132c89)",
+      "55f93686c01528224f448c19128836e7df245f72 3rdParty/nlohmannJson (55f9368)",
+      "5b4e9ce9e72524037ae24ecd831b9b6604d2eb48 3rdParty/xgrammar (5b4e9ce)",
+      "6689d14c203eed390ae7bb64f56a983cfd7dff9c 3rdParty/xgrammar/3rdparty/cpptrace (6689d14)",
+      "bbd2f4d32427e548797929af08cfe2a9cbb3cf12 3rdParty/xgrammar/3rdparty/dlpack (bbd2f4d)",
+      "df1544bcee0c7ce35cd5ea0b3eb8cc81855a4140 3rdParty/xgrammar/3rdparty/googletest (df1544b)"
+    ],
+    "source_tree_digest": {
+      "source_tree_sha256": "c1520a35d4e72839ec6a2ecbc2681b9b674c1c28ab98e7fd66700ad2b04522cf",
+      "expected": "c1520a35d4e72839ec6a2ecbc2681b9b674c1c28ab98e7fd66700ad2b04522cf",
+      "match": "yes"
+    }
+  },
+  "configure": {
+    "flags": [
+      "-DCMAKE_BUILD_TYPE=Release",
+      "-DTRT_PACKAGE_DIR=/usr",
+      "-DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake",
+      "-DEMBEDDED_TARGET=jetson-orin",
+      "-DCUDA_CTK_VERSION=13.2",
+      "-DENABLE_CUTE_DSL=ALL",
+      "-DCMAKE_CUDA_ARCHITECTURES=87"
+    ],
+    "pybind_flags": [
+      "-DBUILD_PYTHON_BINDINGS=ON",
+      "-DPython_EXECUTABLE=/opt/venv/bin/python",
+      "-DPython3_EXECUTABLE=/opt/venv/bin/python",
+      "-Dpybind11_DIR=<pybind11.get_cmake_dir()>"
+    ],
+    "cmake_cache_selected": {
+      "BUILD_PYTHON_BINDINGS:BOOL": "ON",
+      "BUILD_UNIT_TESTS:BOOL": "OFF",
+      "CMAKE_BUILD_TYPE:STRING": "Release",
+      "CMAKE_CUDA_ARCHITECTURES:UNINITIALIZED": "87",
+      "CMAKE_CUDA_HOST_COMPILER:STRING": "/usr/bin/aarch64-linux-gnu-g++",
+      "CMAKE_HOME_DIRECTORY:INTERNAL": "/src/TensorRT-Edge-LLM",
+      "CMAKE_TOOLCHAIN_FILE:FILEPATH": "/src/TensorRT-Edge-LLM/cmake/aarch64_linux_toolchain.cmake",
+      "CUDART_LIB:FILEPATH": "/usr/local/cuda/targets/sbsa-linux/lib/libcudart.so",
+      "CUDA_CTK_VERSION:UNINITIALIZED": "13.2",
+      "CUDA_DIR:STRING": "/usr/local/cuda/targets/sbsa-linux",
+      "CUDA_DRIVER_LIB:FILEPATH": "/usr/local/cuda/targets/sbsa-linux/lib/stubs/libcuda.so",
+      "CUDA_RUNTIME_API_INCLUDE_DIR:PATH": "/usr/local/cuda/targets/sbsa-linux/include",
+      "CURAND_KERNEL_INCLUDE_DIR:PATH": "/usr/local/cuda/targets/sbsa-linux/include",
+      "CUTE_DSL_ARTIFACT_TAG:STRING": "",
+      "EMBEDDED_TARGET:UNINITIALIZED": "jetson-orin",
+      "ENABLE_CUTE_DSL:STRING": "ALL",
+      "ENABLE_NVTX_PROFILING:BOOL": "OFF",
+      "NVRTC_DYNAMIC_LIB:FILEPATH": "/usr/local/cuda/targets/sbsa-linux/lib/libnvrtc.so",
+      "NVRTC_INCLUDE_DIR:PATH": "/usr/local/cuda/targets/sbsa-linux/include",
+      "NVRTC_LIB:STRING": "/usr/local/cuda/targets/sbsa-linux/lib/libnvrtc.so",
+      "Python3_EXECUTABLE:UNINITIALIZED": "/opt/venv/bin/python",
+      "Python_EXECUTABLE:UNINITIALIZED": "/opt/venv/bin/python",
+      "TRT_PACKAGE_DIR:UNINITIALIZED": "/usr",
+      "TensorRT_INCLUDE_DIR:PATH": "/usr/include/aarch64-linux-gnu",
+      "TensorRT_LIBRARY:FILEPATH": "/usr/lib/aarch64-linux-gnu/libnvinfer.so",
+      "TensorRT_OnnxParser_INCLUDE_DIR:PATH": "/usr/include/aarch64-linux-gnu",
+      "TensorRT_OnnxParser_LIBRARY:FILEPATH": "/usr/lib/aarch64-linux-gnu/libnvonnxparser.so",
+      "pybind11_DIR:UNINITIALIZED": "/opt/venv/lib/python3.12/site-packages/pybind11/share/cmake/pybind11"
+    }
+  },
+  "phases": [
+    {
+      "phase": "build-pybind",
+      "start_epoch": 1791411527,
+      "end_epoch": 1791411544,
+      "wall_seconds": 17,
+      "exit_code": 0,
+      "max_rss_kib_single_process": "1545100",
+      "cgroup_memory_peak_bytes_cumulative": "4000264192"
+    },
+    {
+      "phase": "build",
+      "start_epoch": 1791411433,
+      "end_epoch": 1791411526,
+      "wall_seconds": 93,
+      "exit_code": 0,
+      "max_rss_kib_single_process": "785672",
+      "cgroup_memory_peak_bytes_cumulative": "4000264192"
+    },
+    {
+      "phase": "check-configure",
+      "start_epoch": 1791411433,
+      "end_epoch": 1791411433,
+      "wall_seconds": 0,
+      "exit_code": 0,
+      "max_rss_kib_single_process": "3092",
+      "cgroup_memory_peak_bytes_cumulative": "81248256"
+    },
+    {
+      "phase": "collect",
+      "start_epoch": 1791411544,
+      "end_epoch": 1791411548,
+      "wall_seconds": 4,
+      "exit_code": 0,
+      "max_rss_kib_single_process": "125232",
+      "cgroup_memory_peak_bytes_cumulative": "4000264192"
+    },
+    {
+      "phase": "configure-pybind",
+      "start_epoch": 1791411526,
+      "end_epoch": 1791411527,
+      "wall_seconds": 1,
+      "exit_code": 0,
+      "max_rss_kib_single_process": "25924",
+      "cgroup_memory_peak_bytes_cumulative": "4000264192"
+    },
+    {
+      "phase": "configure",
+      "start_epoch": 1791411432,
+      "end_epoch": 1791411433,
+      "wall_seconds": 1,
+      "exit_code": 0,
+      "max_rss_kib_single_process": "93756",
+      "cgroup_memory_peak_bytes_cumulative": "81248256"
+    },
+    {
+      "phase": "preflight",
+      "start_epoch": 1791411431,
+      "end_epoch": 1791411432,
+      "wall_seconds": 1,
+      "exit_code": 0,
+      "max_rss_kib_single_process": "32080",
+      "cgroup_memory_peak_bytes_cumulative": "31596544"
+    },
+    {
+      "phase": "record",
+      "start_epoch": 1791411009,
+      "end_epoch": 1791411009,
+      "wall_seconds": 0,
+      "exit_code": 0,
+      "max_rss_kib_single_process": "32164",
+      "cgroup_memory_peak_bytes_cumulative": "4288159744"
+    },
+    {
+      "phase": "verify-outputs",
+      "start_epoch": 1791411548,
+      "end_epoch": 1791411549,
+      "wall_seconds": 1,
+      "exit_code": 0,
+      "max_rss_kib_single_process": "76464",
+      "cgroup_memory_peak_bytes_cumulative": "4000264192"
+    }
+  ],
+  "container": {
+    "uname": "Linux 7.0.0-1019-nvidia aarch64",
+    "os_release": "Ubuntu 24.04.5 LTS",
+    "nproc": "20",
+    "cgroup_cpu_max": "1000000 100000",
+    "cgroup_memory_max": "15032385536",
+    "cgroup_memory_peak_bytes": "4000264192",
+    "dev_nvidia_nodes": ""
+  },
+  "venv_freeze": [
+    "annotated-doc==0.0.5",
+    "annotated-types==0.8.0",
+    "anyio==4.15.1",
+    "av==17.1.0",
+    "certifi==2026.7.22",
+    "click==8.5.0",
+    "fastapi==0.139.2",
+    "filelock==4.0.12",
+    "fsspec==2026.9.0",
+    "h11==0.16.0",
+    "hf-xet==1.7.0",
+    "httpcore==1.0.9",
+    "httpx==0.28.1",
+    "huggingface_hub==1.33.0",
+    "idna==3.20",
+    "numpy==2.2.6",
+    "packaging==26.3",
+    "pip==26.2.1",
+    "pybind11==3.0.4",
+    "pydantic==2.13.5",
+    "pydantic_core==2.46.5",
+    "python-multipart==0.0.32",
+    "PyYAML==6.0.3",
+    "setuptools==84.0.0",
+    "starlette==1.7.0",
+    "tqdm==4.70.1",
+    "typing-inspection==0.4.4",
+    "typing_extensions==4.16.0",
+    "uvicorn==0.51.0",
+    "wheel==0.48.0"
+  ],
+  "outputs": {
+    "builder": [
+      {
+        "path": "bin/llm_build",
+        "sha256": "e472944e59cd404828bdf63abb3a5cffd0ceb6b319f6abf7c73589bfa86abf22",
+        "size": 542904
+      },
+      {
+        "path": "bin/visual_build",
+        "sha256": "9a7af2a628f02a42987c49c0e874bf07a19b55a5f6b93be69db13d293703a2c3",
+        "size": 326256
+      },
+      {
+        "path": "lib/libNvInfer_edgellm_plugin.so.1.0",
+        "sha256": "8d5166944dff3185fb0a588ad89b67c88948f43112999e32860c18d170b5df71",
+        "size": null
+      },
+      {
+        "path": "lib/libNvInfer_edgellm_plugin.so",
+        "symlink_to": "libNvInfer_edgellm_plugin.so.1"
+      },
+      {
+        "path": "lib/libNvInfer_edgellm_plugin.so.1",
+        "symlink_to": "libNvInfer_edgellm_plugin.so.1.0"
+      }
+    ],
+    "runtime": [
+      {
+        "path": "REVISION",
+        "sha256": "4814afdec793a70a4ba7b9c7399532f6c564b1a4e36358cc5f8f38af8c429359",
+        "size": 41
+      },
+      {
+        "path": "plugin/libNvInfer_edgellm_plugin.so",
+        "sha256": "8d5166944dff3185fb0a588ad89b67c88948f43112999e32860c18d170b5df71",
+        "size": 24236384
+      },
+      {
+        "path": "pybind/_edgellm_runtime.cpython-312-aarch64-linux-gnu.so",
+        "sha256": "b7a73c8714c0dc6f54156643c36db9b7443fe63bcd315231c1b580a239768e21",
+        "size": 32564232
+      },
+      {
+        "path": "requirements.lock",
+        "sha256": "a9e02feec607b841c3bd5956561b62bcde70f98760b05a655a15ec6fc875c665",
+        "size": 508
+      },
+      {
+        "path": "source/LICENSE",
+        "sha256": "267b087adacda7c301467b1cbfc396299cb439bb8a606d938d02e6183884cf8f",
+        "size": 11376
+      },
+      {
+        "path": "source/experimental/__init__.py",
+        "sha256": "e5a2017275fa2987037e7d395ad58c9e7882a808c149b66bfee8237e0f0348af",
+        "size": 733
+      },
+      {
+        "path": "source/experimental/builder/README.md",
+        "sha256": "0892a546cde6f07e1454571779c73d6f2d251d3caa854a9da39d691343a688eb",
+        "size": 16132
+      },
+      {
+        "path": "source/experimental/builder/__init__.py",
+        "sha256": "a331b16dfbe31de344b17c8ca49b55b81e61ac8e124254ac2310c84646fd496a",
+        "size": 960
+      },
+      {
+        "path": "source/experimental/builder/__main__.py",
+        "sha256": "d29674db19e126ab3fd1ebdf6f43c5e801e088779efb99ff358259dc7acc50b6",
+        "size": 800
+      },
+      {
+        "path": "source/experimental/builder/cli.py",
+        "sha256": "2279650952dfa5a54f71c7fdbef02cecf87cbf75a9541c5da2d643238dab6413",
+        "size": 16304
+      },
+      {
+        "path": "source/experimental/builder/core/__init__.py",
+        "sha256": "a9efd0a59a4a3dde33e7b3cc7ec7d9f1701a2fda32e05397e7ebc4a6e39a7be2",
+        "size": 760
+      },
+      {
+        "path": "source/experimental/builder/core/artifacts/__init__.py",
+        "sha256": "2cd42c08b20d7bb442cc43679718849ac374a670ccaaeea129988377a157a816",
+        "size": 1007
+      },
+      {
+        "path": "source/experimental/builder/core/artifacts/embeddings.py",
+        "sha256": "d22187db4bd9c6190843e10e0ff76dedbb95a0a6e4236fd68caba09a573585f8",
+        "size": 8200
+      },
+      {
+        "path": "source/experimental/builder/core/artifacts/external_weights.py",
+        "sha256": "b9d0ae48d1d1edc999f5afc69255fc29685b83de3ebad3c2b6d147c252d0d818",
+        "size": 7743
+      },
+      {
+        "path": "source/experimental/builder/core/artifacts/runtime_artifacts.py",
+        "sha256": "117404ce44f5d5352639feebbf44a219f29e1e0e8af64bc8ead724f7dd7f1ff9",
+        "size": 14854
+      },
+      {
+        "path": "source/experimental/builder/core/artifacts/runtime_config.py",
+        "sha256": "e08762d3edeef9eb489b5f85f5475b39b95bab35895790fa6b74f14f4a661bc6",
+        "size": 19381
+      },
+      {
+        "path": "source/experimental/builder/core/artifacts/tensors.py",
+        "sha256": "656afa8cdd4e9a712fa19659765bbc4f267b3f93579ece2b4f701dbe74a33d31",
+        "size": 2092
+      },
+      {
+        "path": "source/experimental/builder/core/artifacts/tokenizer.py",
+        "sha256": "7749ede083b20e8f98d2ce4455d2ad9c9e1b56f3db5b189812e1dd5d37eba743",
+        "size": 3558
+      },
+      {
+        "path": "source/experimental/builder/core/builder.py",
+        "sha256": "0dca5a12ca492cd8f40d898ea1e64cf2795db199361b81ea5b7b7627df4aa29e",
+        "size": 46547
+      },
+      {
+        "path": "source/experimental/builder/core/bundle.py",
+        "sha256": "2c80a3bba6fdcaa88d0b59a50249ed74d246cdf893987f5642eaa684921621d5",
+        "size": 3592
+      },
+      {
+        "path": "source/experimental/builder/core/config.py",
+        "sha256": "b093ad9b055d98b8034b425126f4da9584d1ad88a8a9625eeb86af9c65ed936b",
+        "size": 41184
+      },
+      {
+        "path": "source/experimental/builder/core/contracts.py",
+        "sha256": "c6f4252d19583719994210a7cea1dcc86b2dc7f071e5cff65f8c8b9b944fbfe2",
+        "size": 13070
+      },
+      {
+        "path": "source/experimental/builder/core/dspark_config.py",
+        "sha256": "233eabfc6e7a63046a19782c4b08fe890e688ef8bce0ab2a90993966187a8fe8",
+        "size": 2895
+      },
+      {
+        "path": "source/experimental/builder/core/numpy_dtypes.py",
+        "sha256": "27fb6cbfa9b5e1fd02ef73afdefca4cf9ddc1048342455846e8b5882a91986e8",
+        "size": 4303
+      },
+      {
+        "path": "source/experimental/builder/core/quantization.py",
+        "sha256": "c6c532470dfc468ec3128311bc5184c4cfe724ef421a010f66350c186e6a64e2",
+        "size": 19469
+      },
+      {
+        "path": "source/experimental/builder/core/ragged.py",
+        "sha256": "bcefe629bbc9bb08d1ff6417f4ad7b347dd95a381f3b3e30d5b6f6f9dd26a217",
+        "size": 7209
+      },
+      {
+        "path": "source/experimental/builder/core/safetensors_np.py",
+        "sha256": "f6c055664d956f512550d63d8dabe143cc29ee23ff9cc2a71bc7e35d2fed7fc0",
+        "size": 21301
+      },
+      {
+        "path": "source/experimental/builder/core/weight_policy.py",
+        "sha256": "e3091a97d5ddca5e4d15564b187602b869265dae52e5388dccf9c67471d3342e",
+        "size": 5657
+      },
+      {
+        "path": "source/experimental/builder/core/weights.py",
+        "sha256": "0db5e762674c14f88d8ecf8b67bd762518f4afcc64788eb5452d4583f165c7fa",
+        "size": 55922
+      },
+      {
+        "path": "source/experimental/builder/models/__init__.py",
+        "sha256": "f9621115f18c2a5573cff047891245bb403dadcd48b55da2974ead154e68745f",
+        "size": 1998
+      },
+      {
+        "path": "source/experimental/builder/models/alpamayo/__init__.py",
+        "sha256": "142377065c46a6f997139ee921274be51a809c0994c4597ad0660872ea88e186",
+        "size": 741
+      },
+      {
+        "path": "source/experimental/builder/models/alpamayo/artifacts.py",
+        "sha256": "aef09e437cf3cbe8f4182d1a311c7da41aa355d56d3e73effc0baa25115e8285",
+        "size": 1613
+      },
+      {
+        "path": "source/experimental/builder/models/alpamayo/configuration.py",
+        "sha256": "9f5765f6bee9b760912877ac200a158afcb50887489b205c1565185e397464e8",
+        "size": 3555
+      },
+      {
+        "path": "source/experimental/builder/models/alpamayo/modeling_alpamayo_action.py",
+        "sha256": "cf0d6698975eb71ef0f7ddc04a1f2902e9a33ac7b6f8d621f938ab5df43d979a",
+        "size": 12562
+      },
+      {
+        "path": "source/experimental/builder/models/alpamayo/modeling_alpamayo_text.py",
+        "sha256": "39ae567550c500332beb077357bb1fd71a4e71855cfcc0d4703b0373eff2a3be",
+        "size": 3795
+      },
+      {
+        "path": "source/experimental/builder/models/alpamayo/modeling_alpamayo_visual.py",
+        "sha256": "db8cf680432b6fe917b34c7be7d7c0c5645b8f800bac6eb5aec23df8fdbf565e",
+        "size": 4700
+      },
+      {
+        "path": "source/experimental/builder/models/alpamayo/preprocessing.py",
+        "sha256": "27e1732ea19014cb6ab05aeaa6911bfde57aab676503a4f4c9704e8dc268c4a5",
+        "size": 1318
+      },
+      {
+        "path": "source/experimental/builder/models/alpamayo/runtime_config.py",
+        "sha256": "ac648bb1943d8af01f4f9389f1606a10bf29ba376e76bd88651a762e5855b520",
+        "size": 5116
+      },
+      {
+        "path": "source/experimental/builder/models/alpamayo/tokenizer.py",
+        "sha256": "8378f48c8e60b232be86da32b7d4c1a4ac1ba6988246b1dd9940e183e23b20f1",
+        "size": 4693
+      },
+      {
+        "path": "source/experimental/builder/models/alpamayo/weights.py",
+        "sha256": "1c7436bd6d3b362a543746e8b3ca14ebce9ed58b1c3123ba45e335f62e62bda2",
+        "size": 2074
+      },
+      {
+        "path": "source/experimental/builder/models/cosmos3/__init__.py",
+        "sha256": "dd2c59ef057eedaede0e418b5cfe8f7b7ae8c52425a280e79a14bb2df11b0682",
+        "size": 1010
+      },
+      {
+        "path": "source/experimental/builder/models/cosmos3/artifacts.py",
+        "sha256": "8a392a82ef24f67747838bcbc9d05dc7c3c36a7f77acf56ccb810b6bb6727564",
+        "size": 3672
+      },
+      {
+        "path": "source/experimental/builder/models/cosmos3/configuration.py",
+        "sha256": "b8fbd7a79bf5c51aaf6cc63ae797a53a51b9a13cb2231ad2deb9eec433afc4a1",
+        "size": 11560
+      },
+      {
+        "path": "source/experimental/builder/models/cosmos3/modeling_cosmos3_gen.py",
+        "sha256": "58269e0f816416b9aafc19d0ad9fe33a0278f3aea89327a89cd3027bd78499e6",
+        "size": 14793
+      },
+      {
+        "path": "source/experimental/builder/models/cosmos3/modeling_cosmos3_reasoner_text.py",
+        "sha256": "ebc0b0cd74401841e9c98a0746303128783e5ecd58dfae38d1c4f58479bf13f8",
+        "size": 4497
+      },
+      {
+        "path": "source/experimental/builder/models/cosmos3/modeling_cosmos3_reasoner_visual.py",
+        "sha256": "3b42a677e96aed3e43a674b9f10602e2b88fb2e470c0733ad31371239b81d11f",
+        "size": 9871
+      },
+      {
+        "path": "source/experimental/builder/models/cosmos3/modeling_cosmos3_und_prefill.py",
+        "sha256": "762c677447933589afccb335857422b49f1bfa8b224812200002d5c2d319716b",
+        "size": 8369
+      },
+      {
+        "path": "source/experimental/builder/models/cosmos3/modeling_cosmos3_vae_encoder.py",
+        "sha256": "f9a0c8acc5a9cd5f03c9b111e0b2d77d57dd7f73b098cd5ab96448b92a988400",
+        "size": 20013
+      },
+      {
+        "path": "source/experimental/builder/models/cosmos3/runtime_config.py",
+        "sha256": "841567d8346fc7115b9089bf66ceadc5173c4390cbe539e5d8dfe585509e7ae6",
+        "size": 11525
+      },
+      {
+        "path": "source/experimental/builder/models/cosmos3/weights.py",
+        "sha256": "99866c174b889e37d7f6ead30e6ebc20f5b9e4405e8c52e73e908ef56f0b0e9d",
+        "size": 4562
+      },
+      {
+        "path": "source/experimental/builder/models/dflash/__init__.py",
+        "sha256": "68973e3629e6ce6c4be9c07006f7be9c2ec4a22179673b7cad05fd70b4d865ac",
+        "size": 739
+      },
+      {
+        "path": "source/experimental/builder/models/dflash/configuration.py",
+        "sha256": "cde4adeda5d45458e99d98a7ef7902e904ff529c3bfff6792e47f1b695d151a5",
+        "size": 3665
+      },
+      {
+        "path": "source/experimental/builder/models/dflash/modeling_dflash_draft.py",
+        "sha256": "7f0b55228bb5f37a60bd1a07744b97dfd8d0e638ebcf7ce62f143dffeee34ca9",
+        "size": 13426
+      },
+      {
+        "path": "source/experimental/builder/models/dflash/weights.py",
+        "sha256": "1fec2280f41692b71626b9f01779d3173401af8039633eb818acc66f48993906",
+        "size": 1125
+      },
+      {
+        "path": "source/experimental/builder/models/dflash2/__init__.py",
+        "sha256": "64236d8046d2ecca9e005a159d4dcfdd03709b8c3f26aa4b9be39b1ea6e4b87d",
+        "size": 740
+      },
+      {
+        "path": "source/experimental/builder/models/dflash2/artifacts.py",
+        "sha256": "532f6595ca53fab9c250776a68b395fd58b4f2576f7dfe165e0d807cf24419ab",
+        "size": 2625
+      },
+      {
+        "path": "source/experimental/builder/models/dflash2/configuration.py",
+        "sha256": "612fa30b65b20ae30abd730daa49374e312d7a5e6638ebe169651c2789083c08",
+        "size": 4883
+      },
+      {
+        "path": "source/experimental/builder/models/dflash2/modeling_dflash2_draft.py",
+        "sha256": "2ac3b53e7b7be690a02c60f4a2b92ba2e15a4eaa8c30cf453f2a32c55edb6b1e",
+        "size": 8488
+      },
+      {
+        "path": "source/experimental/builder/models/dflash2/weights.py",
+        "sha256": "ba030efb99a6430f7dc6625571fe27cbc0f0a262fc0f4ad4efec5547408bbdbf",
+        "size": 1127
+      },
+      {
+        "path": "source/experimental/builder/models/diffusion_gemma/__init__.py",
+        "sha256": "3c186d25358609791360e5ed8f0a441e36938facbca094f7f484b817225cfff5",
+        "size": 732
+      },
+      {
+        "path": "source/experimental/builder/models/diffusion_gemma/artifacts.py",
+        "sha256": "2b1e2b87feae44c9572dd953ddfd503fc3723f4a176a7504c994f86f05a4646e",
+        "size": 1462
+      },
+      {
+        "path": "source/experimental/builder/models/diffusion_gemma/configuration.py",
+        "sha256": "04079b23fbecdfc02dc7171b16c5a301bbdc88872c8d838f2bec1a089bc1268d",
+        "size": 2929
+      },
+      {
+        "path": "source/experimental/builder/models/diffusion_gemma/modeling_diffusion_gemma.py",
+        "sha256": "4389776d5e07817eeb93265b7d0187f269e28e09463a243fcec5ab779aa07de3",
+        "size": 19420
+      },
+      {
+        "path": "source/experimental/builder/models/diffusion_gemma/modeling_diffusion_gemma_visual.py",
+        "sha256": "85e3374fdf696591673a478f99ed8a0cb459315b62a1b1d2be0d70cddfcf06bc",
+        "size": 911
+      },
+      {
+        "path": "source/experimental/builder/models/diffusion_gemma/runtime_config.py",
+        "sha256": "e913c23491e96a746d43c5c40bfeffb6688486296bd6b9bee01295a3e7071d4b",
+        "size": 5012
+      },
+      {
+        "path": "source/experimental/builder/models/diffusion_gemma/tokenizer.py",
+        "sha256": "4d5d992d6627f5aac58f7e963580ef43750f2c176573300ac12f56da87430f4d",
+        "size": 752
+      },
+      {
+        "path": "source/experimental/builder/models/diffusion_gemma/weights.py",
+        "sha256": "89000521bd863d27a0506290717fce16a82861e3b8fdaefed094b5290f3d7729",
+        "size": 2647
+      },
+      {
+        "path": "source/experimental/builder/models/dspark/__init__.py",
+        "sha256": "869ee719f7442b4b20c41a8a408428e30b6a6a6d4b2a764e4cb7f40cf3989e40",
+        "size": 738
+      },
+      {
+        "path": "source/experimental/builder/models/dspark/artifacts.py",
+        "sha256": "a6c125157e3e85aaa5691008318d90935bd474b03615670d33cd2ee7078dc427",
+        "size": 5342
+      },
+      {
+        "path": "source/experimental/builder/models/dspark/configuration.py",
+        "sha256": "28fa817da503756f09633762f2ecc072eeab53fb7939e62a06a96c0de7b1184b",
+        "size": 6677
+      },
+      {
+        "path": "source/experimental/builder/models/dspark/modeling_dspark_draft.py",
+        "sha256": "282624d58769969dbb6766ebdd2529443ac74edeb4f1c801d71f3e78e3a56b5a",
+        "size": 9848
+      },
+      {
+        "path": "source/experimental/builder/models/dspark/weights.py",
+        "sha256": "e7439145679fcf51e928bc82e02e8f9179e45a5f62e3dc6ba736d8d43d78a3f9",
+        "size": 1129
+      },
+      {
+        "path": "source/experimental/builder/models/eagle3/__init__.py",
+        "sha256": "5d5b5c81c5500c8674dd7687b631ab1fcf90ea41f7919bac232803c40c132766",
+        "size": 739
+      },
+      {
+        "path": "source/experimental/builder/models/eagle3/configuration.py",
+        "sha256": "03c86a45704a58217e04cd1a29d9cb38f585df7bdde3a6fcfceafd7adf16cbf1",
+        "size": 2620
+      },
+      {
+        "path": "source/experimental/builder/models/eagle3/modeling_eagle3_draft.py",
+        "sha256": "00782a114d54b1ed7368b154a8e6848197b58bc537b158af6668355bf70f7fdc",
+        "size": 6916
+      },
+      {
+        "path": "source/experimental/builder/models/eagle3/weights.py",
+        "sha256": "b6c143f56cd2f2c0f0b652eaa7aa3f2db3de0234da39ba482de7b7f62d870a85",
+        "size": 1508
+      },
+      {
+        "path": "source/experimental/builder/models/gemma4/__init__.py",
+        "sha256": "98ce87cfaa922725094b77523487aa6f3b1c04c1b3e342b18c10ec4a84ae593e",
+        "size": 739
+      },
+      {
+        "path": "source/experimental/builder/models/gemma4/artifacts.py",
+        "sha256": "0bffbefaf7ce47e9b8ce157173a6ab2c589e6786a8890d886fd05ad55ce3cfdc",
+        "size": 1459
+      },
+      {
+        "path": "source/experimental/builder/models/gemma4/configuration.py",
+        "sha256": "217fb277daa738a7a63cba4f45d685b89e9928f0010e6532abdf319935034628",
+        "size": 10574
+      },
+      {
+        "path": "source/experimental/builder/models/gemma4/modeling_gemma4_assistant.py",
+        "sha256": "a9741833bfc2b17cd0b3d5e8efa1cbbc0d3a0b054df694f54cd037dd89b05469",
+        "size": 11743
+      },
+      {
+        "path": "source/experimental/builder/models/gemma4/modeling_gemma4_audio.py",
+        "sha256": "697daa39af47fcdf5de56c63a6a661a13c2313d18cd133bfdc79374d894e3df8",
+        "size": 16384
+      },
+      {
+        "path": "source/experimental/builder/models/gemma4/modeling_gemma4_layers.py",
+        "sha256": "f1bbe6d1ec5514a19be008d968d841eb322d8737b2c2191b378211ddda7a34da",
+        "size": 1459
+      },
+      {
+        "path": "source/experimental/builder/models/gemma4/modeling_gemma4_text.py",
+        "sha256": "accebf9f7e633dccfabf0191eb8ae182b4e5e5532689447160fbb84dfd081d5a",
+        "size": 22483
+      },
+      {
+        "path": "source/experimental/builder/models/gemma4/modeling_gemma4_unified_audio.py",
+        "sha256": "408034efde71f8d5f0c4a15f6c769ae8365afc5be762da0dd4c21e7985840db6",
+        "size": 2577
+      },
+      {
+        "path": "source/experimental/builder/models/gemma4/modeling_gemma4_unified_visual.py",
+        "sha256": "5060f826a0129a725e474125566f97b439e349eda6b6beec7cc28a820d7545e2",
+        "size": 6893
+      },
+      {
+        "path": "source/experimental/builder/models/gemma4/modeling_gemma4_visual.py",
+        "sha256": "8ffbeb75dbb4c6476aab9d363403927ca7c97e67a8d59bc89e86afc4221dc0b7",
+        "size": 12227
+      },
+      {
+        "path": "source/experimental/builder/models/gemma4/runtime_config.py",
+        "sha256": "0b9cb9138d587bf7a2b212b5a1a1c8c0c988f8764640fef33a45e3abfa26310b",
+        "size": 5777
+      },
+      {
+        "path": "source/experimental/builder/models/gemma4/weights.py",
+        "sha256": "274e7e53dc8116a658c52b72c60845c466b4194f5f2cc6b61299e822d2c7c3dd",
+        "size": 11313
+      },
+      {
+        "path": "source/experimental/builder/models/hunyuan_v1_dense/__init__.py",
+        "sha256": "f8a4ae771ec88184c8c24e9514ba1fe0aa62bb2afa8fbdca15e225b54135ed16",
+        "size": 747
+      },
+      {
+        "path": "source/experimental/builder/models/hunyuan_v1_dense/artifacts.py",
+        "sha256": "6d59562816982bd2bcc0e1ea6814b1f8e84d6a93bc6900704ae8c3eaf67d7c08",
+        "size": 1178
+      },
+      {
+        "path": "source/experimental/builder/models/hunyuan_v1_dense/configuration.py",
+        "sha256": "f2445a9f289ef9626b936f5c4dcf1728a7cd481d6ac779e4750e0bb24579a336",
+        "size": 990
+      },
+      {
+        "path": "source/experimental/builder/models/hunyuan_v1_dense/modeling_hunyuan_v1_dense.py",
+        "sha256": "b688d92e1f54e8ee4b3b5385630b54667e38267c0a6a4f882ce38d42346e2bec",
+        "size": 4590
+      },
+      {
+        "path": "source/experimental/builder/models/hunyuan_v1_dense/weights.py",
+        "sha256": "96c8cba635e123d72f7bbd1a7e627d56557c756fc34e6ff382d4dbd05348be8f",
+        "size": 1541
+      },
+      {
+        "path": "source/experimental/builder/models/internvl3/__init__.py",
+        "sha256": "294690c9f2d68e02595bbbc9aa666e1ae6107fb734b3a0c329a2c2e3a9ba3675",
+        "size": 742
+      },
+      {
+        "path": "source/experimental/builder/models/internvl3/artifacts.py",
+        "sha256": "bfeb7b83c769a2709b2393f56f1a068bd6598abd30a3a87cf87e30b9f05abbec",
+        "size": 1462
+      },
+      {
+        "path": "source/experimental/builder/models/internvl3/configuration.py",
+        "sha256": "498d1c4bce5f29196761c703a3a44eff1f105f8fb399b009ff92469e950d82c1",
+        "size": 1069
+      },
+      {
+        "path": "source/experimental/builder/models/internvl3/modeling_internvl3_text.py",
+        "sha256": "38e066a8a78b08edcbc68c913440e3f597be81a7ab8ba3cd7a8b687a12c6ba9b",
+        "size": 4294
+      },
+      {
+        "path": "source/experimental/builder/models/internvl3/modeling_internvl3_visual.py",
+        "sha256": "752818cbd8417ba01c0c51213a28d81c984094722f6e8789dfcf82c5dcd3c9cc",
+        "size": 11995
+      },
+      {
+        "path": "source/experimental/builder/models/internvl3/runtime_config.py",
+        "sha256": "1e452147e8cdf914008659ed862353a6e19004ce89bf2bd1179f5e7b1fabaa9d",
+        "size": 2933
+      },
+      {
+        "path": "source/experimental/builder/models/internvl3/weights.py",
+        "sha256": "1658fe520d17f3183ef1d36c012497c653c93b9dce65bc31e8d1dea1d224cffe",
+        "size": 2031
+      },
+      {
+        "path": "source/experimental/builder/models/internvl3_5/__init__.py",
+        "sha256": "9901072d1f1ca96052818eba191e74cafa00cef5196e127f5414760762ddc8d2",
+        "size": 744
+      },
+      {
+        "path": "source/experimental/builder/models/internvl3_5/artifacts.py",
+        "sha256": "6374e9b4a01e32ea6a11ae77c48fed08ed8602787d8b785f9159b5650f434705",
+        "size": 1464
+      },
+      {
+        "path": "source/experimental/builder/models/internvl3_5/configuration.py",
+        "sha256": "204ab0c76be32f09a06bf97bb4eed1eac83965c6db7e11a3e20e02b8d779eca9",
+        "size": 1073
+      },
+      {
+        "path": "source/experimental/builder/models/internvl3_5/modeling_internvl3_5_text.py",
+        "sha256": "f2d5b37d406cb70149cc981a274fcbf7de978395dc04c1167a6088b27e29ac00",
+        "size": 4313
+      },
+      {
+        "path": "source/experimental/builder/models/internvl3_5/modeling_internvl3_5_visual.py",
+        "sha256": "2b6f3f317af2473c92bda96e676e2cdcca09a664e96392fb1f30d4f4c47e3135",
+        "size": 13336
+      },
+      {
+        "path": "source/experimental/builder/models/internvl3_5/runtime_config.py",
+        "sha256": "c9fbbb507bb8bbecf990fedb1f9952726ecda992f91a19a7c41edc4604061fd4",
+        "size": 2881
+      },
+      {
+        "path": "source/experimental/builder/models/internvl3_5/weights.py",
+        "sha256": "dfdde0819db607eb0b9ceee8791cb00ca02ea4ed406cddc4e54831cf1e1ba52e",
+        "size": 2035
+      },
+      {
+        "path": "source/experimental/builder/models/jetspec/__init__.py",
+        "sha256": "3324cae2cb0331b2230cc949a9e41041dd75d67970af1d456c4d11de1ae312e5",
+        "size": 756
+      },
+      {
+        "path": "source/experimental/builder/models/jetspec/configuration.py",
+        "sha256": "6ab7de4f1cd8d06baaf86de15de8009a94ec48f8df475ace2c81653d0bbd4874",
+        "size": 5644
+      },
+      {
+        "path": "source/experimental/builder/models/llama/__init__.py",
+        "sha256": "b5e8d5c15173a977adce8a5762427c730a02516cc7da0d7ca78e7cac1483ca84",
+        "size": 721
+      },
+      {
+        "path": "source/experimental/builder/models/llama/artifacts.py",
+        "sha256": "dc04a5e42fe3acaf844485c3fe1782346774a8afad1bbeeecac7dd2d4d4a6389",
+        "size": 1148
+      },
+      {
+        "path": "source/experimental/builder/models/llama/configuration.py",
+        "sha256": "9a0a309324aa37194ef78aece15960f869945a1f9e0cca1fba2131a4c3f38873",
+        "size": 964
+      },
+      {
+        "path": "source/experimental/builder/models/llama/modeling_llama.py",
+        "sha256": "ca704cf1439b3da422b6e9e28fcc880d77c6f4ec5f2b9af75093dc0c8bfea854",
+        "size": 4262
+      },
+      {
+        "path": "source/experimental/builder/models/llama/weights.py",
+        "sha256": "9aeaebbc050d9af62ea2ecf7274cbc85242eb7909c261ba17fdcdc615c59c4e3",
+        "size": 1070
+      },
+      {
+        "path": "source/experimental/builder/models/mistral/__init__.py",
+        "sha256": "04421454437bebaa6b7613b118ffaf29d1442468a087945f5ad4715352609929",
+        "size": 723
+      },
+      {
+        "path": "source/experimental/builder/models/mistral/artifacts.py",
+        "sha256": "15fd1ca7cdcefd494041cdf56098abb140d349378ccf6f32bd22e67bcda55939",
+        "size": 1152
+      },
+      {
+        "path": "source/experimental/builder/models/mistral/configuration.py",
+        "sha256": "668a47bcdaa55838254ed1f00372fa7ea8edddbd379b29ec783a51afbb7dc547",
+        "size": 1262
+      },
+      {
+        "path": "source/experimental/builder/models/mistral/modeling_mistral.py",
+        "sha256": "3c6ac1c4ceb8a04123206fe72a67292cce3192d68fc2a49a504a9ea79ff9be70",
+        "size": 4395
+      },
+      {
+        "path": "source/experimental/builder/models/mistral/weights.py",
+        "sha256": "c7d00225dc9ae8b4c622b3ea86dfe9379171ff79121bc9b80408d4003b3ccc14",
+        "size": 1074
+      },
+      {
+        "path": "source/experimental/builder/models/muse_glimmer/__init__.py",
+        "sha256": "a1d816d4b2aabe71418eb75e711b5411aaa5a6fbfc5e78f3057575b2de5f7f20",
+        "size": 743
+      },
+      {
+        "path": "source/experimental/builder/models/muse_glimmer/artifacts.py",
+        "sha256": "dddfc52673439cea38c7351a3aa9870972adcd16850e4ed66c93b1f1e04d06fd",
+        "size": 1531
+      },
+      {
+        "path": "source/experimental/builder/models/muse_glimmer/configuration.py",
+        "sha256": "fb46fab89c65eadcd4c6f1cdbe566afa55578394cedac86cf74b482ac63d5b2d",
+        "size": 8045
+      },
+      {
+        "path": "source/experimental/builder/models/muse_glimmer/dflash_weights.py",
+        "sha256": "49122dea970e7fe378c744e9641c230ba933382e0dd0f46e34813f40852c74ca",
+        "size": 1791
+      },
+      {
+        "path": "source/experimental/builder/models/muse_glimmer/modeling_muse_glimmer_text.py",
+        "sha256": "113e195f914227e22d39998b359544f4380bbca7e6cc7176ce4d582287f068c8",
+        "size": 12225
+      },
+      {
+        "path": "source/experimental/builder/models/muse_glimmer/modeling_muse_glimmer_visual.py",
+        "sha256": "82b831ae288725c16297e2a145beb836918c88036bd190769bba064a5b7d9236",
+        "size": 11404
+      },
+      {
+        "path": "source/experimental/builder/models/muse_glimmer/runtime_config.py",
+        "sha256": "dff15b04832036653e53621519f6f5077322a1faa5555c1025f47df125c0b04e",
+        "size": 1579
+      },
+      {
+        "path": "source/experimental/builder/models/muse_glimmer/tokenizer.py",
+        "sha256": "a7ae3a32ab50f9b44c112c91063bf3e14ef309bf233674ab36eeb14300739327",
+        "size": 1568
+      },
+      {
+        "path": "source/experimental/builder/models/muse_glimmer/weights.py",
+        "sha256": "009860a5cf1c8ea87d79f3631effdc8df9d992fd31b8713610df763c9459dc55",
+        "size": 2779
+      },
+      {
+        "path": "source/experimental/builder/models/nemotron3_5_asr/__init__.py",
+        "sha256": "ff83274ce0ab053258ad50cddb79f88d04d3a07cccd3b90c5c1f157de2745261",
+        "size": 748
+      },
+      {
+        "path": "source/experimental/builder/models/nemotron3_5_asr/artifacts.py",
+        "sha256": "ea31aeee2fd449e0e3d7da7c053492fce28e6726bc0bb799f455e18bdb26e791",
+        "size": 3142
+      },
+      {
+        "path": "source/experimental/builder/models/nemotron3_5_asr/configuration.py",
+        "sha256": "209e66a2ab79d0f152f349bd439634e52be9f4719ae35e06017b9f955fc50b46",
+        "size": 2059
+      },
+      {
+        "path": "source/experimental/builder/models/nemotron3_5_asr/modeling_nemotron3_5_asr_audio.py",
+        "sha256": "d0579f6171ffccb9e1b79d5e27e3b4430a8faccdbb0ad4de6130dc91d0708b30",
+        "size": 16065
+      },
+      {
+        "path": "source/experimental/builder/models/nemotron3_5_asr/modeling_nemotron3_5_asr_rnnt.py",
+        "sha256": "bac43939c5cf9144560013008b806a1c8b6fe8aea67c1912dcffac6d5cb28eb0",
+        "size": 5264
+      },
+      {
+        "path": "source/experimental/builder/models/nemotron3_5_asr/weights.py",
+        "sha256": "84107f2296b4840da07332e117bbe2f2dac567572dccf99cd81f20d3a2fda316",
+        "size": 1001
+      },
+      {
+        "path": "source/experimental/builder/models/nemotron_h/__init__.py",
+        "sha256": "66dc3b9af389c4a991ece18f70dfe9eccf47e93ff0ad508615a97b81ed55d62a",
+        "size": 743
+      },
+      {
+        "path": "source/experimental/builder/models/nemotron_h/artifacts.py",
+        "sha256": "33da8bfed469fe4b0de804bb1f336b9af1fe715e5eec4ce06ff7e554273b7007",
+        "size": 1770
+      },
+      {
+        "path": "source/experimental/builder/models/nemotron_h/configuration.py",
+        "sha256": "1403e9b411c090acf5b908a5263295fee341bc34825926443b514498e13ec223",
+        "size": 4238
+      },
+      {
+        "path": "source/experimental/builder/models/nemotron_h/modeling_nemotron_h.py",
+        "sha256": "ee8d0b2489eca24ee24ea232abf9abedbfaa4af2b22ea6d57daf04a13a56735f",
+        "size": 16703
+      },
+      {
+        "path": "source/experimental/builder/models/nemotron_h/modeling_nemotron_h_mtp.py",
+        "sha256": "0099280883b55c4a6fb3406d1dcc7fd5de6b2c4962d978b6f37488ce511d9ef4",
+        "size": 8069
+      },
+      {
+        "path": "source/experimental/builder/models/nemotron_h/weights.py",
+        "sha256": "0b252725e99842e44a2108b5c4091cb2a862892176b1ae03a1b317b1a443b202",
+        "size": 8567
+      },
+      {
+        "path": "source/experimental/builder/models/nemotron_omni/__init__.py",
+        "sha256": "e65d232a1d2412d8b1101a49ccf212e719cf4a70b3165b87eef1be70493ff55c",
+        "size": 746
+      },
+      {
+        "path": "source/experimental/builder/models/nemotron_omni/artifacts.py",
+        "sha256": "e59cf1ed1f6c5cc496b9fc3f07b0bdbbf9b43b83b25f9eac08762bd073a3ec88",
+        "size": 4468
+      },
+      {
+        "path": "source/experimental/builder/models/nemotron_omni/configuration.py",
+        "sha256": "ca5206629cf7d506165d2d3541c46ac54203a67916f7191a4f3f9d875a5975f4",
+        "size": 4410
+      },
+      {
+        "path": "source/experimental/builder/models/nemotron_omni/modeling_nemotron_omni_audio.py",
+        "sha256": "b7e1e176a0beab7ad7a720f83d12c4927e9b9bb4b44429d5457dc891eeb0ca77",
+        "size": 15912
+      },
+      {
+        "path": "source/experimental/builder/models/nemotron_omni/modeling_nemotron_omni_text.py",
+        "sha256": "152a7090df26082df555a1fd68cfe9fbdf65e89821b6fe13a30df75ef97b67a7",
+        "size": 16671
+      },
+      {
+        "path": "source/experimental/builder/models/nemotron_omni/modeling_nemotron_omni_visual.py",
+        "sha256": "a48c36c9a1668c4cb8800e5d3dc6399c13c6ef6e2e3e5b9d736162ba48e1eeac",
+        "size": 10134
+      },
+      {
+        "path": "source/experimental/builder/models/nemotron_omni/runtime_config.py",
+        "sha256": "a1f7cc529d72d879a6daf7ef1aaabae85c3da1846623ac644bc5eb109a5e6598",
+        "size": 3884
+      },
+      {
+        "path": "source/experimental/builder/models/nemotron_omni/weights.py",
+        "sha256": "5bd12dc27992ffdceccc04aebbdbfa7d706e230d48cd971d6592cb2abc51777e",
+        "size": 5870
+      },
+      {
+        "path": "source/experimental/builder/models/phi4mm/__init__.py",
+        "sha256": "725487394d845ae4ddb42d45e56646cb543196114f2cbd6e08edf4b417d1a972",
+        "size": 739
+      },
+      {
+        "path": "source/experimental/builder/models/phi4mm/artifacts.py",
+        "sha256": "031df4f43f9605820b335ae351a390ec066ab6854b61480203532e35b7e59b93",
+        "size": 1601
+      },
+      {
+        "path": "source/experimental/builder/models/phi4mm/configuration.py",
+        "sha256": "6974d049455e6d4772c46d9b285f283d993af3592e3b95ab1abbb2c7bf75b350",
+        "size": 1864
+      },
+      {
+        "path": "source/experimental/builder/models/phi4mm/embeddings.py",
+        "sha256": "f8c9ffb7933663f2dd940c90288168d67fae2b9c022ed069c19344f1ef7be731",
+        "size": 4195
+      },
+      {
+        "path": "source/experimental/builder/models/phi4mm/modeling_phi4mm_text.py",
+        "sha256": "d428e8255d541978fc6c094f15b26fd769564d9df12c55c09e8a04feac400397",
+        "size": 8682
+      },
+      {
+        "path": "source/experimental/builder/models/phi4mm/modeling_phi4mm_visual.py",
+        "sha256": "345e87c38da7176a74b7a8ee54761ecad2becf9f4978a6ca9d3280bdfdda5e8f",
+        "size": 10587
+      },
+      {
+        "path": "source/experimental/builder/models/phi4mm/runtime_config.py",
+        "sha256": "10e0efed69b53ea283b03c26fb14710c7b2c28bab2e8e2ce95fa31ba5cb91dfe",
+        "size": 2649
+      },
+      {
+        "path": "source/experimental/builder/models/phi4mm/weights.py",
+        "sha256": "b5855fa5b2de31b133b69207c3827ea5226890009216891724a261082e85b567",
+        "size": 3773
+      },
+      {
+        "path": "source/experimental/builder/models/qwen2/__init__.py",
+        "sha256": "e7198bd7a632d463a1d5b5d088a14c35a302644fa54d33f24aac8230d2316abe",
+        "size": 721
+      },
+      {
+        "path": "source/experimental/builder/models/qwen2/artifacts.py",
+        "sha256": "ccb9a92d7a402ccd247df5757cd74b13d9818e5e96a3fec8c92ce94f3b567acd",
+        "size": 1148
+      },
+      {
+        "path": "source/experimental/builder/models/qwen2/configuration.py",
+        "sha256": "8c07c67dfa2d74aee9d69fb03bb67aa18aed9f378a4909432c6e02aad8326387",
+        "size": 964
+      },
+      {
+        "path": "source/experimental/builder/models/qwen2/modeling_qwen2.py",
+        "sha256": "7887061c4553a51b3397f0e3b7c7df5643bf494c3eae46a8356f1bed0a4ae862",
+        "size": 4042
+      },
+      {
+        "path": "source/experimental/builder/models/qwen2/weights.py",
+        "sha256": "e953b5a5452b0b8e7270dafa528711c1ad5a36e84b5ca778e6c724d971c1f6ea",
+        "size": 1070
+      },
+      {
+        "path": "source/experimental/builder/models/qwen2_5_vl/__init__.py",
+        "sha256": "7b2223e27d8346b3d62ce13d0f2273f17c7e079c425066d9e0ec427f3ee1dd60",
+        "size": 743
+      },
+      {
+        "path": "source/experimental/builder/models/qwen2_5_vl/artifacts.py",
+        "sha256": "c430da7913bfd435143a39d617b1e417378ef9d2d1d6f91c46e6413bb79caa84",
+        "size": 1249
+      },
+      {
+        "path": "source/experimental/builder/models/qwen2_5_vl/configuration.py",
+        "sha256": "95159eb9957566100982402de03d7e1448763a442c2240d942ca21d1b5ed25ab",
+        "size": 1071
+      },
+      {
+        "path": "source/experimental/builder/models/qwen2_5_vl/modeling_qwen2_5_vl_text.py",
+        "sha256": "410d3a0cebe78ab4baefc348b958b92e74231f68a1b77544dcb0b4d64bc2fb98",
+        "size": 4274
+      },
+      {
+        "path": "source/experimental/builder/models/qwen2_5_vl/modeling_qwen2_5_vl_visual.py",
+        "sha256": "49d20ab51b73e8a670c7cb17eaddee32561c4bb978e7ba63edb63cb6a2ea462a",
+        "size": 7553
+      },
+      {
+        "path": "source/experimental/builder/models/qwen2_5_vl/weights.py",
+        "sha256": "16f213848ad177cc12f38f39baecce80bf44b79bb43da89d644d0bca4598a3ae",
+        "size": 2033
+      },
+      {
+        "path": "source/experimental/builder/models/qwen2_vl/__init__.py",
+        "sha256": "eee8ad79c5f891d032661b1cbfa3c6c97557a29d7ad31a347d4dcff2f2ee1580",
+        "size": 746
+      },
+      {
+        "path": "source/experimental/builder/models/qwen2_vl/artifacts.py",
+        "sha256": "01ca4d2fe46319d3485abf750a8bc03f7ab960e6eeef6d1e33adc17f1c7d06fd",
+        "size": 1247
+      },
+      {
+        "path": "source/experimental/builder/models/qwen2_vl/configuration.py",
+        "sha256": "36b9dc197fbf9a716f1b253ec616218e54c33098b699c14fcfa5d8f4080fe12b",
+        "size": 1067
+      },
+      {
+        "path": "source/experimental/builder/models/qwen2_vl/modeling_qwen2_vl_text.py",
+        "sha256": "500006e672ea9ecffaddea13798687ba71fe1efa80c92cda176e817212d22b63",
+        "size": 9085
+      },
+      {
+        "path": "source/experimental/builder/models/qwen2_vl/modeling_qwen2_vl_visual.py",
+        "sha256": "f2867d880b43de4097d68d1878b6dce62a7296b848482c3f1640346da7ef9612",
+        "size": 8125
+      },
+      {
+        "path": "source/experimental/builder/models/qwen2_vl/weights.py",
+        "sha256": "ccb062d1c05cc4c282c400247edafbd54457e1948daadefbb2893218549c85fe",
+        "size": 2029
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3/__init__.py",
+        "sha256": "83a91f4e0d9e29c09096fc815afa457f4cfcd0d2ec70a1d01fba230f1a4bda08",
+        "size": 721
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3/artifacts.py",
+        "sha256": "9c3092eda89f64a7a4cbdb3dca517663e0edf966446e5a2a5a28781938786e98",
+        "size": 1148
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3/configuration.py",
+        "sha256": "bab37ad2ca97d74a759715d706389088c4a79068a5884057a4419921b2979696",
+        "size": 964
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3/modeling_qwen3.py",
+        "sha256": "e1b89cffc069a6400df59b95dc4311ddd90d7420905dab16080f703d4c8d504f",
+        "size": 5184
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3/weights.py",
+        "sha256": "bf60761085744f2d443b0f3ee4cae14317b0b9bf3fea944607c2014e5ed7fa2b",
+        "size": 3402
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_5/__init__.py",
+        "sha256": "6b5a789519345d67443997f0cdd0a71f3c419c4dfd66eb219e2af83a585ac34b",
+        "size": 740
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_5/artifacts.py",
+        "sha256": "a620ad0bd3312d743f2c375937d3d19cbb57e69eec11cb45b9e02d8fd39377ef",
+        "size": 1246
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_5/configuration.py",
+        "sha256": "9132175e3d02717f6bdd5a3226a820707265ff14ec46d2f358207168cc0ac536",
+        "size": 2429
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_5/modeling_qwen3_5_mtp.py",
+        "sha256": "f92e0e8ab49cc636cb04f8ca3ed63ce98dcf510b6c1cade054fc3b74806a6e33",
+        "size": 5522
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_5/modeling_qwen3_5_text.py",
+        "sha256": "d7b137a9e365246af09faa4eec15a1942436966cc87267d38815a9fe95970470",
+        "size": 10847
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_5/modeling_qwen3_5_visual.py",
+        "sha256": "3acd3f218af7aceecf593da9f30868915c33f99bffc92e85da7b8387e832caef",
+        "size": 3960
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_5/weights.py",
+        "sha256": "7417c474cd131c359c5e4482afe8c379cd0fca8e22092429837d5a74b5afe843",
+        "size": 5311
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_5_moe/__init__.py",
+        "sha256": "c52da3ed202a9ac853edd3053dec91b3c15192cc5817184baec732d96758e712",
+        "size": 744
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_5_moe/artifacts.py",
+        "sha256": "22f101bdd2ef0ad9f0b4dea298e277877a2b9a2912322e88035ede948c50b096",
+        "size": 1464
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_5_moe/configuration.py",
+        "sha256": "7871083abe91c014384cfd1e313f05bdb45f157785cc74516b833048ae52cdb9",
+        "size": 2454
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_5_moe/modeling_qwen3_5_moe.py",
+        "sha256": "b8cbfb1e67cdbc4bfc9c952b70f956ddac24ed2911331a61834f42d951a7a4e5",
+        "size": 10920
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_5_moe/modeling_qwen3_5_moe_mtp.py",
+        "sha256": "0b2ad58a16ad1515334476722222506ca321430f6e876497627f2eecdd218a4d",
+        "size": 2343
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_5_moe/modeling_qwen3_5_moe_sparse_moe.py",
+        "sha256": "cad19f74021a3d786214882bfefd8c76d2fb4e96b5e9742a669e746ca07dfe36",
+        "size": 6738
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_5_moe/modeling_qwen3_5_moe_visual.py",
+        "sha256": "e13ff5e6d7d4ab4cdb76b1aa2a26ac32c7fccef502a1161958d2eeeeea05aa71",
+        "size": 3979
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_5_moe/runtime_config.py",
+        "sha256": "436b1b9dc343f01ba09dfe18412fa324c697cbad19fac67c98b4b1b62538271b",
+        "size": 2407
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_5_moe/weights.py",
+        "sha256": "412d89b00e31190a3e19c728d4afbabf4e3efce089147444f87e49cd4a2a7e60",
+        "size": 16471
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_asr/__init__.py",
+        "sha256": "66abdeda78b638b750ad8a6a3a09ec3abd2de3165c3e59e829ca0010e5e35148",
+        "size": 742
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_asr/artifacts.py",
+        "sha256": "ad1d4494211e63f6d368ad97a75a1a79213416e3cb0da07bb5fe29b0f2ca2e7f",
+        "size": 1462
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_asr/configuration.py",
+        "sha256": "61b214a01a37b43d3007efa2e6b078b2b03e1a229d14023090d3e22a96e61769",
+        "size": 1156
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_asr/modeling_qwen3_asr_audio.py",
+        "sha256": "c50d33ed20d9194a5f13ed96199f31f45f7e95477a5dee47f2e2c5f0ff20e32b",
+        "size": 3278
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_asr/modeling_qwen3_asr_text.py",
+        "sha256": "8e5455c0787b7c4f55ce5ba45b8fbab80f894ad764aa53d4cf8342813e44dc52",
+        "size": 4611
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_asr/runtime_config.py",
+        "sha256": "dfa0cfdfde96a22bf4bd5084b6458fbe97557f560ac869cd17577e0d3bef908a",
+        "size": 1942
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_asr/weights.py",
+        "sha256": "31ea7958f14554059bbe19f9c726a55731f34babc094762b9d313c27c37e0c69",
+        "size": 2036
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_moe/__init__.py",
+        "sha256": "2f2170e7cc69fde6bb766a8b05402866d8700af6159842dcd7fab047e3298cb4",
+        "size": 745
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_moe/artifacts.py",
+        "sha256": "8b2e99a229ff411f76bdbffca21135cbedb8b022ef00ef8c2a9b63f4e74b99ae",
+        "size": 1156
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_moe/configuration.py",
+        "sha256": "db6ea2df56c8af0e73eff7eaa889ede8c8b54f8ff6fb74f876c08fbbc664c2bc",
+        "size": 972
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_moe/modeling_qwen3_moe.py",
+        "sha256": "35fa1c044c168d92a15d769be66c48852e69305028e3a961277cee3f9bdd327e",
+        "size": 11429
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_moe/modeling_qwen3_moe_layers.py",
+        "sha256": "6f11f2538f44f47c23b024c9d1794e404290d3229bb12ba9d11dda898e394b5f",
+        "size": 4816
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_moe/weights.py",
+        "sha256": "98134e1d16cc127febfe8a4aa04b4cdc5335599ae7a3c9e68abc6c87d5e0b2ee",
+        "size": 14239
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni/__init__.py",
+        "sha256": "effcaaed4b8a6354be71f4b23e54c2ed835d2dde913b2abc3260cc61523585e9",
+        "size": 743
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni/artifacts.py",
+        "sha256": "a6b6e1a573987e10953f8b20532c1974c694a2bde18dd5490e2be2db42a9fe9c",
+        "size": 1595
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni/configuration.py",
+        "sha256": "82f1bfc01c5b12d4b31e092628355657ae2ec1bdd192a98c0f6929c5a9c1eef8",
+        "size": 4895
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni/embeddings.py",
+        "sha256": "220932b16fd4822d9ab95ee3d1ef8c204a3825bcf951cf4510cbcfbac41d4f2b",
+        "size": 2832
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni/modeling_qwen3_omni_audio.py",
+        "sha256": "4bda82bbef75d73f87918ccb6ce6f4ff6f0b5d4bd79cb867e5969c3a3347d3ad",
+        "size": 3510
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni/modeling_qwen3_omni_code2wav.py",
+        "sha256": "baec527e5f776f7a1026c2a226e96ed0892481f58960f6df0e62dda58c5ac111",
+        "size": 4724
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni/modeling_qwen3_omni_code_predictor.py",
+        "sha256": "83155b5d6f8d82821d584a078ababf666fda3c545a5389562e897f45ce93f0e0",
+        "size": 4173
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni/modeling_qwen3_omni_moe_talker.py",
+        "sha256": "281a10a1ecf632db9d3d04e973e5036f48abda962d17d92cbd599daf1bdd1278",
+        "size": 11194
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni/modeling_qwen3_omni_moe_text.py",
+        "sha256": "96a9fe184bccd54c4268762e219ec7e5639032d8f9eb1564716e6b4dc8308d94",
+        "size": 15163
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni/modeling_qwen3_omni_mtp.py",
+        "sha256": "97f276a859837fb4eb3662749be52926c9b2c1c480949d4ddfd2249c6b5ce3f3",
+        "size": 7469
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni/modeling_qwen3_omni_talker.py",
+        "sha256": "a0562faec80b570236b66430bb411e7c6109b0597126bc77abbe710f0fc08b4a",
+        "size": 3174
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni/modeling_qwen3_omni_text.py",
+        "sha256": "ede12477dda44f2b1fde8fa08cea1c9c799843c757b6b0090cfa33c8e45007a1",
+        "size": 4543
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni/modeling_qwen3_omni_visual.py",
+        "sha256": "87561b2bb956f51257a47fa6e1b0fa6ddb8ff1a6a29d7c17f3e5360b19c1b1cb",
+        "size": 5124
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni/runtime_config.py",
+        "sha256": "7d1b0dedec6c15351219139f81adb15fe38e58ee5822617b9919ad2c3eb22a99",
+        "size": 6528
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni/weights.py",
+        "sha256": "2af729ce504646810f8e7e232cae4faffa052d45c98dbc78430324a598490582",
+        "size": 14785
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni_next/__init__.py",
+        "sha256": "0c9944ebb3383b62821bc7e9df754984a5c0340921fd95f60b61b35e07ede3d2",
+        "size": 747
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni_next/artifacts.py",
+        "sha256": "b1b26e6aa0163b8d699addf59c8e2cc7e6cafc8d7696510ce1e98d6d4f831a25",
+        "size": 1666
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni_next/configuration.py",
+        "sha256": "7b15c283c1d6593f00568aff02bcd9d2cc751c0738a3ff4ae4e56049528c09aa",
+        "size": 12086
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni_next/embeddings.py",
+        "sha256": "63d87c07aecbe1e8975cfa9a71613154b237f4e1d0c8b4f8d25a32d30e3eed12",
+        "size": 2984
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni_next/modeling_qwen3_omni_next_audio.py",
+        "sha256": "f4d63740e313502ed6648590e8ac1d805f4faf74708fd89afa7b33436011f2ef",
+        "size": 4786
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni_next/modeling_qwen3_omni_next_code2wav.py",
+        "sha256": "53971a8bb1f4d38868c98cf92b2524f6253207362dce0e0907c21d848cbd6247",
+        "size": 12707
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni_next/modeling_qwen3_omni_next_code_predictor.py",
+        "sha256": "eac2ac1688fb3c7170f09701ae4208ec6d44145946b7a843c606a485e8ba3963",
+        "size": 6269
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni_next/modeling_qwen3_omni_next_moe_talker.py",
+        "sha256": "e284c27bf5029857f541491fc6fc2f2fd5287f68c9a888a2b4940d4978947875",
+        "size": 1664
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni_next/modeling_qwen3_omni_next_moe_text.py",
+        "sha256": "056fb48e5bcfea5204b53ccc40810f4b332ef703c5bd5b6eb5a482719a2a641f",
+        "size": 6793
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni_next/modeling_qwen3_omni_next_mtp.py",
+        "sha256": "4bb43b73f70551eade9cc49bcca3692f4163505dd56d64b4957d511b78a21b01",
+        "size": 6058
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni_next/modeling_qwen3_omni_next_talker.py",
+        "sha256": "3e5ec83e0444228a15b65011d0b75f9f0ac20a6aa9f74dd4046acea06b05b8e1",
+        "size": 6162
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni_next/modeling_qwen3_omni_next_text.py",
+        "sha256": "3e12cd967915139e4b57814054a29c1a0da4820199a291e41ecc6b7eaf59430a",
+        "size": 13753
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni_next/modeling_qwen3_omni_next_visual.py",
+        "sha256": "fafd5c8f83324ac3be791b208592b869f7e74d362a4b841daace43eb36e4610b",
+        "size": 4998
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni_next/runtime_config.py",
+        "sha256": "c7d2e0b1e4d6b2d388ffe2e82d1a6b40fdf64105fa3b4ce77e96fd1fe7cc30e9",
+        "size": 7422
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni_next/tokenizer.py",
+        "sha256": "0970b2d7c994cc15a672c3b805188371e67d068e530bebc7e8a76691c6f81a17",
+        "size": 1062
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_omni_next/weights.py",
+        "sha256": "a06d27a10cbb40d74bc1bc3ee9c952758b8911f4bf01a247f49c8a69db49399a",
+        "size": 26029
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_tts/__init__.py",
+        "sha256": "7813b5b1d3efb761adcdd6780de80ad8009e214a9121e24c3b038c857179f468",
+        "size": 742
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_tts/artifacts.py",
+        "sha256": "101c1452b524a1a33fd1c8d65986e939af0ea91219151781e755427fa40aebec",
+        "size": 2275
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_tts/configuration.py",
+        "sha256": "ddb8e1a62e28e51d8cade05b9a9824b5164f412ab79ffcf3a281dded95909409",
+        "size": 3831
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_tts/embeddings.py",
+        "sha256": "1f4df1ec13c6d60f4385d43ae3349408dffbba25635757a8ab6cc49d321de3f8",
+        "size": 3099
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_tts/modeling_qwen3_tts_code2wav.py",
+        "sha256": "8739b817933499f87ecb86386e3bc509b83d8b2f2359051c411338b6d03a445d",
+        "size": 2546
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_tts/modeling_qwen3_tts_code_predictor.py",
+        "sha256": "d23ddbfdcb8452555699b479a65c892e8338c3a8ce1673811353713a7b47730e",
+        "size": 4157
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_tts/modeling_qwen3_tts_speaker_clone_encoder.py",
+        "sha256": "2701918bd001843da9aa632198d850c5fc605ae27755296d469352f8a356c946",
+        "size": 13874
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_tts/modeling_qwen3_tts_speech_tokenizer_clone_encoder.py",
+        "sha256": "a981397245898fcbb3f30a5fab8a835a579d0b3888d56f61aba7964a44f2332e",
+        "size": 20029
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_tts/modeling_qwen3_tts_talker.py",
+        "sha256": "2dcd5d83e345e37de6dec6f0ca6da6dbae8c6098396d72a0c65d7749d069a8f0",
+        "size": 3153
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_tts/runtime_config.py",
+        "sha256": "8a17bd6c25479c2015c541aaf5f6c70179fb0d63e6429486b7581a0fefee0b24",
+        "size": 5122
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_tts/weights.py",
+        "sha256": "186ae4f9332c086c27b419e4c3df595a387c976d9eb445002a0946b97350a316",
+        "size": 2155
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_vl/__init__.py",
+        "sha256": "84d01c109814045dca9803810e5d140bb0f1888c9a7232cbc5a0865396626738",
+        "size": 741
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_vl/artifacts.py",
+        "sha256": "0cb98e05d49c048786db21182df8d50dcb37ff9cdad5007fe49c559eae16b51c",
+        "size": 1247
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_vl/configuration.py",
+        "sha256": "14473b8e8355b1170fb0eef0a74c2efc8d4d628ce9e1159e999a5f936e6038f1",
+        "size": 1785
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_vl/modeling_qwen3_vl_text.py",
+        "sha256": "63c1d9f768d3151dca885936cbca9ff895849096d72a1d115f009a93c61a4e08",
+        "size": 4695
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_vl/modeling_qwen3_vl_visual.py",
+        "sha256": "bc11c24fbd20203314ebc3cc4b888a1da327af438f97632e0877cf1e967c0b1f",
+        "size": 4658
+      },
+      {
+        "path": "source/experimental/builder/models/qwen3_vl/weights.py",
+        "sha256": "26d8592559f1817e865d20618d5797c296b79b514643500d0aeaee61bf5b900d",
+        "size": 2029
+      },
+      {
+        "path": "source/experimental/builder/models/registry.py",
+        "sha256": "4be7010ee776c12f8f52acea10be7c8b40e662d691820b71aa0a9a655e601d2a",
+        "size": 29636
+      },
+      {
+        "path": "source/experimental/builder/ops/__init__.py",
+        "sha256": "0d18bf393d571534344cd9c913caea1436626e6c8161b65dbca5c5e8d6f46ddf",
+        "size": 3183
+      },
+      {
+        "path": "source/experimental/builder/ops/audio.py",
+        "sha256": "bc3043e7605abd757651af7fce742c0bac7afde3529a1c3c47b663d9c987b051",
+        "size": 9673
+      },
+      {
+        "path": "source/experimental/builder/ops/backend.py",
+        "sha256": "fb8fd0030e0b0a6d8c1ee1a20416bcfdbc4ed97bb68326a8bbf77580d23e576d",
+        "size": 74440
+      },
+      {
+        "path": "source/experimental/builder/ops/code2wav.py",
+        "sha256": "f2744bedce0af091feb3e97ee41c4e79c549dd794ff7a8e46896eb0a9eecf89b",
+        "size": 18310
+      },
+      {
+        "path": "source/experimental/builder/ops/embedding.py",
+        "sha256": "a304ba216bd250751c033b083a74a577b83119e55276221f7e93ae4be94d44e5",
+        "size": 2255
+      },
+      {
+        "path": "source/experimental/builder/ops/functional/__init__.py",
+        "sha256": "c7f3477a376bca418e897b16da95710fe5e1c717b7eb054f3cc66ecdbb41e4bb",
+        "size": 3415
+      },
+      {
+        "path": "source/experimental/builder/ops/functional/_operation.py",
+        "sha256": "94cf0d883113edc5dc6ec1ed457ad4f65e3528fa6bf671e97b96709cdcc3ffa9",
+        "size": 2372
+      },
+      {
+        "path": "source/experimental/builder/ops/functional/attention.py",
+        "sha256": "faaa9d0a0ba9e3365f93bd5106f215d67312caafd9320e52a118889fc3f88fbe",
+        "size": 6360
+      },
+      {
+        "path": "source/experimental/builder/ops/functional/core.py",
+        "sha256": "78ca3a304fbd632fc3ddb8c81bf34d6a244eac8263668e30008b702be86eb30d",
+        "size": 21578
+      },
+      {
+        "path": "source/experimental/builder/ops/functional/distributed.py",
+        "sha256": "b9ef650ada1301cb8b62e421a9f11c158dc3f92c718f050dc06e2b5156e466f0",
+        "size": 976
+      },
+      {
+        "path": "source/experimental/builder/ops/functional/moe.py",
+        "sha256": "21a69999939b4bed9a7c493ea91b61db19ecba443b13a7c58de8903ad4da161d",
+        "size": 10215
+      },
+      {
+        "path": "source/experimental/builder/ops/functional/recurrent.py",
+        "sha256": "2a193c272fd4a8feeb41d8a784ec02f70e9246914687ea223d082a7be519c3f3",
+        "size": 5810
+      },
+      {
+        "path": "source/experimental/builder/ops/functional/speculative.py",
+        "sha256": "1c365af18e2d7a3a20dd69e250b293cc0e12748ac09fb4e1f2c4af403b3e867a",
+        "size": 4533
+      },
+      {
+        "path": "source/experimental/builder/ops/gated_delta_net.py",
+        "sha256": "c21f1bbd707a09f9057c47b770341188fd023aac205cdd4851d76a8edf9836c4",
+        "size": 6990
+      },
+      {
+        "path": "source/experimental/builder/ops/linear.py",
+        "sha256": "bcb9d11bffbc33ceb210978d96bf16e572e31505115297ddd56f01eced2e51c2",
+        "size": 10587
+      },
+      {
+        "path": "source/experimental/builder/ops/mlp.py",
+        "sha256": "61b68b65e8f701f879558d15c978f676c184d39b2fadca2b7774a165b51ef142",
+        "size": 1969
+      },
+      {
+        "path": "source/experimental/builder/ops/module.py",
+        "sha256": "426fe1fa794614b824cd5c624beccd66356a005a2bd9bd90d7ff1e856318980e",
+        "size": 6751
+      },
+      {
+        "path": "source/experimental/builder/ops/moe.py",
+        "sha256": "30049db2bf9e50b092f0639a3f2dfc6938eb2780569b22d0b65600c17e8ac2fd",
+        "size": 19048
+      },
+      {
+        "path": "source/experimental/builder/ops/normalization.py",
+        "sha256": "97ca8310d5040fac77c29ba13a9690ae54b0a6d5d9da8862cf2edf01b7d84468",
+        "size": 2674
+      },
+      {
+        "path": "source/experimental/builder/ops/ragged.py",
+        "sha256": "282a3b2577a2f9c893f4d31faaa223d55c2fa051178a4d5394daddb94592fa36",
+        "size": 2895
+      },
+      {
+        "path": "source/experimental/builder/ops/scope.py",
+        "sha256": "17737dd87b7cd09c2cdbfc09f34ee1a5176ede133ed5a5cc2822acf7b6ab5dc6",
+        "size": 1856
+      },
+      {
+        "path": "source/experimental/builder/ops/tensor.py",
+        "sha256": "70716a540208252829e21ae5327eb3065a6c753b10d03732d42a3bf6aa3298f4",
+        "size": 13137
+      },
+      {
+        "path": "source/experimental/builder/ops/transformer.py",
+        "sha256": "8fa65ba4f731388de6c6f9de3b9a5d4315aa7cd15392addfcf1dd8df7839b319",
+        "size": 15313
+      },
+      {
+        "path": "source/experimental/builder/ops/vision.py",
+        "sha256": "87283a62c74ba5f9ffdb8c4046860ccf608e7762f2180cc2b1bc24490f1cb394",
+        "size": 6905
+      },
+      {
+        "path": "source/experimental/builder/weight_packing/__init__.py",
+        "sha256": "327331e6faa07ad9c3893632f90ee4db8af472f41bec37f8fcb52ece43adbb3f",
+        "size": 800
+      },
+      {
+        "path": "source/experimental/builder/weight_packing/int4.py",
+        "sha256": "e1ffe18ac17ed20cdc9f78088e7bb13ae36834e076e92a42b785df20293891c3",
+        "size": 13978
+      },
+      {
+        "path": "source/experimental/builder/weight_packing/nvfp4.py",
+        "sha256": "970bb1b2f900ac64d7219dc74693e287879081bc88ddfcae44fc53de3063b3a7",
+        "size": 16337
+      },
+      {
+        "path": "source/experimental/docker/Dockerfile",
+        "sha256": "791ce550f84fdbafb20cdec69b60c7f6d8ca003ceb9b8184f699f29b1eaf4a0d",
+        "size": 2012
+      },
+      {
+        "path": "source/experimental/docker/README.md",
+        "sha256": "c5ff1602dc9a0817acc47191e1642f23c4568b5fc0deee0dcdc58f3fdaa685b2",
+        "size": 1255
+      },
+      {
+        "path": "source/experimental/docker/build.sh",
+        "sha256": "fe8e1921b53f40afa2fb79e0265422fa6391ccdfe723938e987d6f67f284f944",
+        "size": 5252
+      },
+      {
+        "path": "source/experimental/docker/build_container.sh",
+        "sha256": "cc24c64294492ff963a545dbeb1502f7b098f91e1463610cc5d57347a5fc714c",
+        "size": 2926
+      },
+      {
+        "path": "source/experimental/nemotron3_5_asr/__init__.py",
+        "sha256": "cca117b2dafe38491ba2dcb9d6d28529b4279da8a0842c3fe9f5af1d80558a1d",
+        "size": 730
+      },
+      {
+        "path": "source/experimental/nemotron3_5_asr/server.py",
+        "sha256": "88a8e56af52eab564801e143ec3653bde1ae591d47a7145803c809f37547fb22",
+        "size": 13079
+      },
+      {
+        "path": "source/experimental/pybind/CMakeLists.txt",
+        "sha256": "59939e4a5eb732bd56225dce184bd1f7184521f63d028806d334f1cfc3b7a4cb",
+        "size": 9018
+      },
+      {
+        "path": "source/experimental/pybind/device_link_stub.cu",
+        "sha256": "9c1b1768ba7a423c64d875e17099537a5a11d5d6385ac9dade745d44c0a86fbf",
+        "size": 986
+      },
+      {
+        "path": "source/experimental/pybind/edgellm_pybind.cpp",
+        "sha256": "6a151a82623678dc0b9e908d87e052f98c92d8e07ecda68727aab96c993c2e26",
+        "size": 69428
+      },
+      {
+        "path": "source/experimental/server/__init__.py",
+        "sha256": "e93399ba4d04c3f2c66fc7f517535b9a9674ee36e7f08b437b13a188ce4b4933",
+        "size": 1470
+      },
+      {
+        "path": "source/experimental/server/__main__.py",
+        "sha256": "49751015a9ffef011c215ff253f9fe7a0f513ee8164cf7cba5425ed5ccc48502",
+        "size": 772
+      },
+      {
+        "path": "source/experimental/server/api/__init__.py",
+        "sha256": "91b587f704e55f2b7e348a7d6f23158edf9b6027de0542cfccd0a88a61f15ef7",
+        "size": 736
+      },
+      {
+        "path": "source/experimental/server/api/anthropic_compat.py",
+        "sha256": "7e1da9ca7148f51b4e64ea2f153d86bcf80f541dae8bed16a554c472c4d6f479",
+        "size": 14509
+      },
+      {
+        "path": "source/experimental/server/api/app.py",
+        "sha256": "e6a5d13e404ee2a3f6b9d0f63c59665da5ca3e8018e4f3a2463c59ed7967d985",
+        "size": 9198
+      },
+      {
+        "path": "source/experimental/server/api/errors.py",
+        "sha256": "a9c09ce80e4a65a317511a7e366be5a96694d3ba9117921e8f7b69d936750f98",
+        "size": 4394
+      },
+      {
+        "path": "source/experimental/server/api/protocol.py",
+        "sha256": "dbabae36b6ce1e9912d1b55eef8f6a49a6918117121c6c84b6b72fb53c12043a",
+        "size": 9166
+      },
+      {
+        "path": "source/experimental/server/api/routes.py",
+        "sha256": "af913489e0ab6821d5b22977ba1ba7b2f766740ad0ac152945d6b990ccbe5c73",
+        "size": 7441
+      },
+      {
+        "path": "source/experimental/server/api/serving_anthropic.py",
+        "sha256": "828fe669f1892389b53e6531b1e3a71c7c255c3e2d967e0eeac8cd9ca6818c39",
+        "size": 11799
+      },
+      {
+        "path": "source/experimental/server/api/serving_audio.py",
+        "sha256": "b2ccff092ff4af968b1762752ff23bbcaa610af2c3918a1263e3e80244f24723",
+        "size": 7732
+      },
+      {
+        "path": "source/experimental/server/api/serving_chat.py",
+        "sha256": "2accae0575af667a4043237707ff5417fd4dd5d17c5db4e52a5e0d3b9926eb52",
+        "size": 35355
+      },
+      {
+        "path": "source/experimental/server/cli.py",
+        "sha256": "127f29559a4273950134c29b14ef9ebe3433314dd3ed22e99df38e05fbd4e1ef",
+        "size": 2146
+      },
+      {
+        "path": "source/experimental/server/config.py",
+        "sha256": "ccafc585a3c6062844cf5f94bbeccd2153a233a86bb6ae46d38488998dc4e6b2",
+        "size": 18467
+      },
+      {
+        "path": "source/experimental/server/media/__init__.py",
+        "sha256": "43e7fda7b062526e8d07d53a052874d99d3ec6b131ad208d6843b878da18f126",
+        "size": 732
+      },
+      {
+        "path": "source/experimental/server/media/audio_preprocess.py",
+        "sha256": "622f8dc557ccb19159675597e39a7997cdf3844221348ae831802b7236173c19",
+        "size": 6040
+      },
+      {
+        "path": "source/experimental/server/media/image_preflight.py",
+        "sha256": "a3a5b17ff79b4879b2e9a7f956bbecbf8f495dec35b8c7e5be361c8621c0d74c",
+        "size": 7552
+      },
+      {
+        "path": "source/experimental/server/media/media_source.py",
+        "sha256": "3053938cdb688dbc8c565bdfcddad715da206fa5cea83b85166e92137dab24dd",
+        "size": 9065
+      },
+      {
+        "path": "source/experimental/server/media/video_sampling.py",
+        "sha256": "ef5f9a416446dfa0ea3b47c59e6a54b63738b15da8e9f7cfbc0c6418f800f564",
+        "size": 60359
+      },
+      {
+        "path": "source/experimental/server/parsing/__init__.py",
+        "sha256": "a52b93696a1cf2e5916041887e82bbc45c2b60d588ef1c256bc2e918543a322f",
+        "size": 739
+      },
+      {
+        "path": "source/experimental/server/parsing/reasoning.py",
+        "sha256": "92d1652997e6dafb75d7e1fa1a4fe068bd85f5060a2c22b4a3749e1f266f0227",
+        "size": 12292
+      },
+      {
+        "path": "source/experimental/server/parsing/terminal_tokens.py",
+        "sha256": "8c5d91a7ce8b339290208e1c28e0ad58ffe630e85492479e7359c7d8f5e002ba",
+        "size": 3473
+      },
+      {
+        "path": "source/experimental/server/parsing/tool_calling.py",
+        "sha256": "e575508be2b509d73091293b07d8a58221b39a949c3b40215eb7672171f9665b",
+        "size": 65744
+      },
+      {
+        "path": "source/experimental/server/runtime/__init__.py",
+        "sha256": "6a5cb7f7b54c5aca7bc5bf939a262ab83ef794fc6365bf6a6cc4d20f5ab6475c",
+        "size": 737
+      },
+      {
+        "path": "source/experimental/server/runtime/engine.py",
+        "sha256": "44ba8ff0840f36573e94aba270578b8c63932e85a91ff17e5db58fd440627250",
+        "size": 110024
+      },
+      {
+        "path": "source/experimental/server/runtime/engine_build.py",
+        "sha256": "59691defd2a5a1bd03d1acdbe4363f383e55c2cb76ddc29dfbc74afe833f4a4d",
+        "size": 19151
+      },
+      {
+        "path": "source/experimental/server/runtime/engine_client.py",
+        "sha256": "a5c2574847ac053aa1f080c2cdac4f38c2776ecbf83065166953afbee0f6a389",
+        "size": 23431
+      },
+      {
+        "path": "source/experimental/server/runtime/engine_layout.py",
+        "sha256": "1d3f152a11d2d1c64896864433ae5a7461ad09d0da181aaae4a9535851187d7e",
+        "size": 5397
+      },
+      {
+        "path": "source/experimental/server/setup_pybind.py",
+        "sha256": "bba07ce8c204d24beef2bf1173d44f6676821124775370ea16bc4b85f6b15848",
+        "size": 5537
+      },
+      {
+        "path": "source/tensorrt_edgellm/__init__.py",
+        "sha256": "19062fbde00d464aa7ab957a48c7c7c3af4162e0178b6ca9834dbb23fd055e4c",
+        "size": 2293
+      },
+      {
+        "path": "source/tensorrt_edgellm/_export_api.py",
+        "sha256": "a995a61c2a6a857a58cc42bd9b87080da306193ac928438fbfc9c469e3266292",
+        "size": 6898
+      },
+      {
+        "path": "source/tensorrt_edgellm/_native/__init__.py",
+        "sha256": "df4079c49393016f675d443e66e3ae5c325360a22901b0364bbf22495306e048",
+        "size": 1813
+      },
+      {
+        "path": "source/tensorrt_edgellm/_native/contract.py",
+        "sha256": "ae08c8f81c7e9b7b0de6cd9edad148c77548f164ba3383ebadabf0d627ffc7a2",
+        "size": 6827
+      },
+      {
+        "path": "source/tensorrt_edgellm/_native/dependencies.py",
+        "sha256": "0c9770d7149ddaa2aaf702b11164e1167a663332474600b391fcf9ab575df07e",
+        "size": 4234
+      },
+      {
+        "path": "source/tensorrt_edgellm/_native/detect.py",
+        "sha256": "dc9c84fcc151ae90f1e143348d580a6cc26f3ff6dc4c743797e67d2b3b159e06",
+        "size": 10395
+      },
+      {
+        "path": "source/tensorrt_edgellm/_native/load.py",
+        "sha256": "58db56985b837d8168d595b3aa5eadd19997228f82ad3e99a4439bdff13a7376",
+        "size": 7283
+      },
+      {
+        "path": "source/tensorrt_edgellm/_native/select.py",
+        "sha256": "446f85fb9dd6453cbe798458a22a37ab96de410cfc36e75925eb556523384438",
+        "size": 3933
+      },
+      {
+        "path": "source/tensorrt_edgellm/_safetensors_io.py",
+        "sha256": "d999acb72716ffbf408c14cb8ea9642df14913ed56ef8af7fec55edd8e60421a",
+        "size": 1933
+      },
+      {
+        "path": "source/tensorrt_edgellm/_version.py",
+        "sha256": "1df614f6c15cae652fece49084fb39591837348c8f6f90a940594b2c5266bd68",
+        "size": 790
+      },
+      {
+        "path": "source/tensorrt_edgellm/chat_template.py",
+        "sha256": "b745d0d8e239460eda67d3602424a56a1ff310b4bcb683c83d1157b5a23342cc",
+        "size": 11297
+      },
+      {
+        "path": "source/tensorrt_edgellm/checkpoint/__init__.py",
+        "sha256": "29c53cbdd54824154b6885b4f95d4c9a94f711efa35c7095aec89a679adebab9",
+        "size": 767
+      },
+      {
+        "path": "source/tensorrt_edgellm/checkpoint/checkpoint_utils.py",
+        "sha256": "4d4c867acda0fee4df76b58f9d7f3a4f3f05e83ca7836165e4b563e43e742142",
+        "size": 55238
+      },
+      {
+        "path": "source/tensorrt_edgellm/checkpoint/embedding_quantization.py",
+        "sha256": "9494a470fa54fd5b6ef8c5dfd25c74bf249fb9ab41197c1c8e9511454a4f71d7",
+        "size": 5878
+      },
+      {
+        "path": "source/tensorrt_edgellm/checkpoint/fused_weights.py",
+        "sha256": "34199f1cd950a1f246875ce272fa206e284305c0b01b7fc86dce6bfc75c49d98",
+        "size": 2960
+      },
+      {
+        "path": "source/tensorrt_edgellm/checkpoint/loader.py",
+        "sha256": "42d76b13ae0935b7ceba7e3977f721c7d1eb874bf968fd18e7a4375ce3574c54",
+        "size": 39595
+      },
+      {
+        "path": "source/tensorrt_edgellm/checkpoint/repacking.py",
+        "sha256": "bce1b58834cef937cf8ee5f83d0b45724bc25b30bc91f1a398f7698a92209002",
+        "size": 93977
+      },
+      {
+        "path": "source/tensorrt_edgellm/config.py",
+        "sha256": "f96f41b6495b942a26d1e53f4b17dbe0220c9afd707b4b6cf8a4ca8ae5b735c3",
+        "size": 125364
+      },
+      {
+        "path": "source/tensorrt_edgellm/dflash.py",
+        "sha256": "266c6c22675f7ab39f4e8d209c7d550fd182b11def7c1ef3a602d1418131cced",
+        "size": 4804
+      },
+      {
+        "path": "source/tensorrt_edgellm/external_weights.py",
+        "sha256": "c48a355bc5d34a147090140c82f8c901cf8e9bff5ab30e3468bf35e457cc5e97",
+        "size": 24090
+      },
+      {
+        "path": "source/tensorrt_edgellm/lora/__init__.py",
+        "sha256": "35d394586c75716c4703205549756a4f46a8f631be3aa776a066629367333e9f",
+        "size": 972
+      },
+      {
+        "path": "source/tensorrt_edgellm/lora/lora.py",
+        "sha256": "b987ecebe0a68037bf5d1a6da9fc8f3d0c61b3476a713089f423c0f8ceaf3950",
+        "size": 26775
+      },
+      {
+        "path": "source/tensorrt_edgellm/lora/phi4mm_utils.py",
+        "sha256": "e57e803c5b3472c78ac5d6cfc28875dbb62a0d90b5e016b64bd915670c2e3065",
+        "size": 6330
+      },
+      {
+        "path": "source/tensorrt_edgellm/model.py",
+        "sha256": "4c6b8f86b8bafa69c223e21f8d3e40d3afdc0102c23654d9458ffb0a1b59cf10",
+        "size": 59407
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/__init__.py",
+        "sha256": "f42a2f13be7f19ffcb77113735946f0f6263435adaa30d89608458c3689dc995",
+        "size": 1803
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/alpamayo/__init__.py",
+        "sha256": "7dd20512865eebc84472e76b92ba98a9a2c8784924de103362d6f713a60ecc2c",
+        "size": 879
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/alpamayo/modeling_alpamayo_action.py",
+        "sha256": "3505c3bfec9ba39e7bd5cf56d0f27e8a9abe438d84e0a12aabe1fe9693c911fa",
+        "size": 20766
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/cosmos3/__init__.py",
+        "sha256": "ec7d827f74b8d6ac9c7fc4e097db4282462374589bd61ec52a710ffad1ab138a",
+        "size": 1763
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/cosmos3/export.py",
+        "sha256": "2402932ef821ce64130e8b3b6c72883083fcffb6165a6d3438a4aab96c35e68c",
+        "size": 9555
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/cosmos3/modeling_gen.py",
+        "sha256": "0093c5874bcb50cf63e04132eccaa319ab4cab1a072d0bb1da120fc965d87f11",
+        "size": 34708
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/cosmos3/modeling_und_prefill.py",
+        "sha256": "546083cff394e46d16211817abfdb00f66ce949184d1683b9bcd91e60bcf2f45",
+        "size": 13460
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/cosmos3/modeling_vae_encoder.py",
+        "sha256": "6a936ee67e053503a28a1221ade4474216275777c5246fb008ba1fc527e8a4f7",
+        "size": 19515
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/cosmos3/weights.py",
+        "sha256": "a97f4f9ff37b09633b5c3daba559dee324003c57a0178dbc107de9b7197f137b",
+        "size": 4771
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/cosmos3_reasoner/__init__.py",
+        "sha256": "0ed3f9990402164ed5532efbc20630c99320ef5c39a37b8e522ebb3dbc1d865b",
+        "size": 1476
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/cosmos3_reasoner/modeling_cosmos3_reasoner_text.py",
+        "sha256": "c692a2db5ff27ce01e592ffa5a5e22ae0f7412327b60e9ac128e05310170177a",
+        "size": 3676
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/cosmos3_reasoner/modeling_cosmos3_reasoner_visual.py",
+        "sha256": "59cff8a4450dbd3f26c625236a184005d359a05ff89ee21225e652ab5564e898",
+        "size": 33505
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/default/__init__.py",
+        "sha256": "84ff0ff93a9e990299fac576e051cb4d2534e251426d31e4163eedd67291ebb5",
+        "size": 751
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/default/modeling_default.py",
+        "sha256": "8085ec0325ae7f6d92ea4fcee3144c5b9095301ee0a3ab4589b579b195c252ca",
+        "size": 60639
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/dflash/__init__.py",
+        "sha256": "cbd811553ee05a22fbb9dce8223d750dcb416d7bc3bb36a5e85b2bdf4c6ab3ee",
+        "size": 764
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/dflash/modeling_dflash_draft.py",
+        "sha256": "f2c40ce7a41075dc8657d189f111e7a43284d27a5d16e4409f61d72e4bb1cae2",
+        "size": 35004
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/dflash2/__init__.py",
+        "sha256": "6b4eb41523bb119ab681e79c84c4e076e1595bcaf04becfd223853e59ea8fd71",
+        "size": 772
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/dflash2/modeling_dflash2_draft.py",
+        "sha256": "727b190d3343680c7aba2845396a642f483fd9c034388fbb70461995933ce600",
+        "size": 19164
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/diffusion_gemma/__init__.py",
+        "sha256": "4b4b8906f32885d23b68bedac34eaaeedf8b8ef0447e88d22733e9c0d61bda9a",
+        "size": 933
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/diffusion_gemma/modeling_diffusion_gemma.py",
+        "sha256": "cdcf60863a7bb898b2cabdbdb4a41bb6e64d6fc3e063fc0ba441b977ce4fc08e",
+        "size": 31213
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/dspark/__init__.py",
+        "sha256": "f7e81a97c588ad5bf532e1f6a4ee9b9c80b2c5558aec5891500116389952d806",
+        "size": 764
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/dspark/modeling_dspark_draft.py",
+        "sha256": "b010c099609374f500b38874aa2e52cc7176d304aca35cf741165450bf5fb909",
+        "size": 33484
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/eagle3/__init__.py",
+        "sha256": "3b5e505abfeafd957b11cdd5504efdc3db46a251572a91deb9f719b9f25bd448",
+        "size": 769
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/eagle3/modeling_eagle3_draft.py",
+        "sha256": "514a595ce207ed132fd2a0c1618cc320628bd5b23e81dbeb6bb34337d1336128",
+        "size": 30113
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/gemma4/__init__.py",
+        "sha256": "56558dd037c6a1895e52858bd318b628f1c89ac7ed4ebc97e6854015bb85e6e0",
+        "size": 1979
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/gemma4/modeling_gemma4_assistant.py",
+        "sha256": "7a7bf0b6653371e7a8de3e202e947cc975eea21cb563ffe0e28c11df18530d48",
+        "size": 26608
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/gemma4/modeling_gemma4_audio.py",
+        "sha256": "4c8930ee5b411ef8267caa7d96618178e659c241e929c6740821a76dc2cca81a",
+        "size": 39809
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/gemma4/modeling_gemma4_text.py",
+        "sha256": "54e10af27b0b59993c56a834e85bdacb33ff1db17e592a3b779339fc3ea9c003",
+        "size": 107731
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/gemma4/modeling_gemma4_unified_audio.py",
+        "sha256": "d29b37b32caffd7d166681355e7d30a8e9c8f7f65027009e16875651e15e9484",
+        "size": 5998
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/gemma4/modeling_gemma4_unified_visual.py",
+        "sha256": "fa97c4f1ab1d5db6455a1c1a9fc75d1aed8a754ab7b4dbdd520d98d62a38287e",
+        "size": 13156
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/gemma4/modeling_gemma4_visual.py",
+        "sha256": "ffad74953c7c51d50a968f075075ffd0f3fa0ce6944d9c810b6eb15d5de0dec4",
+        "size": 27152
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/internvl3/__init__.py",
+        "sha256": "8e9d782fcded705c88e707e187e7b308a5c632c670381f6d7b1008244d4c3a52",
+        "size": 1025
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/internvl3/modeling_internvl3_text.py",
+        "sha256": "5c8327171176134d867bde602fb0efe5617856369f5894341af611108673e402",
+        "size": 1214
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/internvl3/modeling_internvl3_visual.py",
+        "sha256": "2458b0c520554e1f7c121f498ebe5ad9eefabd97fea2f59cc7759aa1284f7d19",
+        "size": 20280
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/internvl3_5/__init__.py",
+        "sha256": "b142d3d047660a063be93cd30259a96ab3b76d3cf610351a7265c64ae43a7d3a",
+        "size": 1058
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/internvl3_5/modeling_internvl3_5_text.py",
+        "sha256": "5123d9107215e966a2e3b0e212c9fb25aa8eb96a24a7b0d4f944d12e7f52f09b",
+        "size": 1225
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/internvl3_5/modeling_internvl3_5_visual.py",
+        "sha256": "418fb3b1880e49f3f3bc74afd2e7cd9e7b82749a6d54faff85094b8fb0a08b3a",
+        "size": 24438
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/linear.py",
+        "sha256": "d81dea9f176b7a550c088025dd45f85854233514163ad4f714cc83edba39fa46",
+        "size": 38393
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/muse_glimmer/__init__.py",
+        "sha256": "5c71aeac1c999fcd27d5d3ed89e8194b5bf6194e825112fd3dc61900b66f1b50",
+        "size": 1203
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/muse_glimmer/modeling_muse_glimmer_text.py",
+        "sha256": "a13981a473e77d098d5e312841d38a8dc1dacfebf0056dfc281a2ef233cd10af",
+        "size": 32960
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/muse_glimmer/modeling_muse_glimmer_visual.py",
+        "sha256": "5f5888454f56ace8dba866992fa560baf17d6ee3c570e3a946bf29f419e2630a",
+        "size": 37611
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/nemotron3_5_asr/__init__.py",
+        "sha256": "eb30a9d873182077b1b5f244a607db881668426d3310cf13939f27cc40e89c52",
+        "size": 1212
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/nemotron3_5_asr/modeling_nemotron3_5_asr_audio.py",
+        "sha256": "e0438d9396499ccca6d1cbdc2903a8e47a6d13a34d35c1efce73eced5458c8bb",
+        "size": 22172
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/nemotron3_5_asr/modeling_nemotron3_5_asr_decoder.py",
+        "sha256": "aa5c1e35551ddda03713c3f85902eadb387963553b0fa42b7b45bbd0edf57e3e",
+        "size": 10097
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/nemotron_h/__init__.py",
+        "sha256": "dc623640057c9ff1e5949272093ed3b40b02998dd22d9c726af139b316801886",
+        "size": 838
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/nemotron_h/modeling_nemotron_h.py",
+        "sha256": "b437cfcb55cf89b7f8998a185c385cf7a9083de14f7f2b17e8f6b5213b516198",
+        "size": 85776
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/nemotron_h/modeling_nemotron_h_mtp.py",
+        "sha256": "588a500b4cfbc03d245a25b45bd4c4d5c51d4ad4d89a49b72feee0b5ee5c81c2",
+        "size": 26538
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/nemotron_omni/__init__.py",
+        "sha256": "18887d40f741a0f6413d8b29bb024a799916a9befdd9f15b762c246f088a0b9d",
+        "size": 1290
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/nemotron_omni/modeling_nemotron_omni_audio.py",
+        "sha256": "d9b3d4554c231b580c824eea2a77e0b2be983e85ab94dc206c25b1ae6d72b1df",
+        "size": 20127
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/nemotron_omni/modeling_nemotron_omni_text.py",
+        "sha256": "1b9065f2e421dcbae0752ed574c0d1f22ccdf4bfcd7df8785fa7b3bdffbbe198",
+        "size": 1587
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/nemotron_omni/modeling_nemotron_omni_visual.py",
+        "sha256": "269bcf719ec0e287f094d51f636a21ab77023936d1fea2229015aaca3ddeacd9",
+        "size": 23974
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/ops.py",
+        "sha256": "5d3a8d395e0a0229077fbd18b1f1443980c08328db75f86c987a07377b61897a",
+        "size": 97820
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/phi4mm/__init__.py",
+        "sha256": "2dcddf34f60b0f1a5035c39a7d3ed30a183c4a83936765a342bb7d6276e0db89",
+        "size": 964
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/phi4mm/modeling_phi4mm_text.py",
+        "sha256": "c1660c338927aceecb87c615a72d1cc3840883fd149eba3c63035c7feffaa916",
+        "size": 1195
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/phi4mm/modeling_phi4mm_visual.py",
+        "sha256": "61852639c420b176e947a6ae443baa0e00925ac0dbf6db25c64c0a08c65b6664",
+        "size": 26565
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/pi05/__init__.py",
+        "sha256": "c098bf079f93f597c0d54e7b4bdbd796a333b4e36781c712e442255852c1967b",
+        "size": 1611
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/pi05/export.py",
+        "sha256": "ea72ef1f1e0576b645df4efade38ce8d39b73b64096ca5c8ec22dad16f08b508",
+        "size": 37726
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/pi05/modeling_pi05_action.py",
+        "sha256": "0730f1566add8145ccd7544bf43c05dbd0dae41a6b76f748630157579a2f1ae3",
+        "size": 23967
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/pi05/modeling_pi05_prefix.py",
+        "sha256": "ae8748ca36cbcd994b6956b01ff4e2c5960ccdef7828774e3a3a50e9593cc816",
+        "size": 11188
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/pi05/modeling_pi05_visual.py",
+        "sha256": "92462eda0345b0ed2c10927adcb1cc973613c9bd6b3370cb583f567cebfb3a5d",
+        "size": 9525
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/pi05/policy_assets.py",
+        "sha256": "ee0116fcb7f18cb54223d1d026513431c80fd95211d4c39d380ec9fbf71c4382",
+        "size": 16707
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/pi05/weights.py",
+        "sha256": "c7b72e552391d0867e6dd56734e26d91739e127aa49946e0bd4613195e0ae355",
+        "size": 9063
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen2_5_vl/__init__.py",
+        "sha256": "fa134418d44f79127f6c7e54ed6674f3718ecd936fde67693ef8d0e56d7ac4f3",
+        "size": 1031
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen2_5_vl/modeling_qwen2_5_vl_text.py",
+        "sha256": "48650221098faa89592768bd00df6c03f2b257a29682c2767dcfcc44059fd708",
+        "size": 1198
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen2_5_vl/modeling_qwen2_5_vl_visual.py",
+        "sha256": "4d903df54bd55614fd082b9e5617cd312cbe3a4d935121259de68508b0be0403",
+        "size": 23144
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_5/__init__.py",
+        "sha256": "d24fcc2eb8a71c99e4795df9a19c6550c232437469210020bedbed4ebdc83ab8",
+        "size": 1171
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_5/modeling_qwen3_5_mtp.py",
+        "sha256": "74e147ef19e0797849de35f03c6282156788d59e584bd75b7ba1ced2965c3822",
+        "size": 20607
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_5/modeling_qwen3_5_text.py",
+        "sha256": "e8e527cbf00b2611fc0b5a66f5ebdf00bd7da80df95d8ef4af8bc44d7a1c8679",
+        "size": 77641
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_5/modeling_qwen3_5_visual.py",
+        "sha256": "1380566602f8a283b98b0233c2ae73ea3dbc5648b5681f03927fd57ec3701af3",
+        "size": 2431
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_5_moe/__init__.py",
+        "sha256": "401de76290719c74be0b3375a01177579a3902c9f14c3c0f07ec5c9adc690864",
+        "size": 892
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_5_moe/modeling_qwen3_5_moe.py",
+        "sha256": "1bbfd0965ef5363d2e9383f2b114fe1927e96d434ac722457cd5306b65eb303a",
+        "size": 3077
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_5_moe/modeling_qwen3_5_moe_mtp.py",
+        "sha256": "3abd2a5e4c68abba987dfda1e45a48e0f399948c10977469a7eb5554268aba67",
+        "size": 1858
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_asr/__init__.py",
+        "sha256": "79fa9f060d8117288dde69e3c902828d19f6402ec44017a09e34b465bd50b952",
+        "size": 957
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_asr/modeling_qwen3_asr_audio.py",
+        "sha256": "87cedb1e4f786b70b70d8b89fa3b6a3aecf387090f845a8e565e86d7a46c85fd",
+        "size": 25800
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_asr/modeling_qwen3_asr_text.py",
+        "sha256": "a48b41fbef1dd02f20f8e65fc5e000d0ff83bcd5969613bb7769a7c92be00e36",
+        "size": 1194
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_moe/__init__.py",
+        "sha256": "ea35897115970847e8e9be762977e05d4ec1878aadbd40644a5a5e2777fc8b51",
+        "size": 2933
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_moe/modeling_qwen3_moe.py",
+        "sha256": "906b2bfba4ccee0f38b531729984952d660378846695115f49c321fca3491962",
+        "size": 43838
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_omni/__init__.py",
+        "sha256": "0c7bf0ceb21e7879833e2a8fad211c895a112f5ea2f937552d78d63435b3ed53",
+        "size": 1686
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_omni/modeling_qwen3_omni_audio.py",
+        "sha256": "3dba96867252ab45d886305fcf1cdb82c5ba40704d476b756b22b74cca702948",
+        "size": 1009
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_omni/modeling_qwen3_omni_code2wav.py",
+        "sha256": "2a2588b3086a698904373e4adea30c9e616a9b4f8a2007de4334e293734c68ee",
+        "size": 21348
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_omni/modeling_qwen3_omni_moe_talker.py",
+        "sha256": "10e24265ac9a96ae0dc5b3d619e25f9cc765f5821bda5d0035b846a93b788b02",
+        "size": 3761
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_omni/modeling_qwen3_omni_moe_text.py",
+        "sha256": "844b709a8da52713c954ccbf930e446bc435c39251cc4dd5f5441d92436352c6",
+        "size": 1308
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_omni/modeling_qwen3_omni_text.py",
+        "sha256": "e90ecd30913a671fea5229281a3ba795df8ff3c4da4749feaebb41e9017d6679",
+        "size": 8674
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_omni/modeling_qwen3_omni_visual.py",
+        "sha256": "a5eb24ae4b3bd7ec732d1a6b67af935b3e6c2b33f00d54e343d594bd53fd591d",
+        "size": 7402
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_omni_next/__init__.py",
+        "sha256": "bf412742cd0a0e954016bc57141ac45fa78ce7aa8945d8f6ed9ba9d79809a9be",
+        "size": 2248
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_omni_next/modeling_qwen3_omni_next_audio.py",
+        "sha256": "841e1d803e5b12ac60add4e336c63570764d7a4eefa81ce85674d449cc1fed25",
+        "size": 7764
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_omni_next/modeling_qwen3_omni_next_code2wav.py",
+        "sha256": "7ab0c536fdfea37f240fcfeb8117a46b4c6c58014b75e54443880b71dda9df2c",
+        "size": 29460
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_omni_next/modeling_qwen3_omni_next_code_predictor.py",
+        "sha256": "729c152315c70ea5ce3d84ce792c9cd31b0b4c3f617e16516fb0864e694c22f5",
+        "size": 6035
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_omni_next/modeling_qwen3_omni_next_moe_talker.py",
+        "sha256": "a7cc68716379042cb331332e53acd5a43730a4e23d683974072775863f529cf8",
+        "size": 5911
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_omni_next/modeling_qwen3_omni_next_moe_text.py",
+        "sha256": "aeb78a9a2257c836dda61e2f9f3f9c464e43fd98316be307220251cbb65d9441",
+        "size": 17095
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_omni_next/modeling_qwen3_omni_next_mtp.py",
+        "sha256": "2a00e5b82bb52c4f58c1ac56e9777495ac4301aa85d1467042543c49ca400793",
+        "size": 2319
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_omni_next/modeling_qwen3_omni_next_talker.py",
+        "sha256": "225a82429946c22a168689f8c19ca74960ab9cbebd238870bfe5f5d897ef1e3e",
+        "size": 2446
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_omni_next/modeling_qwen3_omni_next_text.py",
+        "sha256": "2525c4f3ba63264e03779ca06596946c4a621b193c88518074e556ca3e9d45f3",
+        "size": 862
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_omni_next/modeling_qwen3_omni_next_visual.py",
+        "sha256": "1403cd665178b3d3a14db4d026a149c11cab22a88c46cbce0126b66832c0d6b0",
+        "size": 6798
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_tts/__init__.py",
+        "sha256": "6656234ec5f505d9fd1b8b5bbdc1b592f21dde7ec5c97e58fb5e461a692bcaf2",
+        "size": 1549
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_tts/modeling_code_predictor.py",
+        "sha256": "1c5613fcf3be97292179480a06625b4f7765742df031480c9831bf67f4acfefc",
+        "size": 9349
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_tts/modeling_qwen3_tts_audio.py",
+        "sha256": "05eaceeea6065b0135fff44e8ca68fd4a3c2ae4dd2672f148781204a6b9ca820",
+        "size": 1575
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_tts/modeling_qwen3_tts_clone_encoders.py",
+        "sha256": "c15e0b545e253d77f44f2e0f18401de8831805b8f8c22a69d79e3b5cd92adfa0",
+        "size": 22061
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_tts/modeling_qwen3_tts_code2wav.py",
+        "sha256": "53077475d384c622df59c2609aad876f4768b4af1ba929735499c7c713dff80a",
+        "size": 30920
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_tts/modeling_qwen3_tts_talker.py",
+        "sha256": "7b0ba7f1fb1802c2a52d22f52a7f68ae542ffa25b3656a103564587eac574623",
+        "size": 3150
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_tts/modeling_qwen3_tts_text.py",
+        "sha256": "186223f1c24d17821e31987c25835ea6f9fd1022ab1bc6814c42e969aa0ce0cc",
+        "size": 1290
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_vl/__init__.py",
+        "sha256": "3dcdc254e0a7315c476aab96848d17fddeb8a6e16141308bc4670d9b30e37899",
+        "size": 974
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_vl/modeling_qwen3_vl_text.py",
+        "sha256": "3324982e64437ee1c8b473886dfb6fd0ef7fd1ecce7c1677cd3d5ccb0d5ac64d",
+        "size": 1190
+      },
+      {
+        "path": "source/tensorrt_edgellm/models/qwen3_vl/modeling_qwen3_vl_visual.py",
+        "sha256": "fd3efa0bcdb217496f89525ff590e1f7b143b542df884b19d6901c4a147d0868",
+        "size": 28131
+      },
+      {
+        "path": "source/tensorrt_edgellm/onnx/__init__.py",
+        "sha256": "f63e0f49aa55fa8006ada76cfeba1295eea2cd56e8ec9207921d3de6287952b0",
+        "size": 762
+      },
+      {
+        "path": "source/tensorrt_edgellm/onnx/dynamo_translations.py",
+        "sha256": "73dcb53ead527b2c07fe16954f085a7867f779f7f227da3f46b15c65f06552d9",
+        "size": 58208
+      },
+      {
+        "path": "source/tensorrt_edgellm/onnx/export.py",
+        "sha256": "1161246e65f3a02b599d57217d1a264db15a24a1986fadf3f6e11c157c455214",
+        "size": 49919
+      },
+      {
+        "path": "source/tensorrt_edgellm/onnx/export_encoder.py",
+        "sha256": "b9d84c97b5c744e139dbbe0a9dcede078f965ebff67e3d4f27c089c72ffb224a",
+        "size": 24007
+      },
+      {
+        "path": "source/tensorrt_edgellm/onnx/onnx_custom_schemas.py",
+        "sha256": "a79c7411f9e8d403edacddbfc849af494e44f5dd6e606a698632cb1cb29ab930",
+        "size": 91903
+      },
+      {
+        "path": "source/tensorrt_edgellm/quantization/README.md",
+        "sha256": "1b85a8d9b60c42ebadee8a1031b8b0cf1d0c037f55817a04853c5d4e57322b05",
+        "size": 7558
+      },
+      {
+        "path": "source/tensorrt_edgellm/quantization/__init__.py",
+        "sha256": "55540a5e0ac210b749ff25d6575d94fbb7c384feb7572d7111cd4a51c45ae336",
+        "size": 1238
+      },
+      {
+        "path": "source/tensorrt_edgellm/quantization/datasets/__init__.py",
+        "sha256": "242e5d9a4dcff02f2dcb2687b0d9f6a6583c426c044e27dfed97ac69ac3ba1f1",
+        "size": 11220
+      },
+      {
+        "path": "source/tensorrt_edgellm/quantization/datasets/builtin.py",
+        "sha256": "2ed90ae1aec6b91bee5c6232624c97c1f8547c827022c7fb3e6d43c1b4f41621",
+        "size": 4851
+      },
+      {
+        "path": "source/tensorrt_edgellm/quantization/datasets/custom_dataset_template.py",
+        "sha256": "53250e354dfe0f227dbe310e265c788a4ca02627c32434e9bce5a9bc82efe5a6",
+        "size": 4069
+      },
+      {
+        "path": "source/tensorrt_edgellm/quantization/gemma4_patch.py",
+        "sha256": "08b7ca35befcf109860a5e85a9e8466072640798b67a89b7c7453d6f6d39485b",
+        "size": 2333
+      },
+      {
+        "path": "source/tensorrt_edgellm/quantization/models/__init__.py",
+        "sha256": "fd6edf2622d35fabd20736d7c362c024ab5be480ff0bc8e6e656a59c709d6cf6",
+        "size": 1458
+      },
+      {
+        "path": "source/tensorrt_edgellm/quantization/models/attention_scale.py",
+        "sha256": "34c0b90df8f3fcf095696b239d35bf04cba7046c8861ab484f6ee03d4bcdb6ce",
+        "size": 1787
+      },
+      {
+        "path": "source/tensorrt_edgellm/quantization/models/dflash_draft.py",
+        "sha256": "b266dda9e3cf2d3338548387dba3c93cac16a64c2016d86cb2b891447c69fcdf",
+        "size": 32057
+      },
+      {
+        "path": "source/tensorrt_edgellm/quantization/models/eagle3_draft.py",
+        "sha256": "884447999ca1fe3d51495caa3216d2c19cc57617f74acffc167a8dac739737f7",
+        "size": 14576
+      },
+      {
+        "path": "source/tensorrt_edgellm/quantization/models/layers.py",
+        "sha256": "80531eca2d806ed2ecef072a3c2e6a862a9c00140ccc5f0a76450e5c9e59d175",
+        "size": 3571
+      },
+      {
+        "path": "source/tensorrt_edgellm/quantization/models/mtp_draft.py",
+        "sha256": "4ebcd89e42d97f3a36534ad113cf96594abe9d5a73f05b99dc36cc378a63f313",
+        "size": 28893
+      },
+      {
+        "path": "source/tensorrt_edgellm/quantization/models/qwen3_asr/__init__.py",
+        "sha256": "55572431d053db8e982ab4d35764538752692111ea263313e25c675963faf93e",
+        "size": 1410
+      },
+      {
+        "path": "source/tensorrt_edgellm/quantization/models/qwen3_asr/modeling_qwen3_asr.py",
+        "sha256": "992f0af669ac374bb8a59021f83b04f3bc668c9c90ac33b2cd4e0a9d79e0a6b1",
+        "size": 11880
+      },
+      {
+        "path": "source/tensorrt_edgellm/quantization/models/qwen3_asr/modeling_qwen3_asr_audio.py",
+        "sha256": "3fc187ec126a4f635040a549b45a99fb7f9268084b3b98ec1125672d6a380320",
+        "size": 17849
+      },
+      {
+        "path": "source/tensorrt_edgellm/quantization/models/qwen3_tts/__init__.py",
+        "sha256": "06cc1cc77cc11697941d810f2e1ad5f7ad3518122416cb67976d9e7ecce8169e",
+        "size": 899
+      },
+      {
+        "path": "source/tensorrt_edgellm/quantization/models/qwen3_tts/modeling_qwen3_tts.py",
+        "sha256": "2f9b410d53e821a9233b2c4e3af7591794178f9690159e86e8bd34f721072c2e",
+        "size": 16178
+      },
+      {
+        "path": "source/tensorrt_edgellm/quantization/nemotron_h_patch.py",
+        "sha256": "e941b7f7dc32b72658f16e8927a32d92bc20a458c9fd649e8fc9351aa71f38e2",
+        "size": 13388
+      },
+      {
+        "path": "source/tensorrt_edgellm/quantization/quantization_configs.py",
+        "sha256": "fc79bc623bd6f4817f59fc61322767c55b678aa4fe745734dd1cde6f07138dfc",
+        "size": 16520
+      },
+      {
+        "path": "source/tensorrt_edgellm/quantization/quantize.py",
+        "sha256": "47188d185ece681e36788d9a62ad759aec9fe721c29c667976dd2775d2c1bd24",
+        "size": 62655
+      },
+      {
+        "path": "source/tensorrt_edgellm/quantization/qwen3_asr_loader.py",
+        "sha256": "55843e02a8fa0f675876eddc9dfcb87fa61ead8cfec6684df2a3daf9c71a1ea8",
+        "size": 12527
+      },
+      {
+        "path": "source/tensorrt_edgellm/quantization/qwen3_cp_loader.py",
+        "sha256": "513dacf72f78748e50f68b1c367662a95e40a2ce977b5674700fcf4a49876526",
+        "size": 15535
+      },
+      {
+        "path": "source/tensorrt_edgellm/quantization/qwen3_omni.py",
+        "sha256": "f5016f372137ff87d568ffb4cc1110b79ae9f63b49818694ef919e7482280509",
+        "size": 81467
+      },
+      {
+        "path": "source/tensorrt_edgellm/runtime.py",
+        "sha256": "cbfb46adc8fdfc10c9ff6b96d0ce6921f9ffe5ed2183aaf3ef978f2b6cec4f45",
+        "size": 1983
+      },
+      {
+        "path": "source/tensorrt_edgellm/scripts/__init__.py",
+        "sha256": "a4f1dd3610e672da696e6f2a4ca7df1b18a3f6f6ec541f27dc9bda8102526d3d",
+        "size": 684
+      },
+      {
+        "path": "source/tensorrt_edgellm/scripts/export.py",
+        "sha256": "afe229885496925ba2f099f4f0b5c39eaa7f61a035b52c4bf8a520e1900d4903",
+        "size": 225071
+      },
+      {
+        "path": "source/tensorrt_edgellm/scripts/insert_lora.py",
+        "sha256": "ae63bd3b737cddedd1f8369fa1efd9309f8577f365bfd5750723bb270f1950c4",
+        "size": 2108
+      },
+      {
+        "path": "source/tensorrt_edgellm/scripts/merge_lora.py",
+        "sha256": "79177864033a84a0591be4efa476c2f0645ba9b4d1bdc1fd3ff81a6cb5569f33",
+        "size": 2442
+      },
+      {
+        "path": "source/tensorrt_edgellm/scripts/process_lora_weights.py",
+        "sha256": "63ea58a0e011e07886d5c53f37b13923916ffa2d365e4905e36a1de88c0e4865",
+        "size": 2391
+      },
+      {
+        "path": "source/tensorrt_edgellm/scripts/quantize.py",
+        "sha256": "85fab2a4ff320f8df5836c263078af07f560175380ebdeddc8e676cac900c82a",
+        "size": 10409
+      },
+      {
+        "path": "source/tensorrt_edgellm/scripts/reduce_vocab.py",
+        "sha256": "7ebbda9d2b1d6d27b6103db338bc5efb153ba368ab23ac50ae91d4b88930cde8",
+        "size": 6348
+      },
+      {
+        "path": "source/tensorrt_edgellm/scripts/sweep_eagle3_configs.py",
+        "sha256": "17ad9b21c5e751bdd103342ee83f9bb1d74f7c97f62501ec86b40d2ceb93ea00",
+        "size": 22229
+      },
+      {
+        "path": "source/tensorrt_edgellm/vocab_reduction/__init__.py",
+        "sha256": "3fbd6be805d5a2f90279ccd9ec265ac09769a4741762e46f0b50346b5d9b13ed",
+        "size": 1713
+      },
+      {
+        "path": "source/tensorrt_edgellm/vocab_reduction/constants.py",
+        "sha256": "7a11ebebc63ee660adff38d6bdb5a415a8691292c58477930d269bc2ea9a56b1",
+        "size": 1017
+      },
+      {
+        "path": "source/tensorrt_edgellm/vocab_reduction/onnx_export.py",
+        "sha256": "acab40523b111066acd912a3697b8511f3ba4af0092d76619046689aa0f47de7",
+        "size": 17086
+      },
+      {
+        "path": "source/tensorrt_edgellm/vocab_reduction/selection.py",
+        "sha256": "0ce64595986480fd542adbc31a47ad4658a7271e5d56e0705b26a10c7e3b2b69",
+        "size": 12270
+      },
+      {
+        "path": "wheelhouse/annotated_doc-0.0.5-py3-none-any.whl",
+        "sha256": "117bac03a25ede5df5440e855b32d556049ca169ead221505badf432fed4b101",
+        "size": 5302
+      },
+      {
+        "path": "wheelhouse/annotated_types-0.8.0-py3-none-any.whl",
+        "sha256": "f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0",
+        "size": 13427
+      },
+      {
+        "path": "wheelhouse/anyio-4.15.1-py3-none-any.whl",
+        "sha256": "6152fdbbf9a77fdec97731721bebf7c4c44f7c29b424b0065826173efc7ed101",
+        "size": 132079
+      },
+      {
+        "path": "wheelhouse/av-17.1.0-cp311-abi3-manylinux_2_28_aarch64.whl",
+        "sha256": "6a20658ec7d96a70e14b1196eff00b7cdd8831ac3b99868e16b8ba8b24090847",
+        "size": 33224427
+      },
+      {
+        "path": "wheelhouse/certifi-2026.7.22-py3-none-any.whl",
+        "sha256": "62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775",
+        "size": 136983
+      },
+      {
+        "path": "wheelhouse/click-8.5.0-py3-none-any.whl",
+        "sha256": "255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360",
+        "size": 125251
+      },
+      {
+        "path": "wheelhouse/fastapi-0.139.2-py3-none-any.whl",
+        "sha256": "b9ad015a835173d59865e2f5d8296fbc2b317bf56a2ba1a5bfbdd03de2fd4b1c",
+        "size": 130234
+      },
+      {
+        "path": "wheelhouse/filelock-4.0.12-py3-none-any.whl",
+        "sha256": "5f17ee83ecee8a6f3e389c75822fb70a1c2f0506b99438a6dffa1d56793588c8",
+        "size": 111732
+      },
+      {
+        "path": "wheelhouse/fsspec-2026.9.0-py3-none-any.whl",
+        "sha256": "8dd6e646e99ea382bd85f97a45e6b526a442d79423a7dc673f1e2756d05fcb5f",
+        "size": 221738
+      },
+      {
+        "path": "wheelhouse/h11-0.16.0-py3-none-any.whl",
+        "sha256": "63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86",
+        "size": 37515
+      },
+      {
+        "path": "wheelhouse/hf_xet-1.7.0-cp38-abi3-manylinux_2_28_aarch64.whl",
+        "sha256": "fcfd6c22418e57dd5b3aea649e813b2e2cfb2aebf317b210d90f1fe4b3018b52",
+        "size": 3990011
+      },
+      {
+        "path": "wheelhouse/httpcore-1.0.9-py3-none-any.whl",
+        "sha256": "2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55",
+        "size": 78784
+      },
+      {
+        "path": "wheelhouse/httpx-0.28.1-py3-none-any.whl",
+        "sha256": "d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad",
+        "size": 73517
+      },
+      {
+        "path": "wheelhouse/huggingface_hub-1.33.0-py3-none-any.whl",
+        "sha256": "04e434b06e100eddbce9a6e817d72693a7884b10a79bd67ab48080d5c07eb899",
+        "size": 846435
+      },
+      {
+        "path": "wheelhouse/idna-3.20-py3-none-any.whl",
+        "sha256": "ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c",
+        "size": 69583
+      },
+      {
+        "path": "wheelhouse/numpy-2.2.6-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+        "sha256": "f2618db89be1b4e05f7a1a847a9c1c0abd63e63a1607d892dd54668dd92faf87",
+        "size": 14018462
+      },
+      {
+        "path": "wheelhouse/packaging-26.3-py3-none-any.whl",
+        "sha256": "d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c",
+        "size": 129956
+      },
+      {
+        "path": "wheelhouse/pip-26.2.1-py3-none-any.whl",
+        "sha256": "71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e",
+        "size": 1816632
+      },
+      {
+        "path": "wheelhouse/pybind11-3.0.4-py3-none-any.whl",
+        "sha256": "961720ee652da51d531b7b2451a6bd2bc042b0106e6d9baa48ecb7d58034ce63",
+        "size": 314166
+      },
+      {
+        "path": "wheelhouse/pydantic-2.13.5-py3-none-any.whl",
+        "sha256": "346a034f080da3755d8e9cb5e00e8b07de1d39e4f6e2c87d8ab7cafa0b269a73",
+        "size": 472589
+      },
+      {
+        "path": "wheelhouse/pydantic_core-2.46.5-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+        "sha256": "4fdc8b93a41521988916eeaa271173fcca7fa0803d62f87675aac8dcec1c8e29",
+        "size": 1951772
+      },
+      {
+        "path": "wheelhouse/python_multipart-0.0.32-py3-none-any.whl",
+        "sha256": "ff6d3f776f16878c894e52e107296ffc890e913c611b1a4ec6c44e2821fe2e23",
+        "size": 30042
+      },
+      {
+        "path": "wheelhouse/pyyaml-6.0.3-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
+        "sha256": "9149cad251584d5fb4981be1ecde53a1ca46c891a79788c0df828d2f166bda28",
+        "size": 775116
+      },
+      {
+        "path": "wheelhouse/setuptools-84.0.0-py3-none-any.whl",
+        "sha256": "51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670",
+        "size": 818216
+      },
+      {
+        "path": "wheelhouse/starlette-1.7.0-py3-none-any.whl",
+        "sha256": "67f8e99895493dd2911a03f11314af6ceebeae4e704bb9f43dfc6a9db151c93e",
+        "size": 78980
+      },
+      {
+        "path": "wheelhouse/tqdm-4.70.1-py3-none-any.whl",
+        "sha256": "c293e525e6fef9c20e8728fd4612df02a0aa31bb5fe91ecd93e123b1b7bffa73",
+        "size": 80199
+      },
+      {
+        "path": "wheelhouse/typing_extensions-4.16.0-py3-none-any.whl",
+        "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8",
+        "size": 45571
+      },
+      {
+        "path": "wheelhouse/typing_inspection-0.4.4-py3-none-any.whl",
+        "sha256": "65b8397ba37ccbce054456aaccddfc91e6e3083c92824df348d96ca832f3f147",
+        "size": 14750
+      },
+      {
+        "path": "wheelhouse/uvicorn-0.51.0-py3-none-any.whl",
+        "sha256": "5d38af6cd620f2ae3849fb44fd4879e0890aa1febe8d47eb355fb45d93fe6a5b",
+        "size": 73219
+      },
+      {
+        "path": "wheelhouse/wheel-0.48.0-py3-none-any.whl",
+        "sha256": "3217dcc807155e45db462d7ef2431f5ddda0d7273b700d05a67b271ceb1287ab",
+        "size": null
+      }
+    ]
+  },
+  "elf_dependencies": [
+    {
+      "file": "/out/builder/bin/llm_build",
+      "soname": null,
+      "runpath": [
+        "/usr/local/cuda/targets/sbsa-linux/lib"
+      ],
+      "rpath": [],
+      "needed": [
+        {
+          "needed": "libcudart.so.13",
+          "resolved": "/usr/local/cuda/targets/sbsa-linux/lib/libcudart.so.13",
+          "package": "cuda-cudart-13-2",
+          "realpath": "/usr/local/cuda-13.2/targets/sbsa-linux/lib/libcudart.so.13.2.86"
+        },
+        {
+          "needed": "libnvonnxparser.so.10",
+          "resolved": "/lib/aarch64-linux-gnu/libnvonnxparser.so.10",
+          "package": "libnvonnxparsers10",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libnvonnxparser.so.10.16.2"
+        },
+        {
+          "needed": "libnvinfer.so.10",
+          "resolved": "/lib/aarch64-linux-gnu/libnvinfer.so.10",
+          "package": "libnvinfer10",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libnvinfer.so.10.16.2"
+        },
+        {
+          "needed": "libstdc++.so.6",
+          "resolved": "/lib/aarch64-linux-gnu/libstdc++.so.6",
+          "package": "libstdc++6",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libstdc++.so.6.0.33"
+        },
+        {
+          "needed": "libgcc_s.so.1",
+          "resolved": "/lib/aarch64-linux-gnu/libgcc_s.so.1",
+          "package": "libgcc-s1",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libgcc_s.so.1"
+        },
+        {
+          "needed": "libc.so.6",
+          "resolved": "/lib/aarch64-linux-gnu/libc.so.6",
+          "package": "libc6",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libc.so.6"
+        },
+        {
+          "needed": "ld-linux-aarch64.so.1",
+          "resolved": "/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+          "package": "libc6",
+          "realpath": "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"
+        }
+      ]
+    },
+    {
+      "file": "/out/builder/bin/visual_build",
+      "soname": null,
+      "runpath": [
+        "/usr/local/cuda/targets/sbsa-linux/lib"
+      ],
+      "rpath": [],
+      "needed": [
+        {
+          "needed": "libcudart.so.13",
+          "resolved": "/usr/local/cuda/targets/sbsa-linux/lib/libcudart.so.13",
+          "package": "cuda-cudart-13-2",
+          "realpath": "/usr/local/cuda-13.2/targets/sbsa-linux/lib/libcudart.so.13.2.86"
+        },
+        {
+          "needed": "libnvonnxparser.so.10",
+          "resolved": "/lib/aarch64-linux-gnu/libnvonnxparser.so.10",
+          "package": "libnvonnxparsers10",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libnvonnxparser.so.10.16.2"
+        },
+        {
+          "needed": "libnvinfer.so.10",
+          "resolved": "/lib/aarch64-linux-gnu/libnvinfer.so.10",
+          "package": "libnvinfer10",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libnvinfer.so.10.16.2"
+        },
+        {
+          "needed": "libstdc++.so.6",
+          "resolved": "/lib/aarch64-linux-gnu/libstdc++.so.6",
+          "package": "libstdc++6",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libstdc++.so.6.0.33"
+        },
+        {
+          "needed": "libm.so.6",
+          "resolved": "/lib/aarch64-linux-gnu/libm.so.6",
+          "package": "libc6",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libm.so.6"
+        },
+        {
+          "needed": "libgcc_s.so.1",
+          "resolved": "/lib/aarch64-linux-gnu/libgcc_s.so.1",
+          "package": "libgcc-s1",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libgcc_s.so.1"
+        },
+        {
+          "needed": "libc.so.6",
+          "resolved": "/lib/aarch64-linux-gnu/libc.so.6",
+          "package": "libc6",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libc.so.6"
+        },
+        {
+          "needed": "ld-linux-aarch64.so.1",
+          "resolved": "/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+          "package": "libc6",
+          "realpath": "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"
+        }
+      ]
+    },
+    {
+      "file": "/out/builder/lib/libNvInfer_edgellm_plugin.so.1.0",
+      "soname": "libNvInfer_edgellm_plugin.so.1",
+      "runpath": [
+        "/usr/local/cuda/targets/sbsa-linux/lib"
+      ],
+      "rpath": [],
+      "needed": [
+        {
+          "needed": "libcuda.so.1",
+          "resolved": null
+        },
+        {
+          "needed": "libcudart.so.13",
+          "resolved": "/usr/local/cuda/targets/sbsa-linux/lib/libcudart.so.13",
+          "package": "cuda-cudart-13-2",
+          "realpath": "/usr/local/cuda-13.2/targets/sbsa-linux/lib/libcudart.so.13.2.86"
+        },
+        {
+          "needed": "libnvinfer.so.10",
+          "resolved": "/lib/aarch64-linux-gnu/libnvinfer.so.10",
+          "package": "libnvinfer10",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libnvinfer.so.10.16.2"
+        },
+        {
+          "needed": "libnvrtc.so.13",
+          "resolved": "/usr/local/cuda/targets/sbsa-linux/lib/libnvrtc.so.13",
+          "package": "cuda-nvrtc-13-2",
+          "realpath": "/usr/local/cuda-13.2/targets/sbsa-linux/lib/libnvrtc.so.13.2.86"
+        },
+        {
+          "needed": "libstdc++.so.6",
+          "resolved": "/lib/aarch64-linux-gnu/libstdc++.so.6",
+          "package": "libstdc++6",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libstdc++.so.6.0.33"
+        },
+        {
+          "needed": "libm.so.6",
+          "resolved": "/lib/aarch64-linux-gnu/libm.so.6",
+          "package": "libc6",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libm.so.6"
+        },
+        {
+          "needed": "libgcc_s.so.1",
+          "resolved": "/lib/aarch64-linux-gnu/libgcc_s.so.1",
+          "package": "libgcc-s1",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libgcc_s.so.1"
+        },
+        {
+          "needed": "libc.so.6",
+          "resolved": "/lib/aarch64-linux-gnu/libc.so.6",
+          "package": "libc6",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libc.so.6"
+        },
+        {
+          "needed": "ld-linux-aarch64.so.1",
+          "resolved": "/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+          "package": "libc6",
+          "realpath": "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"
+        }
+      ]
+    },
+    {
+      "file": "/out/runtime/plugin/libNvInfer_edgellm_plugin.so",
+      "soname": "libNvInfer_edgellm_plugin.so.1",
+      "runpath": [
+        "/usr/local/cuda/targets/sbsa-linux/lib"
+      ],
+      "rpath": [],
+      "needed": [
+        {
+          "needed": "libcuda.so.1",
+          "resolved": null
+        },
+        {
+          "needed": "libcudart.so.13",
+          "resolved": "/usr/local/cuda/targets/sbsa-linux/lib/libcudart.so.13",
+          "package": "cuda-cudart-13-2",
+          "realpath": "/usr/local/cuda-13.2/targets/sbsa-linux/lib/libcudart.so.13.2.86"
+        },
+        {
+          "needed": "libnvinfer.so.10",
+          "resolved": "/lib/aarch64-linux-gnu/libnvinfer.so.10",
+          "package": "libnvinfer10",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libnvinfer.so.10.16.2"
+        },
+        {
+          "needed": "libnvrtc.so.13",
+          "resolved": "/usr/local/cuda/targets/sbsa-linux/lib/libnvrtc.so.13",
+          "package": "cuda-nvrtc-13-2",
+          "realpath": "/usr/local/cuda-13.2/targets/sbsa-linux/lib/libnvrtc.so.13.2.86"
+        },
+        {
+          "needed": "libstdc++.so.6",
+          "resolved": "/lib/aarch64-linux-gnu/libstdc++.so.6",
+          "package": "libstdc++6",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libstdc++.so.6.0.33"
+        },
+        {
+          "needed": "libm.so.6",
+          "resolved": "/lib/aarch64-linux-gnu/libm.so.6",
+          "package": "libc6",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libm.so.6"
+        },
+        {
+          "needed": "libgcc_s.so.1",
+          "resolved": "/lib/aarch64-linux-gnu/libgcc_s.so.1",
+          "package": "libgcc-s1",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libgcc_s.so.1"
+        },
+        {
+          "needed": "libc.so.6",
+          "resolved": "/lib/aarch64-linux-gnu/libc.so.6",
+          "package": "libc6",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libc.so.6"
+        },
+        {
+          "needed": "ld-linux-aarch64.so.1",
+          "resolved": "/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+          "package": "libc6",
+          "realpath": "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"
+        }
+      ]
+    },
+    {
+      "file": "/out/runtime/pybind/_edgellm_runtime.cpython-312-aarch64-linux-gnu.so",
+      "soname": null,
+      "runpath": [
+        "/usr/local/cuda/targets/sbsa-linux/lib"
+      ],
+      "rpath": [],
+      "needed": [
+        {
+          "needed": "libnvinfer.so.10",
+          "resolved": "/lib/aarch64-linux-gnu/libnvinfer.so.10",
+          "package": "libnvinfer10",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libnvinfer.so.10.16.2"
+        },
+        {
+          "needed": "libnvonnxparser.so.10",
+          "resolved": "/lib/aarch64-linux-gnu/libnvonnxparser.so.10",
+          "package": "libnvonnxparsers10",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libnvonnxparser.so.10.16.2"
+        },
+        {
+          "needed": "libcuda.so.1",
+          "resolved": null
+        },
+        {
+          "needed": "libcudart.so.13",
+          "resolved": "/usr/local/cuda/targets/sbsa-linux/lib/libcudart.so.13",
+          "package": "cuda-cudart-13-2",
+          "realpath": "/usr/local/cuda-13.2/targets/sbsa-linux/lib/libcudart.so.13.2.86"
+        },
+        {
+          "needed": "libstdc++.so.6",
+          "resolved": "/lib/aarch64-linux-gnu/libstdc++.so.6",
+          "package": "libstdc++6",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libstdc++.so.6.0.33"
+        },
+        {
+          "needed": "libm.so.6",
+          "resolved": "/lib/aarch64-linux-gnu/libm.so.6",
+          "package": "libc6",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libm.so.6"
+        },
+        {
+          "needed": "libgcc_s.so.1",
+          "resolved": "/lib/aarch64-linux-gnu/libgcc_s.so.1",
+          "package": "libgcc-s1",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libgcc_s.so.1"
+        },
+        {
+          "needed": "libc.so.6",
+          "resolved": "/lib/aarch64-linux-gnu/libc.so.6",
+          "package": "libc6",
+          "realpath": "/usr/lib/aarch64-linux-gnu/libc.so.6"
+        },
+        {
+          "needed": "ld-linux-aarch64.so.1",
+          "resolved": "/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+          "package": "libc6",
+          "realpath": "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"
+        }
+      ]
+    }
+  ]
+}
