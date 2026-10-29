@@ -82,9 +82,9 @@ E-model qualifies). It combines with `--hostEmbeddingTables`.
 | `ple_embedding.safetensors` | `weight_scale` | FP16 | `[vocab, layers * ple_hidden / 32]` | |
 
 For Gemma 4 E4B the two tables shrink from 3,534,749,696 bytes (INT8) to
-1,962,934,272 bytes (calculated: 4.5 bits per element). INT4 changes the
-embeddings that feed the model, so unlike INT8 it is not accuracy-neutral by
-construction; validate the task accuracy for each model.
+1,962,934,272 bytes (calculated: 4.5 bits per element). Both INT8 and INT4
+round the embeddings that feed the model, INT4 far more coarsely; validate
+the task accuracy for each model and format.
 
 `--int4-embedding-scale q4_0_grid` uses codes in `[-8, 7]` and a signed FP16
 step per group instead of the default `amax / 7` and `[-7, 7]`. Q4_0 maps the

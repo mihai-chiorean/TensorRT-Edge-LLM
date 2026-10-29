@@ -898,7 +898,7 @@ void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTabl
         auto const& scalesTensor = scales.value().get();
         auto const scaleShape = scalesTensor.getShape();
         check::check(hiddenSize % kInt4GroupSize == 0,
-            format::fmtstr("INT4 hiddenSize must be a multiple of %d", kInt4GroupSize));
+            format::fmtstr("INT4 hiddenSize must be a multiple of %d", static_cast<int>(kInt4GroupSize)));
         check::check(scaleShape.getNumDims() == 2, "INT4 scales must be 2D tensor [vocabSize, hiddenSize / 32]");
         check::check(scaleShape[0] == tableRows, "INT4 scale rows must match embeddingTable rows");
         check::check(scaleShape[1] == hiddenSize / kInt4GroupSize, "INT4 scale columns must equal hiddenSize / 32");
@@ -1000,7 +1000,8 @@ void gemma4PleGather(rt::Tensor const& inputIds, rt::Tensor const& pleTable, rt:
             outputBuffer.getDataType() == nvinfer1::DataType::kHALF, "INT4 pleTable requires an FP16 outputBuffer");
         check::check(scales.has_value(), "scales must be provided for INT4 pleTable");
         check::check(rowWidth % kInt4GroupSize == 0,
-            format::fmtstr("numLayers * pleHiddenSize must be a multiple of %d for INT4", kInt4GroupSize));
+            format::fmtstr(
+                "numLayers * pleHiddenSize must be a multiple of %d for INT4", static_cast<int>(kInt4GroupSize)));
         auto const& scalesTensor = scales.value().get();
         auto const scaleShape = scalesTensor.getShape();
         check::check(scaleShape.getNumDims() == 2, "INT4 PLE scales must be 2D [vocabSize, numLayers * hidden / 32]");

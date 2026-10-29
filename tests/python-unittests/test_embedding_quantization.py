@@ -537,6 +537,17 @@ def test_int4_q4_0_grid_mode_picks_the_lower_error_sign():
         assert (error <= candidate.square().sum(2)).all()
 
 
+@pytest.mark.parametrize("scale_mode", ["absmax", "q4_0_grid"])
+def test_int4_rejects_groups_that_decode_to_inf(scale_mode):
+    weight = torch.zeros(1, 32, dtype=torch.float16)
+    weight[0, 0] = 65504.0
+    weight[0, 1] = -65504.0
+
+    with pytest.raises(ValueError, match="non-finite"):
+        embedding_quantization.quantize_embedding_to_int4(
+            weight, scale_mode=scale_mode)
+
+
 def test_int4_default_scale_mode_is_absmax():
     torch.manual_seed(3)
     weight = torch.randn(4, 64).to(torch.float16)

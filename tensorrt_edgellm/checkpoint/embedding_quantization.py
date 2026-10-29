@@ -175,6 +175,11 @@ def quantize_embedding_to_int4(
             group_scales = torch.where(use_negative, neg_scales, pos_scales)
             quantized = torch.where(use_negative.unsqueeze(2), neg_quantized,
                                     pos_quantized)
+        decoded = (quantized * group_scales.float().unsqueeze(2)).to(
+            torch.float16)
+        if not torch.isfinite(decoded).all():
+            raise ValueError(
+                "INT4 quantization would decode to non-finite FP16 values")
         offset = (quantized + 8).to(torch.uint8).view(row_end - row_start,
                                                       width)
         packed[row_start:row_end] = offset[:, 0::2] | (offset[:, 1::2] << 4)
