@@ -104,8 +104,11 @@ void generateVisionBlockIds(
 
 //! \brief Gather Gemma4 per-layer token-identity embeddings.
 //!
+//! An FP16 or BF16 table is copied into an outputBuffer of the same dtype. An INT8 table is dequantized into an
+//! FP16 outputBuffer with one FP32 scale per vocabulary row and layer.
+//!
 //! \param[in] inputIds Input token IDs with shape [batchSize, seqLen]
-//! \param[in] pleTable PLE table with shape [vocabSize, numLayers * pleHiddenSize]
+//! \param[in] pleTable PLE table with shape [vocabSize, numLayers * pleHiddenSize] (FP16, BF16, or INT8)
 //! \param[in,out] outputBuffer Backing tensor for all per-layer outputs; shape [numLayers, maxBatch, maxSeq, hidden]
 //! \param[in] numLayers Number of PLE layer outputs
 //! \param[in] pleHiddenSize Hidden size of each PLE output
@@ -113,9 +116,10 @@ void generateVisionBlockIds(
 //! \param[in] audioTokenId Optional audio token ID gathered as padTokenId (-1 = unused)
 //! \param[in] padTokenId Row gathered for media placeholders; out-of-range IDs are zero-filled
 //! \param[in] stream CUDA stream for execution
+//! \param[in] scales FP32 scales with shape [vocabSize, numLayers]; required for an INT8 table, std::nullopt otherwise
 void gemma4PleGather(rt::Tensor const& inputIds, rt::Tensor const& pleTable, rt::Tensor& outputBuffer,
     int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, int32_t padTokenId,
-    cudaStream_t stream);
+    cudaStream_t stream, rt::OptionalInputTensor scales = std::nullopt);
 
 } // namespace kernel
 } // namespace trt_edgellm
