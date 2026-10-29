@@ -15,7 +15,12 @@
 
 import asyncio
 import json
+import os
+import pathlib
 import queue
+import subprocess
+import sys
+import textwrap
 import threading
 import time
 from types import SimpleNamespace
@@ -33,6 +38,8 @@ from tensorrt_edgellm.server.runtime.engine import (
 from tensorrt_edgellm.server.runtime.engine_client import (
     _AdmissionController, _IFBAdmissionGate, _iterate_sync)
 from tensorrt_edgellm.server.runtime.engine_layout import EngineType
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.parametrize("top_k, expected_verify", [(1, 4), (2, 13)])
@@ -743,6 +750,57 @@ def test_disconnect_closes_the_stream_only_after_next_returns():
     assert cancelled.is_set()
     assert source.closed
     assert closes_during_read and not any(closes_during_read)
+
+
+def test_close_racing_a_native_wait_inside_next_does_not_crash(tmp_path):
+    # A keyword C call releasing the GIL matches StreamChannel.wait_pop():
+    # CPython 3.12 can SIGSEGV if another thread closes its running generator.
+    script = tmp_path / "close_race.py"
+    script.write_text(
+        textwrap.dedent("""
+        import threading, time
+        from tensorrt_edgellm.server.runtime import engine
+
+        def native_wait_loop(lock):
+            while True:
+                lock.acquire(timeout=0.0002)
+                yield None
+
+        failures = []
+        for _ in range(200):
+            lock = threading.Lock()
+            lock.acquire()
+            stream = engine.CancellableIterator(native_wait_loop(lock), lambda: None)
+            stop = threading.Event()
+
+            def drive():
+                try:
+                    while not stop.is_set():
+                        next(stream)
+                except StopIteration:
+                    pass
+                except BaseException as error:
+                    failures.append(repr(error))
+
+            worker = threading.Thread(target=drive)
+            worker.start()
+            deadline = time.monotonic() + 0.01
+            while time.monotonic() < deadline:
+                stream.close()
+            stop.set()
+            worker.join()
+        print("ok" if not failures else failures[0])
+        """))
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(_REPO_ROOT), env.get("PYTHONPATH", "")])
+    result = subprocess.run([sys.executable, str(script)],
+                            capture_output=True,
+                            text=True,
+                            timeout=120,
+                            env=env)
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert result.stdout.strip() == "ok"
 
 
 def test_close_waits_for_native_entry_and_releases_runtime_once():
