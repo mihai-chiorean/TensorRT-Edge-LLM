@@ -47,6 +47,7 @@ from typing import (TYPE_CHECKING, Any, Dict, Iterator, List, Mapping,
                     Optional, Sequence, Tuple, Union)
 
 from ..config import DEFAULT_MAX_QUEUED_REQUESTS, ContextCacheConfig
+from ..parsing.reasoning import REASONING_PARSERS, prompt_reasoning_state
 from ..parsing.terminal_tokens import (ended_on_stop, strip_terminal_tokens,
                                        terminal_special_tokens)
 from ..parsing.tool_calling import (ToolConfig, inject_tool_requirement,
@@ -1750,10 +1751,24 @@ class LLM:
                     tool_config,
                     tool_parser=tool_parser,
                     reasoning_parser=reasoning_parser,
+                    reasoning_open=self._prompt_reasoning_state(
+                        reasoning_parser, messages, params),
                 )
             outputs.append(output)
 
         return outputs
+
+    def _prompt_reasoning_state(self, reasoning_parser: str,
+                                messages: List[Dict[str, Any]],
+                                params: SamplingParams) -> Optional[bool]:
+        if reasoning_parser == "none":
+            return None
+        return prompt_reasoning_state(REASONING_PARSERS.resolve(
+            reasoning_parser, self._model_dir),
+                                      messages,
+                                      enable_thinking=params.enable_thinking,
+                                      templated=True,
+                                      add_generation_prompt=True)
 
     def chat(
         self,

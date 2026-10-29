@@ -3233,3 +3233,24 @@ def test_gemma_anthropic_truncated_thought_after_tool_result(tmp_path):
     blocks = response.json()["content"]
     assert [b["type"] for b in blocks] == ["thinking"]
     assert blocks[0]["thinking"] == "Still considering"
+
+
+def test_gemma_raw_prompt_that_opens_a_thought(tmp_path):
+    client, llm = _gemma_thinking_client(tmp_path)
+    _gemma_stream_with(llm, ["Maybe ", _GEMMA_CALL], finish_reason="length")
+    body = _thinking_body(stream=True,
+                          tools=True,
+                          messages=[{
+                              "role":
+                              "user",
+                              "content":
+                              "<|turn>user\nWeather?<turn|>\n"
+                              "<|turn>model\n<|channel>thought\n"
+                          }])
+    body["apply_chat_template"] = False
+    response = client.post("/v1/chat/completions", json=body)
+    assert response.status_code == 200, response.text
+    reasoning, content, calls, finish, errors = _stream_parts(response)
+    assert reasoning == "Maybe " + _GEMMA_CALL
+    assert content == "" and calls == [] and errors == []
+    assert finish == ["length"]

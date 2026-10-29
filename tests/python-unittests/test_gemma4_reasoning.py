@@ -222,6 +222,17 @@ def test_stream_that_starts_inside_the_block():
         "role": "tool",
         "content": "sunny"
     }], False, True, False),
+    ([{
+        "role": "user",
+        "content": "<|turn>model\n<|channel>thought\n"
+    }], False, True, True),
+    ([{
+        "role": "user",
+        "content": [{
+            "type": "text",
+            "text": "<|channel>thought\nx<channel|>"
+        }]
+    }], False, True, False),
 ])
 def test_prompt_opens_reasoning_after_a_tool_response(messages, templated,
                                                       generation_prompt,
@@ -302,3 +313,67 @@ def test_assistant_stream_without_tools_uses_the_prompt_hint(tmp_path):
         assert ("".join(e["text"] for e in events if e["type"] == "reasoning"),
                 "".join(e["text"] for e in events
                         if e["type"] == "content")) == expected
+
+
+def test_python_api_applies_the_prompt_hint(tmp_path):
+    import contextlib
+
+    from experimental.server.runtime.engine import LLM, SamplingParams
+
+    model_dir = _gemma_dir(tmp_path, {"model": "gemma4_text"})
+    llm = LLM.__new__(LLM)
+    llm._model_dir = model_dir
+    llm._admission = contextlib.nullcontext
+    llm._ensure_open = lambda: None
+    llm._make_generation_request = lambda *args, **kwargs: object()
+    seen = []
+
+    def complete(_request, _params, tool_config, **kwargs):
+        seen.append(kwargs["reasoning_open"])
+        return llm._parse_generation_output(
+            "Maybe " + _CALL, [1],
+            7,
+            "length",
+            tool_config,
+            reasoning_parser=kwargs["reasoning_parser"],
+            reasoning_open=kwargs["reasoning_open"],
+            skip_special_tokens=False)
+
+    llm._complete_prepared_request = complete
+    messages = [{
+        "role": "user",
+        "content": "Weather?"
+    }, {
+        "role":
+        "assistant",
+        "tool_calls": [{
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "arguments": {
+                    "location": "Paris"
+                }
+            },
+        }],
+    }, {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": "sunny"
+    }]
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "weather",
+            "parameters": {
+                "type": "object"
+            }
+        },
+    }]
+    output = llm.chat(messages,
+                      SamplingParams(enable_thinking=True),
+                      tools=tools,
+                      reasoning_parser="gemma4")
+    assert seen == [True]
+    assert output.reasoning == "Maybe " + _CALL
+    assert output.tool_calls == []

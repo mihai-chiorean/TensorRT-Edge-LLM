@@ -335,7 +335,14 @@ class Gemma4ReasoningParser(ReasoningParser):
     def prompt_opens_reasoning(self, messages: Sequence[Mapping[str, Any]], *,
                                templated: bool,
                                add_generation_prompt: bool) -> Optional[bool]:
-        if not (templated and add_generation_prompt and messages):
+        if not messages:
+            return False
+        if not templated:
+            # The runtime concatenates raw text parts into the prompt.
+            raw = "".join(_raw_text(message) for message in messages)
+            return (raw.rfind(_GEMMA4_CHANNEL_START)
+                    > raw.rfind(_GEMMA4_CHANNEL_END))
+        if not add_generation_prompt:
             return False
         last = messages[-1]
         if not isinstance(last, Mapping):
@@ -343,6 +350,36 @@ class Gemma4ReasoningParser(ReasoningParser):
         role = last.get("role")
         return role == "tool" or (role == "assistant"
                                   and bool(last.get("tool_responses")))
+
+
+def _raw_text(message: Any) -> str:
+    content = message.get("content") if isinstance(message, Mapping) else None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            part.get("text") or "" for part in content
+            if isinstance(part, Mapping) and part.get("type") == "text"
+            and isinstance(part.get("text"), str))
+    return ""
+
+
+def prompt_reasoning_state(parser: Optional[ReasoningParser],
+                           messages: Sequence[Mapping[str, Any]], *,
+                           enable_thinking: bool, templated: bool,
+                           add_generation_prompt: bool) -> Optional[bool]:
+    """Whether generation starts inside a reasoning span, or ``None`` when
+    the parser has no prompt-dependent start."""
+    if parser is None:
+        return None
+    state = parser.prompt_opens_reasoning(
+        messages,
+        templated=templated,
+        add_generation_prompt=add_generation_prompt)
+    # Provider templates only open a reasoning span in thinking mode.
+    if state and templated and not enable_thinking:
+        return False
+    return state
 
 
 class Gemma4StreamingReasoningParser:

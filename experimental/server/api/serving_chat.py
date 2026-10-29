@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from ..config import ApiConfig
-from ..parsing.reasoning import REASONING_PARSERS
+from ..parsing.reasoning import REASONING_PARSERS, prompt_reasoning_state
 from ..parsing.terminal_tokens import (IM_END_TOKEN, TerminalTokenStripper,
                                        ended_on_stop, strip_terminal_tokens,
                                        terminal_special_tokens)
@@ -256,11 +256,13 @@ class OpenAIServingChat:
         except KeyError as exc:
             raise InvalidRequestError(str(exc),
                                       param="reasoning_parser") from exc
-        reasoning_open = parser.prompt_opens_reasoning(
+        reasoning_open = prompt_reasoning_state(
+            parser,
             request.messages,
+            enable_thinking=request.enable_thinking,
             templated=request.apply_chat_template,
             add_generation_prompt=request.add_generation_prompt,
-        ) if parser is not None else None
+        )
 
         from ..runtime.engine import (_normalize_guided_decoding,
                                       _normalize_logit_bias,
