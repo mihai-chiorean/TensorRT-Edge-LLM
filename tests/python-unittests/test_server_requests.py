@@ -2490,3 +2490,110 @@ def test_chat_temperature_zero_reaches_the_runtime_as_greedy(client_and_llm):
     assert response.status_code == 200
     assert llm.last_sampling_params.top_p == 1.0
     assert llm.last_sampling_params.top_k == 1
+
+
+# ---------------------------------------------------------------------------
+# /health context-cache metrics
+# ---------------------------------------------------------------------------
+
+
+def test_health_exposes_context_cache_metrics(client_and_llm):
+    client, llm = client_and_llm
+    expected = {
+        "hit_sequences": 3,
+        "reused_tokens": 768,
+        "media_aware_sequences": 4,
+        "base_kv_pages": {
+            "free": 100,
+            "capacity": 128
+        },
+    }
+    llm.context_cache_metrics = lambda: expected
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["context_cache"] == expected
+
+
+def test_health_allows_runtimes_without_context_cache_metrics(client_and_llm):
+    client, _ = client_and_llm
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["context_cache"] is None
+
+
+def _metrics_llm(native):
+    import threading
+
+    from experimental.server.runtime.engine import LLM
+
+    llm = LLM.__new__(LLM)
+    llm._context_cache_config = SimpleNamespace(enabled=True)
+    llm._closed = False
+    llm._infer_lock = threading.Lock()
+    llm._runtime = SimpleNamespace(get_context_cache_metrics=lambda: native)
+    return llm
+
+
+def test_context_cache_metrics_dict_flattens_native_pools():
+
+    class Pool:
+        free = 100
+        capacity = 128
+
+    class Native:
+        hit_sequences = 3
+        reused_tokens = 768
+        base_kv_pages = Pool()
+
+        def method(self):
+            return 1
+
+    llm = _metrics_llm(Native())
+    assert llm.context_cache_metrics() == {
+        "hit_sequences": 3,
+        "reused_tokens": 768,
+        "base_kv_pages": {
+            "free": 100,
+            "capacity": 128
+        },
+    }
+    llm._context_cache_config = SimpleNamespace(enabled=False)
+    assert llm.context_cache_metrics() is None
+
+
+def test_context_cache_metrics_return_none_after_close():
+
+    class Native:
+        hit_sequences = 1
+
+    llm = _metrics_llm(Native())
+    llm._closed = True
+    assert llm.context_cache_metrics() is None
+    llm._closed = False
+    assert llm.context_cache_metrics() == {"hit_sequences": 1}
+    # A request holds the runtime: the cached snapshot is served while open,
+    # never after close().
+    assert llm._infer_lock.acquire(blocking=False)
+    assert llm.context_cache_metrics() == {"hit_sequences": 1}
+    llm._closed = True
+    assert llm.context_cache_metrics() is None
+    llm._infer_lock.release()
+
+
+def test_context_cache_metrics_do_not_wait_for_a_running_request():
+
+    class Native:
+        hit_sequences = 1
+
+    llm = _metrics_llm(Native())
+    with llm._infer_lock:
+        assert llm.context_cache_metrics() is None
+    assert llm.context_cache_metrics() == {"hit_sequences": 1}
+    Native.hit_sequences = 2
+    with llm._infer_lock:
+        assert llm.context_cache_metrics() == {"hit_sequences": 1}
+    assert llm.context_cache_metrics() == {"hit_sequences": 2}
