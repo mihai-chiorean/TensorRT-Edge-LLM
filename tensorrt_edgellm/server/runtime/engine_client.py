@@ -574,6 +574,7 @@ class EngineClient:
         tool_config: Optional[ToolConfig] = None,
         tool_parser: str = "auto",
         reasoning_parser: str = "none",
+        reasoning_open: Optional[bool] = None,
         prepared: Optional[PreparedRequest] = None,
     ) -> CompletionOutput:
         owned = prepared
@@ -596,6 +597,7 @@ class EngineClient:
                 tool_config,
                 tool_parser=tool_parser,
                 reasoning_parser=reasoning_parser,
+                reasoning_open=reasoning_open,
                 on_handle=latch.publish,
             )
             return await _run_sync(operation,
