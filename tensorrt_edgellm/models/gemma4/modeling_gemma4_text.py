@@ -1711,6 +1711,14 @@ class Gemma4Transformer(nn.Module):
             if _gemma4_uses_swa_pool(config, consumer)
         }
         self.swa_kv_donor_layers = set(self.swa_kv_donor_indices.values())
+        num_kv_shared = int(getattr(config, "num_kv_shared_layers", 0) or 0)
+        self.first_kv_shared_layer = (config.num_hidden_layers - num_kv_shared
+                                      if num_kv_shared > 0 else None)
+        # Shape-only carrier: its length (ExecutionPhase::kAutoregressiveDecode)
+        # drives the compacted shared-KV suffix through the decode path.
+        self.register_buffer("suffix_phase_marker",
+                             torch.zeros(3, dtype=torch.int32),
+                             persistent=False)
         self.norm = Gemma4RMSNorm(config.hidden_size, config.rms_norm_eps)
 
         if self.ple_enabled:
@@ -1776,6 +1784,25 @@ class Gemma4Transformer(nn.Module):
         combined = (projected_per_layer_inputs[..., layer_index, :] +
                     ple_token_embeds[layer_index].to(
                         dtype=projected_per_layer_inputs.dtype))
+        return combined * self.per_layer_input_scale
+
+    def _combine_suffix_per_layer_inputs(
+            self, projected_per_layer_inputs: torch.Tensor,
+            ple_token_embeds: Tuple[torch.Tensor, ...], first_layer: int,
+            rows: torch.Tensor) -> torch.Tensor:
+        """Combine the per-layer inputs of layers >= first_layer at the selected rows."""
+        if len(ple_token_embeds) != len(self.layers):
+            raise ValueError(
+                "Gemma4 PLE expects one ple_token_embeds input per layer; "
+                f"got {len(ple_token_embeds)} for {len(self.layers)} layers.")
+        num_suffix = len(self.layers) - first_layer
+        token_embeds = torch.index_select(
+            torch.cat(ple_token_embeds[first_layer:], dim=-1), 0, rows)
+        token_embeds = token_embeds.unflatten(
+            -1, (num_suffix, self.hidden_size_per_layer_input))
+        projected = torch.index_select(projected_per_layer_inputs, 0, rows)
+        combined = projected[:, first_layer:, :] + token_embeds.to(
+            dtype=projected.dtype)
         return combined * self.per_layer_input_scale
 
     def _select_rope_for_layer(
@@ -1914,6 +1941,7 @@ class Gemma4Transformer(nn.Module):
         valid_tree_counts: torch.Tensor | None = None,
         output_hidden_states: bool = False,
         target_layer_ids: "List[int] | None" = None,
+        compact_rows: torch.Tensor | None = None,
     ) -> Tuple:
         hidden_states = inputs_embeds
         token_phase = phase_is_encoder
@@ -1925,16 +1953,65 @@ class Gemma4Transformer(nn.Module):
         all_hidden_states = []
         target_hidden_by_layer: dict[int, torch.Tensor] = {}
         target_layer_set = set(target_layer_ids or [])
+        compact_at = (self.first_kv_shared_layer
+                      if compact_rows is not None else None)
+        if compact_at is not None and (output_hidden_states
+                                       or target_layer_set):
+            raise ValueError(
+                "Gemma4 row compaction cannot emit per-row hidden states.")
+        compacted = False
         for layer_index, layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states.append(hidden_states)
+            if layer_index == compact_at:
+                # Layers from here on write no KV, so only the rows selected
+                # for logits are carried. Each sequence keeps exactly one row
+                # (the ragged vanilla contract), which is the decode shape:
+                # the suffix attention plugins run XQA against the donor pool
+                # in both the bounded and the full SWA storage mode.
+                compacted = True
+                hidden_states = torch.index_select(hidden_states, 0,
+                                                   compact_rows)
+                if projected_per_layer_inputs is not None:
+                    suffix_per_layer_inputs = self._combine_suffix_per_layer_inputs(
+                        projected_per_layer_inputs, ple_token_embeds,
+                        compact_at, compact_rows)
+                if rope_rotary_cos_sin is not None:
+                    rope_rotary_cos_sin = torch.index_select(
+                        rope_rotary_cos_sin, 0, compact_rows)
+                if rope_rotary_cos_sin_sliding is not None:
+                    rope_rotary_cos_sin_sliding = torch.index_select(
+                        rope_rotary_cos_sin_sliding, 0, compact_rows)
+                if rope_rotary_cos_sin_full is not None:
+                    rope_rotary_cos_sin_full = torch.index_select(
+                        rope_rotary_cos_sin_full, 0, compact_rows)
+                if vision_block_ids is not None:
+                    # Suffix attention runs the decode path, which ignores
+                    # vision_block_ids, so a last prompt token inside an
+                    # image block longer than the sliding window can compact
+                    # to a different result than the full prefill.
+                    vision_block_ids = torch.index_select(
+                        vision_block_ids, 0, compact_rows)
+                past_lengths = past_lengths + query_lengths - 1
+                query_lengths = torch.ones_like(query_lengths)
+                query_start_offsets = torch.arange(
+                    query_start_offsets.shape[0],
+                    dtype=query_start_offsets.dtype,
+                    device=query_start_offsets.device)
+                execution_phase_marker = self.suffix_phase_marker
+                context_sequence_count_carrier = (
+                    context_sequence_count_carrier[:0])
             layer_rope = _select_rope_for_layer(layer, rope_rotary_cos_sin,
                                                 rope_rotary_cos_sin_sliding,
                                                 rope_rotary_cos_sin_full)
-            per_layer_input = self._combine_per_layer_input(
-                projected_per_layer_inputs, ple_token_embeds, layer_index)
+            if compacted and projected_per_layer_inputs is not None:
+                per_layer_input = suffix_per_layer_inputs[:, layer_index -
+                                                          compact_at, :]
+            else:
+                per_layer_input = self._combine_per_layer_input(
+                    projected_per_layer_inputs, ple_token_embeds, layer_index)
             shared_key_value = None
-            if layer_index in self.swa_kv_donor_indices:
+            if not compacted and layer_index in self.swa_kv_donor_indices:
                 donor_index = self.swa_kv_donor_indices[layer_index]
                 if donor_index not in current_swa_key_values:
                     raise ValueError(
@@ -2015,6 +2092,13 @@ class Gemma4ForCausalLM(CausalLM):
     def ple_enabled(self) -> bool:
         """Whether this Gemma4 export uses per-layer embedding inputs."""
         return self.model.ple_enabled
+
+    def materialize_checkpoint_defaults(self, device: str) -> None:
+        marker = self.model.suffix_phase_marker
+        if marker.device.type == "meta":
+            self.model.suffix_phase_marker = torch.zeros(marker.shape,
+                                                         dtype=marker.dtype,
+                                                         device=device)
 
     def onnx_export_spec(self) -> OnnxSpec:
         """Return Gemma4-specific ONNX export parameters."""
@@ -2328,6 +2412,15 @@ class Gemma4ForCausalLM(CausalLM):
                 break
         collect_eagle_hidden_states = (self.config.eagle_base
                                        and not target_layer_ids)
+        # Row compaction needs one logits row per sequence, as enforced by
+        # the runtime in validateRuntimeAdapterStep, and no per-row
+        # hidden-state consumer (EAGLE/MTP/DFlash/DSpark bases, tree verify).
+        compact_rows = (
+            logits_indices if self.model.first_kv_shared_layer is not None
+            and packed_attention_mask is None
+            and not collect_eagle_hidden_states and not target_layer_ids
+            and not self.emit_hidden_states and not self.config.gemma4_mtp_base
+            and not self.config.is_diffusion_gemma else None)
         model_outputs = self.model.forward_ragged(
             inputs_embeds,
             past_key_values,
@@ -2353,14 +2446,16 @@ class Gemma4ForCausalLM(CausalLM):
             tree_depths=tree_depths,
             valid_tree_counts=valid_tree_counts,
             output_hidden_states=collect_eagle_hidden_states,
-            target_layer_ids=target_layer_ids)
+            target_layer_ids=target_layer_ids,
+            compact_rows=compact_rows)
         if collect_eagle_hidden_states:
             hidden_states, present_key_values, fallback_hidden = model_outputs
         else:
             hidden_states, present_key_values = model_outputs
             fallback_hidden = None
-        selected_hidden_states = torch.index_select(hidden_states, 0,
-                                                    logits_indices)
+        selected_hidden_states = (hidden_states if compact_rows is not None
+                                  else torch.index_select(
+                                      hidden_states, 0, logits_indices))
         logits = self.lm_head(selected_hidden_states).to(torch.float32)
         if self.config.final_logit_softcapping is not None:
             cap = self.config.final_logit_softcapping
