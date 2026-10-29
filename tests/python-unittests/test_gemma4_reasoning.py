@@ -19,6 +19,7 @@ import json
 import pytest
 
 from experimental.server.config import parse_server_config
+from experimental.server.parsing import tool_calling
 from experimental.server.parsing.reasoning import (REASONING_PARSERS,
                                                    Gemma4ReasoningParser)
 from experimental.server.parsing.tool_calling import (parse_assistant_output,
@@ -98,6 +99,12 @@ def test_auto_selects_gemma4_by_model_family(tmp_path, config, name):
     model_dir = _gemma_dir(tmp_path, config, name)
     assert isinstance(REASONING_PARSERS.resolve("auto", model_dir),
                       Gemma4ReasoningParser)
+
+
+def test_bolt_checkpoint_gets_the_gemma4_tool_parser(tmp_path):
+    model_dir = _gemma_dir(tmp_path, {"model_type": "gemma4"},
+                           "NVIDIA-Nemotron-3.5-Bolt-E4B-BF16")
+    assert tool_calling._parser_name_for_model(model_dir) == "gemma4"
 
 
 def test_other_families_keep_their_parsers(tmp_path):

@@ -1603,6 +1603,10 @@ def _parser_name_for_model(model_dir: str) -> str:
             config.get("model_type") or config.get("model") or "").lower()
     except (OSError, ValueError, AttributeError):
         pass
+    # The config's family wins over the directory name: Nemotron Bolt is a
+    # Gemma 4 checkpoint that speaks the Gemma 4 tool grammar.
+    if "gemma4" in model_type:
+        return "gemma4"
     name = f"{model_type} {os.path.basename(model_dir).lower()}"
     if "qwen3" in name and "coder" in name:
         return "qwen3_xml"
