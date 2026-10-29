@@ -80,9 +80,10 @@ def _int4_quantize_groups(
         grouped: torch.Tensor, group_step: torch.Tensor,
         code_min: float) -> Tuple[torch.Tensor, torch.Tensor]:
     """Round ``grouped`` against the FP16 form of ``group_step`` (the scale the
-    runtime sees); a zero step becomes scale 1.0."""
-    group_scales = torch.where(group_step != 0, group_step,
-                               torch.ones_like(group_step)).to(torch.float16)
+    runtime sees); a step that is zero in FP16 becomes scale 1.0."""
+    group_scales = group_step.to(torch.float16)
+    group_scales = torch.where(group_scales != 0, group_scales,
+                               torch.ones_like(group_scales))
     quantized = torch.round(grouped / group_scales.float().unsqueeze(2))
     return group_scales, quantized.clamp(code_min, INT4_SYMMETRIC_MAX)
 

@@ -548,6 +548,22 @@ def test_int4_rejects_groups_that_decode_to_inf(scale_mode):
             weight, scale_mode=scale_mode)
 
 
+@pytest.mark.parametrize("scale_mode", ["absmax", "q4_0_grid"])
+def test_int4_step_below_fp16_range_gets_unit_scale(scale_mode):
+    weight = torch.zeros(1, 64, dtype=torch.float32)
+    weight[0, :31] = 1e-8
+    weight[0, 32:] = torch.linspace(-1.0, 1.0, 32)
+
+    packed, scales = embedding_quantization.quantize_embedding_to_int4(
+        weight, scale_mode=scale_mode)
+
+    assert scales[0, 0] == 1.0
+    dequantized = embedding_quantization.dequantize_int4_embedding(
+        packed, scales)
+    assert torch.equal(dequantized[0, :32], torch.zeros(32,
+                                                        dtype=torch.float16))
+
+
 def test_int4_default_scale_mode_is_absmax():
     torch.manual_seed(3)
     weight = torch.randn(4, 64).to(torch.float16)
