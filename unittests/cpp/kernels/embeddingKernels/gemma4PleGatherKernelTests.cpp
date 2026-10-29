@@ -240,7 +240,7 @@ void runInt8GatherTest(std::vector<int32_t> const& inputIds, int32_t batchSize, 
     copyHostToDevice(outputDevice, initialOutput);
 
     kernel::gemma4PleGather(inputIdsDevice, tableDevice, outputDevice, numLayers, pleHiddenSize, imageTokenId,
-        audioTokenId, nullptr, rt::OptionalInputTensor{scalesDevice});
+        audioTokenId, /* padTokenId = */ 0, nullptr, rt::OptionalInputTensor{scalesDevice});
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<half> const output = copyDeviceToHost<half>(outputDevice);
@@ -488,7 +488,7 @@ TEST(Gemma4PleGatherKernelTest, GatherRejectsMismatchedScalesAndOutputTypes)
     rt::Tensor oneDimScales({kVocabSize}, rt::DeviceType::kGPU, DataType::kFLOAT);
     rt::Tensor wrongColumns({kVocabSize, kNumLayers + 1}, rt::DeviceType::kGPU, DataType::kFLOAT);
     auto const gather = [&](rt::Tensor const& table, rt::Tensor& output, rt::OptionalInputTensor s) {
-        kernel::gemma4PleGather(inputIds, table, output, kNumLayers, kPleHiddenSize, -1, -1, nullptr, s);
+        kernel::gemma4PleGather(inputIds, table, output, kNumLayers, kPleHiddenSize, -1, -1, 0, nullptr, s);
     };
 
     expectContains(thrownMessage([&]() { gather(fp16Table, fp16Output, rt::OptionalInputTensor{scales}); }),
