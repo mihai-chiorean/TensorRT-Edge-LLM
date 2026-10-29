@@ -34,7 +34,8 @@ namespace rt
 LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
     std::unordered_map<std::string, std::string> const& loraWeightsMap, SpecDecodeDraftingConfig const& draftingConfig,
     cudaStream_t stream, ContextCacheConfig const& contextCacheConfig, std::string const& checkpointDir,
-    std::string const& draftCheckpointDir, EmbeddingTableResidency embeddingTableResidency)
+    std::string const& draftCheckpointDir, std::optional<std::filesystem::path> const& runtimeCachePath,
+    EmbeddingTableResidency embeddingTableResidency)
 {
     ParallelExecutionConfig config{};
     config.localRanks = {0};
@@ -44,16 +45,18 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
     config.contextCacheConfig = contextCacheConfig;
     config.checkpointDir = checkpointDir;
     config.draftCheckpointDir = draftCheckpointDir;
+    config.runtimeCachePath = runtimeCachePath;
     config.embeddingTableResidency = embeddingTableResidency;
     auto artifacts = std::make_unique<ModelArtifacts>(ModelArtifacts::loadFromEngineDir(engineDir, draftingConfig,
-        checkpointDir, draftCheckpointDir, contextCacheConfig.enabled, stream, embeddingTableResidency));
+        checkpointDir, draftCheckpointDir, contextCacheConfig.enabled, stream, {}, runtimeCachePath,
+        embeddingTableResidency));
     initializeCoordinator(engineDir, multimodalEngineDir, loraWeightsMap, std::move(config), std::move(artifacts));
 }
 
 LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
     std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream,
     ContextCacheConfig const& contextCacheConfig, std::string const& checkpointDir,
-    EmbeddingTableResidency embeddingTableResidency)
+    std::optional<std::filesystem::path> const& runtimeCachePath, EmbeddingTableResidency embeddingTableResidency)
 {
     ParallelExecutionConfig config{};
     config.localRanks = {0};
@@ -61,9 +64,11 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
     config.ownsLocalStreams = false;
     config.contextCacheConfig = contextCacheConfig;
     config.checkpointDir = checkpointDir;
+    config.runtimeCachePath = runtimeCachePath;
     config.embeddingTableResidency = embeddingTableResidency;
     auto artifacts = std::make_unique<ModelArtifacts>(ModelArtifacts::loadFromEngineDir(
-        engineDir, std::nullopt, checkpointDir, "", contextCacheConfig.enabled, stream, embeddingTableResidency));
+        engineDir, std::nullopt, checkpointDir, "", contextCacheConfig.enabled, stream, {}, runtimeCachePath,
+        embeddingTableResidency));
     initializeCoordinator(engineDir, multimodalEngineDir, loraWeightsMap, std::move(config), std::move(artifacts));
 }
 
@@ -110,6 +115,7 @@ void LLMInferenceRuntime::initializeCoordinator(std::string const& engineDir, st
     coordinatorConfig.ownsLocalStreams = config.ownsLocalStreams;
     coordinatorConfig.backendHandles = std::move(config.backendHandles);
     coordinatorConfig.modelArtifacts = std::move(modelArtifacts);
+    coordinatorConfig.runtimeCachePath = config.runtimeCachePath;
     mCoordinator = std::make_unique<RuntimeCoordinator>(std::move(coordinatorConfig));
 }
 

@@ -120,16 +120,18 @@ void generateVisionBlockIds(
 //! \param[in,out] outputBuffer Backing tensor for all per-layer outputs; shape [numLayers, maxBatch, maxSeq, hidden]
 //! \param[in] numLayers Number of PLE layer outputs
 //! \param[in] pleHiddenSize Hidden size of each PLE output
-//! \param[in] imageTokenId Optional image token ID to zero-fill (-1 = unused)
-//! \param[in] audioTokenId Optional audio token ID to zero-fill (-1 = unused)
+//! \param[in] imageTokenId Optional image token ID gathered as padTokenId (-1 = unused)
+//! \param[in] audioTokenId Optional audio token ID gathered as padTokenId (-1 = unused)
+//! \param[in] padTokenId Row gathered for media placeholders; out-of-range IDs are zero-filled
 //! \param[in] stream CUDA stream for execution
 //! \param[in] scales FP32 scales with shape [vocabSize, numLayers] for an INT8 table, FP16 scales with shape
 //!                   [vocabSize, numLayers * pleHiddenSize / 32] for a packed INT4 table, std::nullopt otherwise
 //! \param[in] stagedVocabSize When set, pleTable and scales hold one row per position (row i belongs to position i)
 //!                            rather than one per vocabulary entry; ids are range-checked against this size
 void gemma4PleGather(rt::Tensor const& inputIds, rt::Tensor const& pleTable, rt::Tensor& outputBuffer,
-    int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, cudaStream_t stream,
-    rt::OptionalInputTensor scales = std::nullopt, std::optional<int32_t> stagedVocabSize = std::nullopt);
+    int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, int32_t padTokenId,
+    cudaStream_t stream, rt::OptionalInputTensor scales = std::nullopt,
+    std::optional<int32_t> stagedVocabSize = std::nullopt);
 
 } // namespace kernel
 } // namespace trt_edgellm

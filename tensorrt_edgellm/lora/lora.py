@@ -529,6 +529,10 @@ def _check_adapter_config(config: dict) -> Tuple[float, int]:
     return float(config["lora_alpha"]), r
 
 
+_VLM_TEXT_PREFIXES = ("model.language_model.", "language_model.model.",
+                      "language_model.")
+
+
 def _process_tensor_name(key: str,
                          strip_prefix: str = "",
                          insert_prefix: str = "") -> str:
@@ -540,6 +544,11 @@ def _process_tensor_name(key: str,
         key = key[len(_BASE_MODEL_PREFIX):]
     if strip_prefix and key.startswith(strip_prefix):
         key = insert_prefix + key[len(strip_prefix):]
+    elif not strip_prefix:
+        for prefix in _VLM_TEXT_PREFIXES:
+            if key.startswith(prefix):
+                key = 'model.' + key[len(prefix):]
+                break
     if not key.startswith('model.'):
         key = 'model.' + key
     return key

@@ -55,6 +55,7 @@ Gemma4EmbeddingPreprocessor::Gemma4EmbeddingPreprocessor(std::filesystem::path c
         }
         mStaging = std::make_unique<RowStaging>(
             *mHostTable, static_cast<int64_t>(maxBatchSize) * maxSeqLen, "Gemma4EmbeddingPreprocessor::staging");
+        mStagedIds.resize(static_cast<size_t>(maxBatchSize) * maxSeqLen);
     }
     else if (checkpointTable.has_value())
     {
@@ -111,6 +112,11 @@ Gemma4EmbeddingPreprocessor::Gemma4EmbeddingPreprocessor(std::filesystem::path c
     ELLM_CHECK(tableShape[1] == (isInt4Ple ? rowWidth / 2 : rowWidth),
         "PLE table second dimension must equal num_ple_inputs * ple_hidden_size (halved for packed INT4)");
     mVocabSize = static_cast<int32_t>(tableShape[0]);
+    if (mConfig.imageTokenId >= 0 || mConfig.audioTokenId >= 0)
+    {
+        ELLM_CHECK(mConfig.padTokenId >= 0 && mConfig.padTokenId < tableShape[0],
+            "Gemma4 multimodal PLE pad_token_id is outside the PLE table vocabulary");
+    }
     ELLM_CHECK(tableDataType == nvinfer1::DataType::kHALF || tableDataType == nvinfer1::DataType::kBF16 || isInt8Ple
             || isInt4Ple,
         "PLE table must be FP16, BF16, INT8, or packed INT4");
@@ -189,16 +195,29 @@ void Gemma4EmbeddingPreprocessor::embed(Tensor const& tokenIds, int32_t const* h
     if (mStaging)
     {
         ELLM_CHECK(hostTokenIds != nullptr, "A host-mapped PLE table needs the token ids in host memory");
-        mStaging->upload(hostTokenIds, physicalTokens, stream);
+        // Staged rows are indexed by position, so media placeholders must stage the PAD row here.
+        int32_t const* stagedIds = hostTokenIds;
+        if (mConfig.imageTokenId >= 0 || mConfig.audioTokenId >= 0)
+        {
+            for (int64_t i = 0; i < physicalTokens; ++i)
+            {
+                int32_t const id = hostTokenIds[i];
+                bool const media = id == mConfig.imageTokenId || id == mConfig.audioTokenId;
+                mStagedIds[i] = media ? mConfig.padTokenId : id;
+            }
+            stagedIds = mStagedIds.data();
+        }
+        mStaging->upload(stagedIds, physicalTokens, stream);
         kernel::gemma4PleGather(tokenIds, mStaging->rows(), mPleOutputBuffer, mConfig.numPleInputs,
-            mConfig.pleHiddenSize, mConfig.imageTokenId, mConfig.audioTokenId, stream, mStaging->scales(), mVocabSize);
+            mConfig.pleHiddenSize, mConfig.imageTokenId, mConfig.audioTokenId, mConfig.padTokenId, stream,
+            mStaging->scales(), mVocabSize);
     }
     else
     {
         OptionalInputTensor const scales
             = mPleScales.getShape().volume() > 0 ? OptionalInputTensor{mPleScales} : std::nullopt;
         kernel::gemma4PleGather(tokenIds, mPleTable, mPleOutputBuffer, mConfig.numPleInputs, mConfig.pleHiddenSize,
-            mConfig.imageTokenId, mConfig.audioTokenId, stream, scales);
+            mConfig.imageTokenId, mConfig.audioTokenId, mConfig.padTokenId, stream, scales);
     }
     reshapeOutputsTokenMajor(physicalTokens);
 }

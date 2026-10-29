@@ -12,21 +12,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Import names for optional extras; installation requirements live in pyproject.toml."""
 
-name: CPU runner no-op
-
-on:
-  push:
-    branches:
-      - 'pull-request/[0-9]+'
-
-permissions: {}
-
-jobs:
-  noop:
-    name: Verify CPU runner access
-    runs-on: linux-amd64-cpu4
-    timeout-minutes: 5
-    steps:
-      - name: Verify CPU runner access
-        run: echo "CPU runner access verified."
+EXPORT_DEPENDENCIES = frozenset({
+    "huggingface_hub",
+    "numpy",
+    "onnx",
+    "onnx_graphsurgeon",
+    "onnxscript",
+    "safetensors",
+    "torch",
+    "transformers",
+})
+TOOL_DEPENDENCIES = EXPORT_DEPENDENCIES | {
+    "modelopt",
+    "datasets",
+    "peft",
+    "einops",
+    "soundfile",
+    "librosa",
+    "tiktoken",
+    "torchvision",
+    "backoff",
+    "httpx",
+    "tqdm",
+}

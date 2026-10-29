@@ -322,7 +322,7 @@ void launchEmbeddingLookupKernel(int32_t const* inputIds, TLoader const& loader,
 template <typename T>
 __global__ void gemma4PleGatherKernel(int32_t const* inputIds, T const* pleTable, T* outputBuffer,
     int64_t layerOutputCapacity, int64_t batchSize, int64_t seqLen, int32_t vocabSize, int32_t numLayers,
-    int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, bool stagedRows)
+    int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, int32_t padTokenId, bool stagedRows)
 {
     int64_t const seqIdx = blockIdx.x;
     int64_t const batchIdx = blockIdx.y;
@@ -334,9 +334,13 @@ __global__ void gemma4PleGatherKernel(int32_t const* inputIds, T const* pleTable
     }
 
     int64_t const tokenOffset = batchIdx * seqLen + seqIdx;
-    int32_t const tokenId = inputIds[tokenOffset];
-    bool const zeroFill = tokenId < 0 || tokenId >= vocabSize || (imageTokenId >= 0 && tokenId == imageTokenId)
-        || (audioTokenId >= 0 && tokenId == audioTokenId);
+    int32_t tokenId = inputIds[tokenOffset];
+    // Media placeholders take the PAD row, matching the HF reference.
+    if ((imageTokenId >= 0 && tokenId == imageTokenId) || (audioTokenId >= 0 && tokenId == audioTokenId))
+    {
+        tokenId = padTokenId;
+    }
+    bool const zeroFill = tokenId < 0 || tokenId >= vocabSize;
 
     int64_t const tableRow = stagedRows ? tokenOffset : static_cast<int64_t>(tokenId);
     int64_t const outputOffset = static_cast<int64_t>(layerIdx) * layerOutputCapacity + tokenOffset * pleHiddenSize;
@@ -365,7 +369,7 @@ __global__ void gemma4PleGatherKernel(int32_t const* inputIds, T const* pleTable
 template <typename T>
 void launchGemma4PleGather(int32_t const* inputIds, T const* pleTable, T* outputBuffer, int64_t layerOutputCapacity,
     int64_t batchSize, int64_t seqLen, int32_t vocabSize, int32_t numLayers, int32_t pleHiddenSize,
-    int32_t imageTokenId, int32_t audioTokenId, bool stagedRows, cudaStream_t stream)
+    int32_t imageTokenId, int32_t audioTokenId, int32_t padTokenId, bool stagedRows, cudaStream_t stream)
 {
     constexpr uint32_t kVecSize = DVec<T>::vec_size;
     check::check(pleHiddenSize % kVecSize == 0,
@@ -374,14 +378,15 @@ void launchGemma4PleGather(int32_t const* inputIds, T const* pleTable, T* output
     dim3 const grid(seqLen, batchSize, numLayers);
     dim3 const block(256);
     gemma4PleGatherKernel<<<grid, block, 0, stream>>>(inputIds, pleTable, outputBuffer, layerOutputCapacity, batchSize,
-        seqLen, vocabSize, numLayers, pleHiddenSize, imageTokenId, audioTokenId, stagedRows);
+        seqLen, vocabSize, numLayers, pleHiddenSize, imageTokenId, audioTokenId, padTokenId, stagedRows);
 }
 
 //! \brief Gathers one PLE layer slice per block from a signed INT8 table and dequantizes it to FP16 with the
 //! row's per-layer scale. Zero-fills the same positions as gemma4PleGatherKernel.
 __global__ void gemma4PleGatherInt8Kernel(int32_t const* inputIds, int8_t const* pleTable, float const* scales,
     half* outputBuffer, int64_t layerOutputCapacity, int64_t batchSize, int64_t seqLen, int32_t vocabSize,
-    int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, bool stagedRows)
+    int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, int32_t padTokenId,
+    bool stagedRows)
 {
     int64_t const seqIdx = blockIdx.x;
     int64_t const batchIdx = blockIdx.y;
@@ -393,9 +398,12 @@ __global__ void gemma4PleGatherInt8Kernel(int32_t const* inputIds, int8_t const*
     }
 
     int64_t const tokenOffset = batchIdx * seqLen + seqIdx;
-    int32_t const tokenId = inputIds[tokenOffset];
-    bool const zeroFill = tokenId < 0 || tokenId >= vocabSize || (imageTokenId >= 0 && tokenId == imageTokenId)
-        || (audioTokenId >= 0 && tokenId == audioTokenId);
+    int32_t tokenId = inputIds[tokenOffset];
+    if ((imageTokenId >= 0 && tokenId == imageTokenId) || (audioTokenId >= 0 && tokenId == audioTokenId))
+    {
+        tokenId = padTokenId;
+    }
+    bool const zeroFill = tokenId < 0 || tokenId >= vocabSize;
 
     int64_t const tableRow = stagedRows ? tokenOffset : static_cast<int64_t>(tokenId);
     int64_t const outputOffset = static_cast<int64_t>(layerIdx) * layerOutputCapacity + tokenOffset * pleHiddenSize;
@@ -432,7 +440,8 @@ __global__ void gemma4PleGatherInt8Kernel(int32_t const* inputIds, int8_t const*
 //! dequantizes it to FP16 with one FP16 scale per kInt4GroupSize columns of the row.
 __global__ void gemma4PleGatherInt4Kernel(int32_t const* inputIds, uint8_t const* pleTable, half const* scales,
     half* outputBuffer, int64_t layerOutputCapacity, int64_t batchSize, int64_t seqLen, int32_t vocabSize,
-    int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, bool stagedRows)
+    int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, int32_t padTokenId,
+    bool stagedRows)
 {
     int64_t const seqIdx = blockIdx.x;
     int64_t const batchIdx = blockIdx.y;
@@ -444,9 +453,12 @@ __global__ void gemma4PleGatherInt4Kernel(int32_t const* inputIds, uint8_t const
     }
 
     int64_t const tokenOffset = batchIdx * seqLen + seqIdx;
-    int32_t const tokenId = inputIds[tokenOffset];
-    bool const zeroFill = tokenId < 0 || tokenId >= vocabSize || (imageTokenId >= 0 && tokenId == imageTokenId)
-        || (audioTokenId >= 0 && tokenId == audioTokenId);
+    int32_t tokenId = inputIds[tokenOffset];
+    if ((imageTokenId >= 0 && tokenId == imageTokenId) || (audioTokenId >= 0 && tokenId == audioTokenId))
+    {
+        tokenId = padTokenId;
+    }
+    bool const zeroFill = tokenId < 0 || tokenId >= vocabSize;
 
     int64_t const tableRow = stagedRows ? tokenOffset : static_cast<int64_t>(tokenId);
     int64_t const rowWidth = static_cast<int64_t>(numLayers) * pleHiddenSize;
@@ -485,7 +497,8 @@ __global__ void gemma4PleGatherInt4Kernel(int32_t const* inputIds, uint8_t const
 
 void launchGemma4PleGatherInt4(int32_t const* inputIds, uint8_t const* pleTable, half const* scales, half* outputBuffer,
     int64_t layerOutputCapacity, int64_t batchSize, int64_t seqLen, int32_t vocabSize, int32_t numLayers,
-    int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, bool stagedRows, cudaStream_t stream)
+    int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, int32_t padTokenId, bool stagedRows,
+    cudaStream_t stream)
 {
     constexpr uint32_t kVecSize = DVec<half>::vec_size;
     // Scale groups follow the whole row (checked by the caller), so a layer slice only needs 4-byte-aligned loads.
@@ -496,12 +509,13 @@ void launchGemma4PleGatherInt4(int32_t const* inputIds, uint8_t const* pleTable,
     uint32_t const sliceThreads = (pleHiddenSize / kVecSize + 31) / 32 * 32;
     dim3 const block(sliceThreads < 256 ? sliceThreads : 256);
     gemma4PleGatherInt4Kernel<<<grid, block, 0, stream>>>(inputIds, pleTable, scales, outputBuffer, layerOutputCapacity,
-        batchSize, seqLen, vocabSize, numLayers, pleHiddenSize, imageTokenId, audioTokenId, stagedRows);
+        batchSize, seqLen, vocabSize, numLayers, pleHiddenSize, imageTokenId, audioTokenId, padTokenId, stagedRows);
 }
 
 void launchGemma4PleGatherInt8(int32_t const* inputIds, int8_t const* pleTable, float const* scales, half* outputBuffer,
     int64_t layerOutputCapacity, int64_t batchSize, int64_t seqLen, int32_t vocabSize, int32_t numLayers,
-    int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, bool stagedRows, cudaStream_t stream)
+    int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, int32_t padTokenId, bool stagedRows,
+    cudaStream_t stream)
 {
     constexpr uint32_t kVecSize = DVec<half>::vec_size;
     check::check(pleHiddenSize % kVecSize == 0,
@@ -513,7 +527,7 @@ void launchGemma4PleGatherInt8(int32_t const* inputIds, int8_t const* pleTable, 
     uint32_t const sliceThreads = (pleHiddenSize / kVecSize + 31) / 32 * 32;
     dim3 const block(sliceThreads < 256 ? sliceThreads : 256);
     gemma4PleGatherInt8Kernel<<<grid, block, 0, stream>>>(inputIds, pleTable, scales, outputBuffer, layerOutputCapacity,
-        batchSize, seqLen, vocabSize, numLayers, pleHiddenSize, imageTokenId, audioTokenId, stagedRows);
+        batchSize, seqLen, vocabSize, numLayers, pleHiddenSize, imageTokenId, audioTokenId, padTokenId, stagedRows);
 }
 
 constexpr int32_t kMetadataScanThreads{256};
@@ -973,8 +987,8 @@ void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTabl
 }
 
 void gemma4PleGather(rt::Tensor const& inputIds, rt::Tensor const& pleTable, rt::Tensor& outputBuffer,
-    int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, cudaStream_t stream,
-    rt::OptionalInputTensor scales, std::optional<int32_t> stagedVocabSize)
+    int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, int32_t padTokenId,
+    cudaStream_t stream, rt::OptionalInputTensor scales, std::optional<int32_t> stagedVocabSize)
 {
     auto const inputShape = inputIds.getShape();
     auto const tableShape = pleTable.getShape();
@@ -1051,25 +1065,25 @@ void gemma4PleGather(rt::Tensor const& inputIds, rt::Tensor const& pleTable, rt:
     {
         launchGemma4PleGatherInt4(inputIdsPtr, pleTable.dataPointer<uint8_t>(),
             scales.value().get().dataPointer<half>(), outputBuffer.dataPointer<half>(), layerOutputCapacity, batchSize,
-            seqLen, vocabSize, numLayers, pleHiddenSize, imageTokenId, audioTokenId, stagedRows, stream);
+            seqLen, vocabSize, numLayers, pleHiddenSize, imageTokenId, audioTokenId, padTokenId, stagedRows, stream);
     }
     else if (isInt8Ple)
     {
         launchGemma4PleGatherInt8(inputIdsPtr, pleTable.dataPointer<int8_t>(),
             scales.value().get().dataPointer<float>(), outputBuffer.dataPointer<half>(), layerOutputCapacity, batchSize,
-            seqLen, vocabSize, numLayers, pleHiddenSize, imageTokenId, audioTokenId, stagedRows, stream);
+            seqLen, vocabSize, numLayers, pleHiddenSize, imageTokenId, audioTokenId, padTokenId, stagedRows, stream);
     }
     else if (pleTable.getDataType() == nvinfer1::DataType::kHALF)
     {
         launchGemma4PleGather(inputIdsPtr, pleTable.dataPointer<half>(), outputBuffer.dataPointer<half>(),
             layerOutputCapacity, batchSize, seqLen, vocabSize, numLayers, pleHiddenSize, imageTokenId, audioTokenId,
-            stagedRows, stream);
+            padTokenId, stagedRows, stream);
     }
     else
     {
         launchGemma4PleGather(inputIdsPtr, pleTable.dataPointer<__nv_bfloat16>(),
             outputBuffer.dataPointer<__nv_bfloat16>(), layerOutputCapacity, batchSize, seqLen, vocabSize, numLayers,
-            pleHiddenSize, imageTokenId, audioTokenId, stagedRows, stream);
+            pleHiddenSize, imageTokenId, audioTokenId, padTokenId, stagedRows, stream);
     }
 }
 

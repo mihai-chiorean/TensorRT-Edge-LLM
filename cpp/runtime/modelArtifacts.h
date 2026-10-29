@@ -27,6 +27,7 @@
 #include <cuda_runtime_api.h>
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 
@@ -73,6 +74,8 @@ struct ModelArtifacts
     static ModelArtifacts loadFromEngineDir(std::filesystem::path const& engineDir,
         std::optional<SpecDecodeDraftingConfig> const& draftingConfig, std::filesystem::path const& checkpointDir,
         std::filesystem::path const& draftCheckpointDir, bool contextReuseEnabled, cudaStream_t stream,
+        std::function<void()> const& checkCancelled = {},
+        std::optional<std::filesystem::path> const& runtimeCachePath = std::nullopt,
         EmbeddingTableResidency embeddingTableResidency = EmbeddingTableResidency::kDevice);
 };
 

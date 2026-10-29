@@ -38,6 +38,7 @@
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/melSpectrogram.h"
+#include "runtime/modelArtifacts.h"
 #ifdef EDGELLM_ENABLE_NEMOTRON_ASR
 #include "runtime/nemotronAsrRuntime.h"
 #endif
@@ -248,6 +249,15 @@ EmbeddingTableResidency embeddingTableResidency(bool hostEmbeddingTables, bool h
     return hostPleTable ? EmbeddingTableResidency::kHostMappedPle : EmbeddingTableResidency::kDevice;
 }
 
+// Called synchronously by constructors while the Python caller holds the GIL.
+void checkLoadingSignals()
+{
+    if (PyErr_CheckSignals() != 0)
+    {
+        throw py::error_already_set();
+    }
+}
+
 //! Unified Python wrapper for LLMInferenceRuntime.
 //! Supports both vanilla decoding and the runtime's speculative decoders
 //! through constructor overloading — mirrors the C++ unified runtime.
@@ -262,8 +272,11 @@ public:
         ContextCacheConfig const& contextCacheConfig, bool hostEmbeddingTables, bool hostPleTable)
     {
         mPluginHandle = loadEdgellmPluginLib();
-        mRuntime = std::make_unique<LLMInferenceRuntime>(engineDir, multimodalEngineDir, loraWeightsMap, mStream.get(),
-            contextCacheConfig, checkpointDir, embeddingTableResidency(hostEmbeddingTables, hostPleTable));
+        auto artifacts = ModelArtifacts::loadFromEngineDir(engineDir, std::nullopt, checkpointDir, "",
+            contextCacheConfig.enabled, mStream.get(), checkLoadingSignals, std::nullopt,
+            embeddingTableResidency(hostEmbeddingTables, hostPleTable));
+        mRuntime = std::make_unique<LLMInferenceRuntime>(std::move(artifacts), engineDir, multimodalEngineDir,
+            loraWeightsMap, std::nullopt, mStream.get(), contextCacheConfig);
     }
 
     //! Speculative decoding constructor.
@@ -276,9 +289,11 @@ public:
         mPluginHandle = loadEdgellmPluginLib();
         SpecDecodeDraftingConfig draftingConfig{draftTopK, draftStep, verifyTreeSize};
         draftingConfig.dflashBlockSize = dflashBlockSize;
-        mRuntime = std::make_unique<LLMInferenceRuntime>(engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig,
-            mStream.get(), contextCacheConfig, checkpointDir, draftCheckpointDir,
+        auto artifacts = ModelArtifacts::loadFromEngineDir(engineDir, draftingConfig, checkpointDir, draftCheckpointDir,
+            contextCacheConfig.enabled, mStream.get(), checkLoadingSignals, std::nullopt,
             embeddingTableResidency(hostEmbeddingTables, hostPleTable));
+        mRuntime = std::make_unique<LLMInferenceRuntime>(std::move(artifacts), engineDir, multimodalEngineDir,
+            loraWeightsMap, draftingConfig, mStream.get(), contextCacheConfig);
     }
 
     LLMGenerationResponse handleRequest(LLMGenerationRequest const& request)
@@ -525,9 +540,11 @@ public:
         mPluginHandle = loadEdgellmPluginLib();
         // Single rank only in this release: tensor-parallel deployments stay on the blocking path
         // until the stepped command stream reaches the other ranks (see the IFB support matrix).
-        auto runtime
-            = std::make_unique<LLMInferenceRuntime>(engineDir, multimodalEngineDir, loraWeightsMap, mStream.get(),
-                contextCacheConfig, checkpointDir, embeddingTableResidency(hostEmbeddingTables, hostPleTable));
+        auto artifacts = ModelArtifacts::loadFromEngineDir(engineDir, std::nullopt, checkpointDir, "",
+            contextCacheConfig.enabled, mStream.get(), checkLoadingSignals, std::nullopt,
+            embeddingTableResidency(hostEmbeddingTables, hostPleTable));
+        auto runtime = std::make_unique<LLMInferenceRuntime>(std::move(artifacts), engineDir, multimodalEngineDir,
+            loraWeightsMap, std::nullopt, mStream.get(), contextCacheConfig);
         // Capture happens here because after the constructor hands the runtime over, nothing but
         // the actor may touch it, and the actor has no pre-first-request hook to capture from.
         if (captureCudaGraph && !runtime->captureDecodingCUDAGraph(mStream.get()))
@@ -718,8 +735,8 @@ PYBIND11_MODULE(_edgellm_runtime, m)
     // Profiling
     // ========================================================================
     m.def("set_profiling_enabled", &setProfilingEnabled, py::arg("enabled"),
-        "Enable or disable profiling data collection");
-    m.def("get_profiling_enabled", &getProfilingEnabled, "Check if profiling is currently enabled");
+        "Enable or disable aggregate counters and GPU stage timing on this thread");
+    m.def("get_profiling_enabled", &getProfilingEnabled, "Check if aggregate profiling is enabled on this thread");
 
     // ========================================================================
     // Metrics
@@ -1004,17 +1021,25 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .value("ERROR", FinishReason::kError)
         .value("STOP_WORDS", FinishReason::kStopWords);
 
+    py::class_<StreamMetrics>(m, "StreamMetrics")
+        .def_readonly("processed_prompt_tokens", &StreamMetrics::processedPromptTokens)
+        .def_readonly("generated_tokens", &StreamMetrics::generatedTokens)
+        .def_readonly("decoded_tokens", &StreamMetrics::decodedTokens)
+        .def_readonly("prompt_seconds", &StreamMetrics::promptSeconds)
+        .def_readonly("generation_seconds", &StreamMetrics::generationSeconds);
+
     py::class_<StreamChunk>(m, "StreamChunk")
         .def(py::init<>())
         .def_readonly("token_ids", &StreamChunk::tokenIds)
         .def_readonly("text", &StreamChunk::text)
         .def_readonly("prompt_token_count", &StreamChunk::promptTokenCount)
+        .def_readonly("metrics", &StreamChunk::metrics)
         .def_readonly("finished", &StreamChunk::finished)
         .def_readonly("reason", &StreamChunk::reason)
         .def_readonly("logprobs", &StreamChunk::logprobs);
 
     py::class_<StreamChannel, std::shared_ptr<StreamChannel>>(m, "StreamChannel")
-        .def_static("create", &StreamChannel::create)
+        .def_static("create", &StreamChannel::create, py::arg("collect_metrics") = false)
         .def("try_pop", &StreamChannel::tryPop)
         .def(
             "wait_pop",

@@ -72,6 +72,7 @@ private:
     Tensor mPleScales{};                      //!< FP32 per-layer row scales for an INT8 PLE table.
     std::unique_ptr<HostRowTable> mHostTable; //!< Set instead of mPleTable/mPleScales when host-mapped.
     std::unique_ptr<RowStaging> mStaging;     //!< Per-step row staging for the host-mapped table.
+    std::vector<int32_t> mStagedIds;          //!< Host ids with media placeholders mapped to the PAD row.
     int32_t mVocabSize{0};
     nvinfer1::DataType mPleOutputDataType{nvinfer1::DataType::kHALF};
     Tensor mPleOutputBuffer{}; //!< Unified owned backing buffer for all PLE layer outputs.
