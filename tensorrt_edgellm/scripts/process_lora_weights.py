@@ -20,7 +20,8 @@ to specified requirements including tensor name processing, shape corrections, a
 format conversions.
 
 Usage:
-    tensorrt-edgellm-process-lora --input-dir /path/to/adapter --output-dir /path/to/output
+    tensorrt-edgellm-process-lora --input-dir /path/to/adapter --output-dir /path/to/output \
+        [--onnx-dir /path/to/onnx/llm] [--max-lora-rank 16]
 """
 
 import argparse
@@ -51,16 +52,43 @@ def main(argv=None, *, prog="tensorrt-edgellm-process-lora") -> None:
                         type=str,
                         required=True,
                         help="Directory where processed files will be saved")
+    parser.add_argument(
+        "--onnx-dir",
+        "--onnx_dir",
+        type=str,
+        default=None,
+        help="Directory containing lora_model.onnx; validates the adapter "
+        "against the engine's LoRA bindings and drops unused tensors")
+    parser.add_argument(
+        "--max-lora-rank",
+        "--max_lora_rank",
+        type=int,
+        default=None,
+        help="Engine --maxLoraRank; the adapter rank must not exceed it")
 
     args = parser.parse_args(argv)
 
     from tensorrt_edgellm.lora.lora import process_lora_weights_and_save
 
     try:
-        # Process LoRA weights
-        process_lora_weights_and_save(input_dir=args.input_dir,
-                                      output_dir=args.output_dir)
+        report = process_lora_weights_and_save(
+            input_dir=args.input_dir,
+            output_dir=args.output_dir,
+            onnx_dir=args.onnx_dir,
+            max_lora_rank=args.max_lora_rank)
 
+        print(f"Wrote {report.output_path}: {len(report.bound)} modules, "
+              f"rank {report.rank}, scale {report.lora_scale:.4f}")
+        if report.unused:
+            print(f"Dropped {len(report.unused)} adapter module(s) the "
+                  "engine does not have:")
+            for stem in report.unused:
+                print(f"  {stem}")
+        if report.unbound_untargeted:
+            print(f"{len(report.unbound_untargeted)} engine binding(s) "
+                  "outside the adapter's targets stay at rank-1 zeros:")
+            for stem in report.unbound_untargeted:
+                print(f"  {stem}")
         print("LoRA weight processing completed successfully!")
 
     except ModuleNotFoundError:
