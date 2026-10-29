@@ -107,7 +107,8 @@ enum LLMInferenceOptionId : int
     VISUAL_PRUNE_ALGO = 939,
     ENCODER_CACHE_BUDGET_BYTES = 940,
     CP_SPEC_VERIFY_SIZE = 941,
-    RTX_RUNTIME_CACHE_PATH = 942
+    RTX_RUNTIME_CACHE_PATH = 942,
+    HOST_PLE_TABLE = 943
 };
 
 // Struct to hold speculative decoding arguments (used by both EAGLE and MTP)
@@ -425,6 +426,12 @@ void printUsage(char const* programName)
     std::cerr << "                            gather rows on the CPU each step (vanilla or Gemma 4 MTP decoding, single"
               << std::endl;
     std::cerr << "                            rank)" << std::endl;
+    std::cerr
+        << "  --hostPleTable            Keep only the PLE sidecar mapped in host memory; the token-embedding table"
+        << std::endl;
+    std::cerr << "                            stays on the device, so Gemma 4 MTP drafting needs no host copy of its"
+              << std::endl;
+    std::cerr << "                            draft tokens" << std::endl;
     std::cerr << "\nContext Reuse Options:" << std::endl;
     std::cerr << "  --enable-context-reuse         Enable process-local content-addressed context reuse" << std::endl;
     std::cerr << "  --context-cache-max-records    Maximum retained context records (default: 1024)" << std::endl;
@@ -558,6 +565,8 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"dsparkMaxProposalLen", required_argument, 0, LLMInferenceOptionId::DSPARK_MAX_PROPOSAL_LEN},
         {"host-embedding-tables", no_argument, 0, LLMInferenceOptionId::HOST_EMBEDDING_TABLES},
         {"hostEmbeddingTables", no_argument, 0, LLMInferenceOptionId::HOST_EMBEDDING_TABLES},
+        {"host-ple-table", no_argument, 0, LLMInferenceOptionId::HOST_PLE_TABLE},
+        {"hostPleTable", no_argument, 0, LLMInferenceOptionId::HOST_PLE_TABLE},
         {"enable-context-reuse", no_argument, 0, LLMInferenceOptionId::ENABLE_CONTEXT_REUSE},
         {"enableContextReuse", no_argument, 0, LLMInferenceOptionId::ENABLE_CONTEXT_REUSE},
         {"context-cache-max-records", required_argument, 0, LLMInferenceOptionId::CONTEXT_CACHE_MAX_RECORDS},
@@ -864,6 +873,12 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             break;
         case LLMInferenceOptionId::HOST_EMBEDDING_TABLES:
             args.embeddingTableResidency = rt::EmbeddingTableResidency::kHostMapped;
+            break;
+        case LLMInferenceOptionId::HOST_PLE_TABLE:
+            if (args.embeddingTableResidency != rt::EmbeddingTableResidency::kHostMapped)
+            {
+                args.embeddingTableResidency = rt::EmbeddingTableResidency::kHostMappedPle;
+            }
             break;
         case LLMInferenceOptionId::ENABLE_CONTEXT_REUSE: args.contextCacheConfig.enabled = true; break;
         case LLMInferenceOptionId::CONTEXT_CACHE_MAX_RECORDS:
@@ -1707,12 +1722,12 @@ int main(int argc, char* argv[])
         draftingConfig.dsparkMaxProposalLen = args.specDecodeArgs.dsparkMaxProposalLen;
         try
         {
-            runtime = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, args.multimodalEngineDir,
-                loraWeightsMap, draftingConfig, stream, args.contextCacheConfig, args.checkpointDir,
-                args.draftCheckpointDir,
-                args.rtxRuntimeCachePath.empty() ? std::nullopt
-                                                 : std::optional<std::filesystem::path>{args.rtxRuntimeCachePath},
-                args.embeddingTableResidency);
+            runtime
+                = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, args.multimodalEngineDir, loraWeightsMap,
+                    draftingConfig, stream, args.contextCacheConfig, args.checkpointDir, args.draftCheckpointDir,
+                    args.rtxRuntimeCachePath.empty() ? std::nullopt
+                                                     : std::optional<std::filesystem::path>{args.rtxRuntimeCachePath},
+                    args.embeddingTableResidency);
         }
         catch (std::exception const& e)
         {

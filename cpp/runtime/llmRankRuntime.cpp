@@ -211,7 +211,7 @@ void LLMRankRuntime::initializeFromEngineDir(std::string const& engineDir, std::
 
     ModelArtifacts artifacts;
     artifacts.embeddingTableResidency = embeddingTableResidency;
-    bool const hostMapped = embeddingTableResidency == EmbeddingTableResidency::kHostMapped;
+    bool const hostMapped = tokenTableHostMapped(embeddingTableResidency);
     std::filesystem::path const engineRoot{engineDir};
     parallel_artifacts::RankArtifactContext const artifactContext{
         worldSize > 0 ? worldSize : tensorParallelSize, globalRank >= 0 ? globalRank : tensorParallelRank};
@@ -241,7 +241,7 @@ void LLMRankRuntime::initializeFromEngineDir(std::string const& engineDir, std::
         artifacts.embedding = loadEmbeddingTable(engineRoot / "embedding.safetensors", stream);
     }
     artifacts.pleEmbedding = artifacts.weights.takePleEmbedding();
-    ELLM_CHECK(!hostMapped || !artifacts.pleEmbedding.has_value(),
+    ELLM_CHECK(!pleTableHostMapped(embeddingTableResidency) || !artifacts.pleEmbedding.has_value(),
         "Host-mapped embedding tables require the ple_embedding.safetensors sidecar");
 
     // Parse engine configurations and attach user drafting. The bundle factory
@@ -353,9 +353,9 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     mBaseExecutor = std::move(artifacts.baseExecutor);
     mEmbedding = std::move(artifacts.embedding);
     EmbeddingTableResidency const embeddingTableResidency = artifacts.embeddingTableResidency;
-    ELLM_CHECK(mEmbedding.isHostResident() == (embeddingTableResidency == EmbeddingTableResidency::kHostMapped),
+    ELLM_CHECK(mEmbedding.isHostResident() == tokenTableHostMapped(embeddingTableResidency),
         "Model artifacts disagree with their embedding table residency");
-    ELLM_CHECK(!mEmbedding.isHostResident()
+    ELLM_CHECK(embeddingTableResidency == EmbeddingTableResidency::kDevice
             || supportsHostMappedEmbeddingTables(
                 mDeployment.specConfig.has_value() ? mDeployment.base.specDecodeType : SpecDecodeMode::kNONE,
                 mDeployment.base.isDiffusionBackbone),

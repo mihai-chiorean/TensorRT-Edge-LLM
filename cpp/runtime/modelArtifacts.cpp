@@ -201,7 +201,7 @@ ModelArtifacts ModelArtifacts::loadFromEngineDir(std::filesystem::path const& en
     // Finish checkpoint reads and weight conversion before any engine can run.
     artifacts.weights.load(
         engineDir, baseConfigPath, stream, artifacts.checkpointDir, {}, std::nullopt, std::nullopt, checkCancelled);
-    bool const hostMapped = embeddingTableResidency == EmbeddingTableResidency::kHostMapped;
+    bool const hostMapped = tokenTableHostMapped(embeddingTableResidency);
     if (auto embedding = artifacts.weights.takeEmbedding())
     {
         ELLM_CHECK(!hostMapped, "Host-mapped embedding tables require the embedding.safetensors sidecar");
@@ -216,7 +216,7 @@ ModelArtifacts ModelArtifacts::loadFromEngineDir(std::filesystem::path const& en
         artifacts.embedding = loadEmbeddingTable(engineDir / "embedding.safetensors", stream);
     }
     artifacts.pleEmbedding = artifacts.weights.takePleEmbedding();
-    ELLM_CHECK(!hostMapped || !artifacts.pleEmbedding.has_value(),
+    ELLM_CHECK(!pleTableHostMapped(embeddingTableResidency) || !artifacts.pleEmbedding.has_value(),
         "Host-mapped embedding tables require the ple_embedding.safetensors sidecar");
 
     std::optional<std::filesystem::path> const draftConfigPath = draftingConfig.has_value()

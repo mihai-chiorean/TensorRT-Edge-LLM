@@ -43,7 +43,7 @@ Gemma4EmbeddingPreprocessor::Gemma4EmbeddingPreprocessor(std::filesystem::path c
     nvinfer1::DataType tableDataType{};
     Coords tableShape;
     std::optional<Coords> scaleShape;
-    if (residency == EmbeddingTableResidency::kHostMapped)
+    if (pleTableHostMapped(residency))
     {
         ELLM_CHECK(!checkpointTable.has_value(), "A checkpoint-backed PLE table cannot stay host-mapped");
         mHostTable = std::make_unique<HostRowTable>(plePath, "weight", "weight_scale");

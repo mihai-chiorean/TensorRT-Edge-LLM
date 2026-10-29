@@ -594,7 +594,7 @@ TEST(Gemma4PleGatherKernelTest, HostMappedInt8SidecarMatchesDeviceResident)
         rt::TensorMap tensorMap;
         rt::Gemma4EmbeddingPreprocessor preprocessor(
             testDir, config, 2, 3, tensorMap, nullptr, std::nullopt, residency);
-        EXPECT_EQ(preprocessor.isHostResident(), residency == rt::EmbeddingTableResidency::kHostMapped);
+        EXPECT_EQ(preprocessor.isHostResident(), residency != rt::EmbeddingTableResidency::kDevice);
         preprocessor.embed(inputIds, ids.data(), nullptr);
         CUDA_CHECK(cudaDeviceSynchronize());
         std::vector<std::vector<half>> outputs;
@@ -612,24 +612,28 @@ TEST(Gemma4PleGatherKernelTest, HostMappedInt8SidecarMatchesDeviceResident)
     };
     auto const device = run(rt::EmbeddingTableResidency::kDevice);
     auto const host = run(rt::EmbeddingTableResidency::kHostMapped);
+    // The PLE-only residency maps this table exactly as the full host-mapped mode does.
+    auto const pleOnly = run(rt::EmbeddingTableResidency::kHostMappedPle);
     ASSERT_EQ(device.size(), host.size());
+    ASSERT_EQ(pleOnly.size(), host.size());
     for (size_t layerIdx = 0; layerIdx < device.size(); ++layerIdx)
     {
         ASSERT_EQ(device[layerIdx].size(), static_cast<size_t>(ids.size()) * kPleHiddenSize);
         EXPECT_EQ(
             std::memcmp(device[layerIdx].data(), host[layerIdx].data(), device[layerIdx].size() * sizeof(half)), 0)
             << "layer " << layerIdx;
+        EXPECT_EQ(std::memcmp(pleOnly[layerIdx].data(), host[layerIdx].data(), host[layerIdx].size() * sizeof(half)), 0)
+            << "layer " << layerIdx;
         // Rows hold ids {3, image, 0, -1, vocab, 6}; the image row must equal the PAD row, and the -1/vocab
         // rows must stay zero.
         for (int32_t hiddenIdx = 0; hiddenIdx < kPleHiddenSize; ++hiddenIdx)
         {
-            float const expected
-                = static_cast<float>(table[(3 * kNumLayers + layerIdx) * kPleHiddenSize + hiddenIdx])
-                    * scales[3 * kNumLayers + layerIdx];
+            float const expected = static_cast<float>(table[(3 * kNumLayers + layerIdx) * kPleHiddenSize + hiddenIdx])
+                * scales[3 * kNumLayers + layerIdx];
             EXPECT_EQ(__half2float(host[layerIdx][hiddenIdx]), __half2float(__float2half(expected)));
             float const padExpected
                 = static_cast<float>(table[(kPadTokenId * kNumLayers + layerIdx) * kPleHiddenSize + hiddenIdx])
-                    * scales[kPadTokenId * kNumLayers + layerIdx];
+                * scales[kPadTokenId * kNumLayers + layerIdx];
             EXPECT_EQ(
                 __half2float(host[layerIdx][kPleHiddenSize + hiddenIdx]), __half2float(__float2half(padExpected)));
             EXPECT_EQ(__half2float(host[layerIdx][3 * kPleHiddenSize + hiddenIdx]), 0.0F);
