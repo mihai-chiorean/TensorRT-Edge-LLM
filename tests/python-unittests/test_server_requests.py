@@ -24,8 +24,9 @@ import pytest
 
 from experimental.server.api.errors import ServerOverloadedError
 from experimental.server.config import ApiConfig
-from experimental.server.runtime.engine import (CompletionOutput, LogprobEntry,
-                                                SamplingParams, StreamDelta)
+from experimental.server.runtime.engine import (AudioParams, CompletionOutput,
+                                                LogprobEntry, SamplingParams,
+                                                StreamDelta)
 
 
 def _create_app(llm, config=None):
@@ -2446,3 +2447,46 @@ def test_tool_stream_strips_terminal_tokens_only_after_a_stop(
     content = "".join(p["choices"][0]["delta"].get("content") or ""
                       for p in _sse_payloads(response) if p.get("choices"))
     assert content == expected
+
+
+# ---------------------------------------------------------------------------
+# Greedy sampling normalization
+# ---------------------------------------------------------------------------
+
+
+def test_greedy_temperature_pins_top_p_and_top_k():
+    params = SamplingParams(temperature=0.0, top_p=0.3, top_k=7)
+    assert (params.top_p, params.top_k) == (1.0, 1)
+    params = SamplingParams(temperature=0.0005, top_p=0.3, top_k=7)
+    assert (params.top_p, params.top_k) == (1.0, 1)
+
+
+def test_sampling_temperature_leaves_top_p_and_top_k_alone():
+    params = SamplingParams(temperature=0.7, top_p=0.3, top_k=7)
+    assert (params.top_p, params.top_k) == (0.3, 7)
+    params = SamplingParams(temperature=-1.0, top_p=0.3, top_k=7)
+    assert (params.top_p, params.top_k) == (0.3, 7)
+
+
+def test_audio_params_normalize_greedy_talker_temperature():
+    params = AudioParams(talker_temperature=0.0,
+                         talker_top_p=0.5,
+                         talker_top_k=20)
+    assert (params.talker_top_p, params.talker_top_k) == (1.0, 1)
+
+
+def test_chat_temperature_zero_reaches_the_runtime_as_greedy(client_and_llm):
+    client, llm = client_and_llm
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "hi"
+                               }],
+                               "temperature": 0,
+                               "top_p": 0.4,
+                               "top_k": 9,
+                           })
+    assert response.status_code == 200
+    assert llm.last_sampling_params.top_p == 1.0
+    assert llm.last_sampling_params.top_k == 1
