@@ -106,6 +106,25 @@ def _visual_model_family(model_type: str) -> Optional[str]:
 # Public data classes
 # ---------------------------------------------------------------------------
 
+#: Temperatures below this are greedy for the native sampler
+#: (cpp/sampler/samplingUtils.cpp).
+GREEDY_TEMPERATURE_EPSILON = 1e-3
+GREEDY_TOP_P = 1.0
+GREEDY_TOP_K = 1
+
+
+def normalize_greedy_sampling(temperature: float, top_p: float,
+                              top_k: int) -> Tuple[float, int]:
+    """Pin ``(top_p, top_k)`` to the greedy tuple for a greedy temperature.
+
+    OpenAI clients spell greedy decoding as ``temperature=0`` alone; the
+    native sampler otherwise rewrites the inconsistent triple and warns on
+    every request. Negative temperatures are left for the native range check.
+    """
+    if 0.0 <= temperature < GREEDY_TEMPERATURE_EPSILON:
+        return GREEDY_TOP_P, GREEDY_TOP_K
+    return top_p, top_k
+
 
 @dataclass
 class SamplingParams:
@@ -136,6 +155,10 @@ class SamplingParams:
     # None lets the deployment choose: false for a speculative request reusing
     # context on a hybrid model (only the prompt is cached there), else true.
     cache_generated_tokens: Optional[bool] = None
+
+    def __post_init__(self) -> None:
+        self.top_p, self.top_k = normalize_greedy_sampling(
+            self.temperature, self.top_p, self.top_k)
 
 
 @dataclass
@@ -239,6 +262,10 @@ class AudioParams:
     max_audio_length: int = 4096
     codec_chunk_frames: int = 10
     talker_prefill_threshold: int = 4
+
+    def __post_init__(self) -> None:
+        self.talker_top_p, self.talker_top_k = normalize_greedy_sampling(
+            self.talker_temperature, self.talker_top_p, self.talker_top_k)
 
 
 #: Sample rate of Omni Code2Wav PCM output.
