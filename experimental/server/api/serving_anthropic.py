@@ -20,9 +20,10 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Dict, Iterable, Optional
 
+from ..parsing.tool_calling import ToolProtocolError
 from ..runtime.engine_client import EngineClient, PreparedRequest
 from . import anthropic_compat as protocol
-from .errors import ServerError
+from .errors import ServerError, ToolProtocolResponseError
 from .protocol import ChatCompletionRequest
 from .serving_chat import IM_END_TOKEN, OpenAIServingChat, PreparedChatRequest
 
@@ -258,6 +259,11 @@ class AnthropicServingMessages:
                         yield chunk
         except asyncio.CancelledError:
             raise
+        except ToolProtocolError as exc:
+            error = ToolProtocolResponseError(exc.reason)
+            yield protocol.event(
+                "error", protocol.error_payload(error.status_code, str(error)))
+            return
         except ServerError as exc:
             status = 529 if exc.status_code == 429 else exc.status_code
             yield protocol.event("error",
@@ -280,7 +286,14 @@ class AnthropicServingMessages:
                                                        self._client.model_name,
                                                        prompt_tokens):
                 yield chunk
-        for chunk in blocks.feed(parser.flush()):
+        try:
+            flushed = list(parser.flush())
+        except ToolProtocolError as exc:
+            error = ToolProtocolResponseError(exc.reason)
+            yield protocol.event(
+                "error", protocol.error_payload(error.status_code, str(error)))
+            return
+        for chunk in blocks.feed(flushed):
             yield chunk
         for chunk in blocks.finish():
             yield chunk

@@ -326,7 +326,7 @@ def create_argument_parser(
     api.add_argument(
         "--tool-call-parser",
         choices=("auto", "generic", "hermes", "qwen3_xml", "nemotron",
-                 "openai"),
+                 "openai", "gemma4"),
         default="auto",
         help="Parser for model-generated tool calls (default: %(default)s)")
     api.add_argument("--enable-auto-tool-choice",
