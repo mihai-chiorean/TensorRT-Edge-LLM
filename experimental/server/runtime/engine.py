@@ -1513,9 +1513,9 @@ class LLM:
         reasoning_parser: str = "none",
         skip_special_tokens: bool = True,
     ) -> CompletionOutput:
-        if (tool_config.parse_output and not skip_special_tokens
-                and ended_on_stop(finish_reason)):
-            # The stop token that ended generation is still at the end.
+        if not skip_special_tokens and ended_on_stop(finish_reason):
+            # The stop token that ended generation is still at the end, and
+            # must go before a reasoning span that never closed is split off.
             text = strip_terminal_tokens(
                 text, terminal_special_tokens(self._model_dir))
         parsed = parse_assistant_output(

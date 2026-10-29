@@ -345,6 +345,14 @@ the request sets `enable_thinking=true` or
 Streaming responses emit indexed tool-call deltas as soon as each generated
 call is complete and end with `finish_reason="tool_calls"`.
 
+Gemma 4 checkpoints (selected by `model_type`, so derivatives such as
+Nemotron Bolt are covered too) use the `gemma4` reasoning parser. It returns the
+`<|channel>thought\n...<channel|>` block as `reasoning_content`; the native tool
+call that follows is parsed from the text after it. A thought cut off by
+`max_tokens` or a stop string comes back as reasoning only. Thinking length is
+bounded only by `max_tokens`: `reasoning_budget_tokens` is not enforced, because
+the runtime has no way to force the end of the thought channel during decoding.
+
 Qwen3.8's provider template accepts `reasoning_effort` values `xhigh` (the
 provider default), `medium`, and `low` when thinking is enabled. Edge-LLM
 passes the value through unchanged, so an unsupported value fails template

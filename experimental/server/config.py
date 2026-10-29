@@ -337,7 +337,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
     api.add_argument(
         "--reasoning-parser",
         choices=("auto", "none", "qwen3", "deepseek_r1", "muse_glimmer",
-                 "nemotron"),
+                 "nemotron", "gemma4"),
         default="auto",
     )
     api.add_argument(

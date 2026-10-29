@@ -132,6 +132,13 @@ def parse_assistant_output(
                                     allow_implicit=True))
 
     parser = _select_parser(model_dir, tool_parser)
+    reasoning = REASONING_PARSERS.resolve(reasoning_parser, model_dir)
+    if reasoning is not None and reasoning.precedes_tool_calls:
+        thought, content = reasoning.extract(text)
+        events, malformed = parser.parse(content or "", tool_config)
+        if thought:
+            events = [{"type": "reasoning", "text": thought}] + events
+        return ParsedAssistantOutput(events, malformed=malformed)
     events, malformed = parser.parse(text, tool_config)
     expanded: List[Dict[str, Any]] = []
     for event in events:
@@ -1058,34 +1065,64 @@ class StreamingAssistantOutputParser:
     stream incrementally.
     """
 
-    def __init__(self, tool_config: ToolConfig, model_dir: str,
-                 tool_parser: str, reasoning_parser: str) -> None:
+    def __init__(self,
+                 tool_config: ToolConfig,
+                 model_dir: str,
+                 tool_parser: str,
+                 reasoning_parser: str,
+                 reasoning_open: Optional[bool] = None) -> None:
         parser = _select_parser(model_dir, tool_parser)
         self._tools = parser.stream(
             tool_config) if tool_config.parse_output else None
         reasoning = REASONING_PARSERS.resolve(reasoning_parser, model_dir)
-        self._reasoning = (reasoning.stream(
-            allow_implicit=not tool_config.parse_output)
-                           if reasoning else None)
+        if reasoning_open is None and tool_config.parse_output:
+            reasoning_open = False
+        stream_args = ({} if reasoning_open is None else {
+            "allow_implicit": reasoning_open
+        })
+        self._reasoning = reasoning.stream(
+            **stream_args) if reasoning else None
+        self._reasoning_first = (self._tools is not None
+                                 and reasoning is not None
+                                 and reasoning.precedes_tool_calls)
         self._calls: Dict[int, ToolCall] = {}
 
     def feed(self, text: str) -> Iterable[Dict[str, Any]]:
         if self._tools is None:
             yield from self._split_reasoning(text)
             return
+        if self._reasoning_first:
+            yield from self._tools_after_reasoning(self._reasoning.feed(text))
+            return
         yield from self._convert(self._tools.feed(text))
 
     def flush(self) -> Iterable[Dict[str, Any]]:
+        if self._reasoning_first:
+            yield from self._tools_after_reasoning(self._reasoning.flush())
+            yield from self._convert(self._tools.flush())
+            return
         if self._tools is not None:
             yield from self._convert(self._tools.flush())
         if self._reasoning:
             yield from self._reasoning_events(self._reasoning.flush())
+
+    def _tools_after_reasoning(
+            self, deltas: Iterable[Any]) -> Iterable[Dict[str, Any]]:
+        for delta in deltas:
+            if delta.field == "reasoning":
+                yield {"type": "reasoning", "text": delta.text}
+            else:
+                yield from self._convert(self._tools.feed(delta.text))
 
     def _convert(
             self,
             events: Iterable["ToolStreamEvent"]) -> Iterable[Dict[str, Any]]:
         for event in events:
             if event.kind == "content":
+                if self._reasoning_first:
+                    if event.text:
+                        yield {"type": "content", "text": event.text}
+                    continue
                 yield from self._split_reasoning(event.text)
             elif event.kind == "tool_head":
                 self._calls[event.index] = ToolCall(id=event.call_id,
@@ -1094,7 +1131,7 @@ class StreamingAssistantOutputParser:
             elif event.kind == "tool_args":
                 self._calls[event.index].arguments += event.text
             elif event.kind == "tool_done":
-                if self._reasoning:
+                if self._reasoning and not self._reasoning_first:
                     yield from self._reasoning_events(self._reasoning.flush())
                 yield {
                     "type": "tool_call",
@@ -1114,13 +1151,20 @@ class StreamingAssistantOutputParser:
 
 
 def stream_assistant_output(
-        tool_config: ToolConfig,
-        model_dir: str,
-        tool_parser: str = "auto",
-        reasoning_parser: str = "none") -> StreamingAssistantOutputParser:
-    """Create incremental parsing state for one assistant response."""
+    tool_config: ToolConfig,
+    model_dir: str,
+    tool_parser: str = "auto",
+    reasoning_parser: str = "none",
+    reasoning_open: Optional[bool] = None,
+) -> StreamingAssistantOutputParser:
+    """Create incremental parsing state for one assistant response.
+
+    ``reasoning_open`` says whether the prompt leaves generation inside a
+    reasoning span; ``None`` uses the parser's default without tools and
+    assumes not with tools.
+    """
     return StreamingAssistantOutputParser(tool_config, model_dir, tool_parser,
-                                          reasoning_parser)
+                                          reasoning_parser, reasoning_open)
 
 
 class _ToolParserRegistry:

@@ -53,6 +53,9 @@ class PreparedChatRequest:
     tool_config: ToolConfig
     reasoning_parser: str
     audio_params: Optional[AudioParams] = None
+    # Whether the rendered prompt leaves generation inside a reasoning span;
+    # None keeps each response path's default.
+    reasoning_open: Optional[bool] = None
 
 
 def _entry_to_openai(entry) -> Dict[str, Any]:
@@ -253,6 +256,11 @@ class OpenAIServingChat:
         except KeyError as exc:
             raise InvalidRequestError(str(exc),
                                       param="reasoning_parser") from exc
+        reasoning_open = parser.prompt_opens_reasoning(
+            request.messages,
+            templated=request.apply_chat_template,
+            add_generation_prompt=request.add_generation_prompt,
+        ) if parser is not None else None
 
         from ..runtime.engine import (_normalize_guided_decoding,
                                       _normalize_logit_bias,
@@ -288,7 +296,7 @@ class OpenAIServingChat:
             cache_generated_tokens=request.cache_generated_tokens,
         )
         return PreparedChatRequest(sampling, tool_config, reasoning_parser,
-                                   audio_params)
+                                   audio_params, reasoning_open)
 
     def parse_output(self, text: str, prepared: PreparedChatRequest):
         return parse_assistant_output(
@@ -307,7 +315,18 @@ class OpenAIServingChat:
             self._model_dir,
             tool_parser=self._config.tool_call_parser,
             reasoning_parser=prepared.reasoning_parser,
+            reasoning_open=prepared.reasoning_open,
         )
+
+    def _reasoning_stream(self, prepared: PreparedChatRequest):
+        """Return the configured reasoning parser and its per-response state."""
+        parser = REASONING_PARSERS.resolve(prepared.reasoning_parser,
+                                           self._model_dir)
+        if parser is None:
+            return None, None
+        if prepared.reasoning_open is None:
+            return parser, parser.stream()
+        return parser, parser.stream(allow_implicit=prepared.reasoning_open)
 
     async def create_chat_completion(
             self, request: ChatCompletionRequest) -> ChatCompletionResponse:
@@ -476,9 +495,7 @@ class OpenAIServingChat:
                 yield chunk
             return
 
-        parser = REASONING_PARSERS.resolve(prepared.reasoning_parser,
-                                           self._model_dir)
-        stream_parser = parser.stream() if parser else None
+        _, stream_parser = self._reasoning_stream(prepared)
         stripper = self.stream_stripper(prepared)
         completion_tokens = 0
         finish_reason = "stop"
@@ -578,9 +595,7 @@ class OpenAIServingChat:
         include_usage: bool,
         engine_request: Optional[PreparedRequest],
     ) -> AsyncGenerator[str, None]:
-        parser = REASONING_PARSERS.resolve(prepared.reasoning_parser,
-                                           self._model_dir)
-        stream_parser = parser.stream() if parser else None
+        _, stream_parser = self._reasoning_stream(prepared)
         completion_tokens = 0
         prompt_tokens = None
         finish_reason = "stop"
@@ -669,9 +684,11 @@ class OpenAIServingChat:
         parser = _select_parser(self._model_dir,
                                 self._config.tool_call_parser).stream(
                                     prepared.tool_config)
-        reasoning = REASONING_PARSERS.resolve(prepared.reasoning_parser,
-                                              self._model_dir)
-        reasoning_stream = reasoning.stream() if reasoning else None
+        reasoning, reasoning_stream = self._reasoning_stream(prepared)
+        # Reasoning-first parsers split the thinking span off before the tool
+        # parser, which then sees only the text after it.
+        reasoning_first = (reasoning is not None
+                           and reasoning.precedes_tool_calls)
         stripper = self.stream_stripper(prepared)
         completion_tokens = 0
         prompt_tokens = None
@@ -682,7 +699,7 @@ class OpenAIServingChat:
             nonlocal tool_heads
             for event in events:
                 if event.kind == "content":
-                    if reasoning_stream is not None:
+                    if reasoning_stream is not None and not reasoning_first:
                         for parsed in reasoning_stream.feed(event.text):
                             field = ("reasoning_content" if parsed.field
                                      == "reasoning" else "content")
@@ -708,6 +725,18 @@ class OpenAIServingChat:
                         },
                     }])
 
+        def messages_after_reasoning(deltas):
+            for parsed in deltas:
+                if parsed.field == "reasoning":
+                    yield DeltaMessage(reasoning_content=parsed.text)
+                else:
+                    yield from messages_for(parser.feed(parsed.text))
+
+        def feed(text):
+            if reasoning_first:
+                return messages_after_reasoning(reasoning_stream.feed(text))
+            return messages_for(parser.feed(text))
+
         native_stream = self._client.stream(
             request.messages,
             prepared.sampling,
@@ -728,7 +757,7 @@ class OpenAIServingChat:
                 if delta.finished:
                     text += stripper.flush(ended_on_stop(delta.finish_reason))
                 if text:
-                    for message in messages_for(parser.feed(text)):
+                    for message in feed(text):
                         yield self._chunk(response_id,
                                           created,
                                           message,
@@ -768,7 +797,11 @@ class OpenAIServingChat:
                 await native_stream.aclose()
 
         try:
-            flushed = list(messages_for(parser.flush()))
+            flushed = []
+            if reasoning_first:
+                flushed.extend(
+                    messages_after_reasoning(reasoning_stream.flush()))
+            flushed.extend(messages_for(parser.flush()))
         except ToolProtocolError as exc:
             for chunk in self._tool_protocol_failure(response_id, created,
                                                      exc):
@@ -776,7 +809,7 @@ class OpenAIServingChat:
             return
         for message in flushed:
             yield self._chunk(response_id, created, message)
-        if reasoning_stream is not None:
+        if reasoning_stream is not None and not reasoning_first:
             for parsed in reasoning_stream.flush():
                 field = ("reasoning_content"
                          if parsed.field == "reasoning" else "content")

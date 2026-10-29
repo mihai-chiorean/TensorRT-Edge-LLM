@@ -17,9 +17,11 @@
 import json
 import os
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import (Any, Dict, Iterable, List, Mapping, Optional, Sequence,
+                    Tuple)
 
 from ..runtime.engine_layout import runtime_config_path
+from .terminal_tokens import partial_token_len
 
 
 @dataclass(frozen=True)
@@ -32,6 +34,10 @@ class ReasoningDelta:
 
 class ReasoningParser:
     """Parser for models that delimit reasoning with thinking tokens."""
+
+    #: Tool calls are parsed from the text after the reasoning span instead of
+    #: from the whole output.
+    precedes_tool_calls = False
 
     def __init__(self,
                  start_token: str = "<think>",
@@ -58,6 +64,14 @@ class ReasoningParser:
         return StreamingReasoningParser(self.start_token,
                                         self.end_token,
                                         allow_implicit=allow_implicit)
+
+    def prompt_opens_reasoning(self, messages: Sequence[Mapping[str, Any]], *,
+                               templated: bool,
+                               add_generation_prompt: bool) -> Optional[bool]:
+        """Whether the rendered prompt leaves generation inside a reasoning
+        span; ``None`` keeps each caller's default."""
+        del messages, templated, add_generation_prompt
+        return None
 
 
 class StreamingReasoningParser:
@@ -241,6 +255,128 @@ class MuseGlimmerStreamingReasoningParser:
         self._buffer = ""
 
 
+_GEMMA4_CHANNEL_START = "<|channel>"
+_GEMMA4_CHANNEL_END = "<channel|>"
+_GEMMA4_THOUGHT_HEADER = "thought"
+
+
+def _strip_gemma4_header(text: str) -> str:
+    if _GEMMA4_THOUGHT_HEADER.startswith(text):
+        return ""
+    if text.startswith(_GEMMA4_THOUGHT_HEADER):
+        text = text[len(_GEMMA4_THOUGHT_HEADER):]
+        if text.startswith("\n"):
+            text = text[1:]
+    return text
+
+
+class Gemma4ReasoningParser(ReasoningParser):
+    """Split Gemma 4's ``<|channel>thought\n...<channel|>`` thinking block.
+
+    The block can only open the turn. ``thought`` and its newline are the
+    channel header, not reasoning text. After a tool response with thinking
+    enabled, the provider template's generation prompt already ends with
+    ``<|channel>thought\n``, so generation starts inside the block. Tool calls
+    follow the block, so they are parsed from the text after it.
+    """
+
+    precedes_tool_calls = True
+
+    def __init__(self) -> None:
+        super().__init__(_GEMMA4_CHANNEL_START, _GEMMA4_CHANNEL_END)
+
+    def extract(self, text: str) -> Tuple[Optional[str], Optional[str]]:
+        if text.startswith(self.start_token):
+            body = _strip_gemma4_header(text[len(self.start_token):])
+        else:
+            end = text.find(self.end_token)
+            start = text.find(self.start_token)
+            if end < 0 or 0 <= start < end:
+                return None, text or None
+            body = text
+        if self.end_token not in body:
+            return body or None, None
+        reasoning, _, content = body.partition(self.end_token)
+        return reasoning or None, content or None
+
+    def stream(
+            self,
+            *,
+            allow_implicit: bool = False) -> "Gemma4StreamingReasoningParser":
+        return Gemma4StreamingReasoningParser(starts_open=allow_implicit)
+
+    def prompt_opens_reasoning(self, messages: Sequence[Mapping[str, Any]], *,
+                               templated: bool,
+                               add_generation_prompt: bool) -> Optional[bool]:
+        if not (templated and add_generation_prompt and messages):
+            return False
+        last = messages[-1]
+        if not isinstance(last, Mapping):
+            return False
+        role = last.get("role")
+        return role == "tool" or (role == "assistant"
+                                  and bool(last.get("tool_responses")))
+
+
+class Gemma4StreamingReasoningParser:
+    """Incrementally split one Gemma 4 thinking block from the content."""
+
+    def __init__(self, *, starts_open: bool) -> None:
+        self._starts_open = starts_open
+        self._state = "start"
+        self._buffer = ""
+
+    def feed(self, text: str) -> Iterable[ReasoningDelta]:
+        self._buffer += text
+        while self._buffer:
+            if self._state == "start":
+                if self._buffer.startswith(_GEMMA4_CHANNEL_START):
+                    self._buffer = self._buffer[len(_GEMMA4_CHANNEL_START):]
+                    self._state = "header"
+                    continue
+                if _GEMMA4_CHANNEL_START.startswith(self._buffer):
+                    return
+                self._state = "reasoning" if self._starts_open else "content"
+                continue
+
+            if self._state == "header":
+                header = _GEMMA4_THOUGHT_HEADER + "\n"
+                if header.startswith(self._buffer):
+                    return
+                self._buffer = _strip_gemma4_header(self._buffer)
+                self._state = "reasoning"
+                continue
+
+            if self._state == "reasoning":
+                index = self._buffer.find(_GEMMA4_CHANNEL_END)
+                if index >= 0:
+                    if index:
+                        yield ReasoningDelta("reasoning", self._buffer[:index])
+                    self._buffer = self._buffer[index +
+                                                len(_GEMMA4_CHANNEL_END):]
+                    self._state = "content"
+                    continue
+                keep = partial_token_len(self._buffer, (_GEMMA4_CHANNEL_END, ))
+                emit = self._buffer[:len(self._buffer) - keep]
+                self._buffer = self._buffer[len(emit):]
+                if emit:
+                    yield ReasoningDelta("reasoning", emit)
+                return
+
+            yield ReasoningDelta("content", self._buffer)
+            self._buffer = ""
+
+    def flush(self) -> Iterable[ReasoningDelta]:
+        buffer, self._buffer = self._buffer, ""
+        if self._state == "header":
+            # Generation ended inside the channel header.
+            return
+        if self._state == "start":
+            self._state = "reasoning" if self._starts_open else "content"
+        if buffer:
+            yield ReasoningDelta(self._state, buffer)
+
+
 class ReasoningParserRegistry:
     """Resolve explicit parser names or infer one from model metadata.
 
@@ -257,6 +393,7 @@ class ReasoningParserRegistry:
             "deepseek_r1": thinking,
             "muse_glimmer": MuseGlimmerReasoningParser(),
             "nemotron": thinking,
+            "gemma4": Gemma4ReasoningParser(),
         }
 
     def names(self) -> List[str]:
@@ -277,6 +414,10 @@ class ReasoningParserRegistry:
     def _for_model(model_dir: str) -> str:
         """Infer a parser from config metadata, with basename as fallback."""
         identifiers = _model_identifiers(model_dir)
+        # Gemma 4 derivatives can carry another family's name (Nemotron Bolt
+        # is model_type gemma4), so the config's family wins over the name.
+        if any("gemma4" in value for value in identifiers[1:]):
+            return "gemma4"
         if any("muse_glimmer" in value for value in identifiers):
             return "muse_glimmer"
         if any("nemotron" in value for value in identifiers):
@@ -285,11 +426,17 @@ class ReasoningParserRegistry:
             return "deepseek_r1"
         if any("qwen3" in value for value in identifiers):
             return "qwen3"
+        if any("gemma4" in value or "gemma-4" in value
+               for value in identifiers):
+            return "gemma4"
         return "none"
 
 
 def _model_identifiers(model_dir: str) -> List[str]:
-    """Read architecture identifiers without relying on checkpoint location."""
+    """Read architecture identifiers without relying on checkpoint location.
+
+    The first entry is the directory basename; the rest come from the config.
+    """
     identifiers = [os.path.basename(os.path.normpath(model_dir)).lower()]
     try:
         with open(runtime_config_path(model_dir),
