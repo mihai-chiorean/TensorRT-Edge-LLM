@@ -445,7 +445,7 @@ TEST(Gemma4PleGatherKernelTest, Int8PleSidecarLoaderRejectsMalformedFiles)
     std::vector<rt::Tensor> int8NoScales;
     int8NoScales.emplace_back(table(DataType::kINT8));
     expectContains(pleLoadRejection(std::move(int8NoScales), kNumLayers, kPleHiddenSize),
-        "INT8 ple_embedding.safetensors must contain exactly weight and weight_scale");
+        "INT8/INT4 ple_embedding.safetensors must contain exactly weight and weight_scale");
 
     std::vector<rt::Tensor> fp16WithScales;
     fp16WithScales.emplace_back(table(DataType::kHALF));
@@ -455,8 +455,8 @@ TEST(Gemma4PleGatherKernelTest, Int8PleSidecarLoaderRejectsMalformedFiles)
 
     std::vector<rt::Tensor> int32Table;
     int32Table.emplace_back(table(DataType::kINT32));
-    expectContains(
-        pleLoadRejection(std::move(int32Table), kNumLayers, kPleHiddenSize), "PLE table must be FP16, BF16, or INT8");
+    expectContains(pleLoadRejection(std::move(int32Table), kNumLayers, kPleHiddenSize),
+        "PLE table must be FP16, BF16, INT8, or packed INT4");
 
     std::vector<rt::Tensor> oneDimScales;
     oneDimScales.emplace_back(table(DataType::kINT8));
@@ -706,6 +706,106 @@ TEST(Gemma4PleGatherKernelTest, Int8SidecarWithOneLayerLoadsThroughPreprocessor)
         for (half const value : values)
         {
             EXPECT_NEAR(__half2float(value), 1.0F, 1e-3F);
+        }
+    }
+    std::filesystem::remove_all(testDir);
+}
+
+// Packed INT4 PLE sidecar: device-resident and host-mapped preprocessors must agree bit for bit and match the
+// CPU dequantization of the nibbles.
+TEST(Gemma4PleGatherKernelTest, Int4SidecarMatchesReferenceInBothResidencies)
+{
+    constexpr int32_t kVocabSize = 5;
+    constexpr int32_t kNumLayers = 3;
+    constexpr int32_t kPleHiddenSize = 64;
+    constexpr int32_t kRowWidth = kNumLayers * kPleHiddenSize;
+    constexpr int32_t kGroup = 32;
+    constexpr int32_t kImageTokenId = 2;
+    constexpr int32_t kPadTokenId = 1;
+    std::vector<uint8_t> packed(static_cast<size_t>(kVocabSize) * kRowWidth / 2, 0);
+    std::vector<half> scales(static_cast<size_t>(kVocabSize) * kRowWidth / kGroup);
+    std::vector<float> reference(static_cast<size_t>(kVocabSize) * kRowWidth);
+    for (int32_t row = 0; row < kVocabSize; ++row)
+    {
+        for (int32_t col = 0; col < kRowWidth; ++col)
+        {
+            int32_t const group = col / kGroup;
+            half const scale = __float2half(0.01F * static_cast<float>(row + 1) + 0.001F * static_cast<float>(group));
+            scales[row * (kRowWidth / kGroup) + group] = scale;
+            int32_t const value = static_cast<int32_t>((row * 5 + col * 11) % 15) - 7;
+            uint8_t const nibble = static_cast<uint8_t>(value + 8);
+            packed[static_cast<size_t>(row) * kRowWidth / 2 + col / 2]
+                |= static_cast<uint8_t>(col % 2 == 0 ? nibble : nibble << 4);
+            reference[static_cast<size_t>(row) * kRowWidth + col]
+                = __half2float(__float2half(static_cast<float>(value) * __half2float(scale)));
+        }
+    }
+    rt::Tensor tableTensor({kVocabSize, kRowWidth / 2}, rt::DeviceType::kCPU, DataType::kUINT8, "weight");
+    rt::Tensor scalesTensor({kVocabSize, kRowWidth / kGroup}, rt::DeviceType::kCPU, DataType::kHALF, "weight_scale");
+    std::memcpy(tableTensor.rawPointer(), packed.data(), packed.size());
+    std::memcpy(scalesTensor.rawPointer(), scales.data(), scales.size() * sizeof(half));
+
+    auto const testDir = std::filesystem::temp_directory_path() / "trt_edgellm_int4_ple_test";
+    std::filesystem::remove_all(testDir);
+    std::filesystem::create_directories(testDir);
+    std::vector<rt::Tensor> sidecar;
+    sidecar.emplace_back(std::move(tableTensor));
+    sidecar.emplace_back(std::move(scalesTensor));
+    ASSERT_TRUE(rt::safetensors::saveSafetensors(testDir / "ple_embedding.safetensors", sidecar, nullptr));
+
+    rt::LLMEngineConfig config;
+    config.pleEnabled = true;
+    config.numPleInputs = kNumLayers;
+    config.pleHiddenSize = kPleHiddenSize;
+    config.imageTokenId = kImageTokenId;
+    config.padTokenId = kPadTokenId;
+    std::vector<int32_t> const ids{4, kImageTokenId, 0, kVocabSize, 3, 1};
+    rt::Tensor inputIds({1, 6}, rt::DeviceType::kGPU, DataType::kINT32);
+    copyHostToDevice(inputIds, ids);
+
+    auto const run = [&](rt::EmbeddingTableResidency residency) -> std::vector<std::vector<half>> {
+        rt::TensorMap tensorMap;
+        rt::Gemma4EmbeddingPreprocessor preprocessor(
+            testDir, config, 1, 6, tensorMap, nullptr, std::nullopt, residency);
+        preprocessor.embed(inputIds, ids.data(), nullptr);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<std::vector<half>> outputs;
+        for (int32_t layerIdx = 0; layerIdx < kNumLayers; ++layerIdx)
+        {
+            auto* output = tensorMap.get("ple_token_embeds_" + std::to_string(layerIdx));
+            if (output == nullptr)
+            {
+                ADD_FAILURE() << "missing ple_token_embeds_" << layerIdx;
+                return outputs;
+            }
+            outputs.push_back(copyDeviceToHost<half>(*output));
+        }
+        return outputs;
+    };
+    auto const device = run(rt::EmbeddingTableResidency::kDevice);
+    auto const host = run(rt::EmbeddingTableResidency::kHostMapped);
+    ASSERT_EQ(device.size(), static_cast<size_t>(kNumLayers));
+    ASSERT_EQ(host.size(), static_cast<size_t>(kNumLayers));
+    for (int32_t layerIdx = 0; layerIdx < kNumLayers; ++layerIdx)
+    {
+        ASSERT_EQ(device[layerIdx].size(), ids.size() * kPleHiddenSize);
+        EXPECT_EQ(
+            std::memcmp(device[layerIdx].data(), host[layerIdx].data(), device[layerIdx].size() * sizeof(half)), 0)
+            << "layer " << layerIdx;
+        for (size_t pos = 0; pos < ids.size(); ++pos)
+        {
+            int32_t const tokenId = ids[pos];
+            int32_t const row = tokenId == kImageTokenId ? kPadTokenId : tokenId;
+            for (int32_t h = 0; h < kPleHiddenSize; ++h)
+            {
+                float expected = 0.0F;
+                if (row >= 0 && row < kVocabSize)
+                {
+                    expected = reference[static_cast<size_t>(row) * kRowWidth + layerIdx * kPleHiddenSize + h];
+                }
+                ASSERT_EQ(__half2float(device[layerIdx][pos * kPleHiddenSize + h]), expected)
+                    << "layer " << layerIdx << " pos " << pos << " h " << h;
+            }
         }
     }
     std::filesystem::remove_all(testDir);

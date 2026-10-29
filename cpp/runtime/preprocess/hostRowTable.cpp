@@ -66,16 +66,18 @@ HostRowTable::HostRowTable(
 
     if (scales != nullptr)
     {
-        ELLM_CHECK(
-            scales->dataType == nvinfer1::DataType::kFLOAT, std::string(scaleName) + " must be FP32: " + mSource);
+        ELLM_CHECK(scales->dataType == nvinfer1::DataType::kFLOAT || scales->dataType == nvinfer1::DataType::kHALF,
+            std::string(scaleName) + " must be FP32 or FP16: " + mSource);
         ELLM_CHECK(scales->shape.getNumDims() == 1 || scales->shape.getNumDims() == 2,
             std::string(scaleName) + " must be [rows] or [rows, scalesPerRow]: " + mSource);
         ELLM_CHECK(scales->shape[0] == mShape[0],
             std::string(scaleName) + " rows must match " + std::string(tableName) + " rows: " + mSource);
+        mScaleDataType = scales->dataType;
         mScaleShape = scales->shape;
         mScalesPerRow = scales->shape.getNumDims() == 2 ? scales->shape[1] : 1;
         ELLM_CHECK(mScalesPerRow > 0, std::string(scaleName) + " must have a positive column count: " + mSource);
-        ELLM_CHECK(static_cast<size_t>(mScalesPerRow) * mShape[0] * sizeof(float) == scales->bytes,
+        mScaleRowBytes = mScalesPerRow * static_cast<int64_t>(utils::getTypeSize(mScaleDataType));
+        ELLM_CHECK(static_cast<size_t>(mScaleRowBytes) * mShape[0] == scales->bytes,
             std::string(scaleName) + " byte count does not match its shape: " + mSource);
         // Kept as bytes: a safetensors header need not pad the payload to 4-byte alignment.
         mScales = static_cast<uint8_t const*>(mFile.getData()) + metadata.dataOffset + scales->offset;
@@ -90,18 +92,18 @@ HostRowTable::HostRowTable(
         mSource.c_str(), mShape.formatString().c_str(), mRowBytes, mScalesPerRow);
 }
 
-void HostRowTable::gather(int32_t const* ids, int64_t count, void* rows, float* scales) const
+void HostRowTable::gather(int32_t const* ids, int64_t count, void* rows, void* scales) const
 {
     ELLM_CHECK(ids != nullptr && rows != nullptr, "HostRowTable::gather requires ids and a row destination");
     ELLM_CHECK(count >= 0, "HostRowTable::gather requires a non-negative row count");
     auto* dstRows = static_cast<uint8_t*>(rows);
     bool const copyScales = mScales != nullptr && scales != nullptr;
-    size_t const scaleBytes = static_cast<size_t>(mScalesPerRow) * sizeof(float);
+    size_t const scaleBytes = static_cast<size_t>(mScaleRowBytes);
     for (int64_t i = 0; i < count; ++i)
     {
         int32_t const id = ids[i];
         uint8_t* dstRow = dstRows + i * mRowBytes;
-        float* dstScales = copyScales ? scales + i * mScalesPerRow : nullptr;
+        uint8_t* dstScales = copyScales ? static_cast<uint8_t*>(scales) + i * mScaleRowBytes : nullptr;
         if (id < 0 || id >= mShape[0])
         {
             std::memset(dstRow, 0, static_cast<size_t>(mRowBytes));
@@ -131,8 +133,8 @@ RowStaging::RowStaging(HostRowTable const& table, int64_t capacity, std::string 
     {
         Coords const scaleShape
             = table.scaleShape().getNumDims() == 2 ? Coords{capacity, table.scalesPerRow()} : Coords{capacity};
-        mHostScales = Tensor(scaleShape, DeviceType::kCPU, nvinfer1::DataType::kFLOAT, name + "::hostScales");
-        mDeviceScales = Tensor(scaleShape, DeviceType::kGPU, nvinfer1::DataType::kFLOAT, name + "::deviceScales");
+        mHostScales = Tensor(scaleShape, DeviceType::kCPU, table.scaleDataType(), name + "::hostScales");
+        mDeviceScales = Tensor(scaleShape, DeviceType::kGPU, table.scaleDataType(), name + "::deviceScales");
     }
 }
 
@@ -144,14 +146,14 @@ void RowStaging::upload(int32_t const* ids, int64_t count, cudaStream_t stream)
 
     Coords const rowShape{count, mTable.shape()[1]};
     ELLM_CHECK(mHostRows.reshape(rowShape) && mDeviceRows.reshape(rowShape), "RowStaging row reshape failed");
-    float* hostScales = nullptr;
+    void* hostScales = nullptr;
     if (mTable.hasScales())
     {
         Coords const scaleShape
             = mTable.scaleShape().getNumDims() == 2 ? Coords{count, mTable.scalesPerRow()} : Coords{count};
         ELLM_CHECK(
             mHostScales.reshape(scaleShape) && mDeviceScales.reshape(scaleShape), "RowStaging scale reshape failed");
-        hostScales = mHostScales.dataPointer<float>();
+        hostScales = mHostScales.rawPointer();
     }
 
     mTable.gather(ids, count, mHostRows.rawPointer(), hostScales);
@@ -160,7 +162,7 @@ void RowStaging::upload(int32_t const* ids, int64_t count, cudaStream_t stream)
     if (hostScales != nullptr)
     {
         CUDA_CHECK(cudaMemcpyAsync(mDeviceScales.rawPointer(), mHostScales.rawPointer(),
-            static_cast<size_t>(count) * mTable.scalesPerRow() * sizeof(float), cudaMemcpyHostToDevice, stream));
+            static_cast<size_t>(count) * mTable.scaleRowBytes(), cudaMemcpyHostToDevice, stream));
     }
     mFence.record(stream);
 }

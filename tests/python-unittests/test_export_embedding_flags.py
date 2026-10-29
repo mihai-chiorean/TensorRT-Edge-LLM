@@ -80,6 +80,16 @@ def test_int8_embedding_rejects_qwen3_omni(monkeypatch, tmp_path, capsys):
     ).err
 
 
+def test_int4_embedding_rejects_qwen3_omni(monkeypatch, tmp_path, capsys):
+    checkpoint = _checkpoint(tmp_path, "qwen3_omni_moe")
+
+    with pytest.raises(SystemExit, match="2"):
+        _run_export_main(monkeypatch, checkpoint, tmp_path, "--int4-embedding")
+
+    assert "--int4-embedding is not supported by Qwen3-Omni" in capsys.readouterr(
+    ).err
+
+
 def test_cosmos3_reasoning_forwards_int8_embedding(monkeypatch, tmp_path):
     checkpoint = _checkpoint(tmp_path, "cosmos3_edge")
     captured = _capture_export_llm(monkeypatch)
@@ -119,11 +129,10 @@ def _write_draft(tmp_path, with_embed_tokens):
     return draft_dir
 
 
-def _write_quantized_sidecar(tmp_path, int8):
+def _write_quantized_sidecar(tmp_path, dtype):
     llm_dir = tmp_path / "llm"
     llm_dir.mkdir()
-    table = (torch.ones(4, 8, dtype=torch.int8)
-             if int8 else torch.ones(4, 8, dtype=torch.float16))
+    table = torch.ones(4, 4 if dtype == torch.uint8 else 8, dtype=dtype)
     save_file({
         "embedding": table,
         "embedding_scale": torch.ones(4)
@@ -132,17 +141,18 @@ def _write_quantized_sidecar(tmp_path, int8):
 
 
 def test_dflash_fold_skips_quantized_sidecar_without_draft_embedding(tmp_path):
-    llm_dir = _write_quantized_sidecar(tmp_path, int8=True)
+    llm_dir = _write_quantized_sidecar(tmp_path, dtype=torch.int8)
     draft_dir = _write_draft(tmp_path, with_embed_tokens=False)
 
     export_script._patch_dflash_mask_embedding(str(llm_dir), str(draft_dir))
 
 
-@pytest.mark.parametrize("int8, flag", [(True, "--int8-embedding"),
-                                        (False, "--fp8-embedding")])
+@pytest.mark.parametrize("dtype, flag", [(torch.int8, "--int8-embedding"),
+                                         (torch.uint8, "--int4-embedding"),
+                                         (torch.float16, "--fp8-embedding")])
 def test_dflash_fold_rejects_quantized_sidecar_naming_the_flag(
-        tmp_path, int8, flag):
-    llm_dir = _write_quantized_sidecar(tmp_path, int8=int8)
+        tmp_path, dtype, flag):
+    llm_dir = _write_quantized_sidecar(tmp_path, dtype=dtype)
     draft_dir = _write_draft(tmp_path, with_embed_tokens=True)
 
     with pytest.raises(ValueError, match=flag):
