@@ -1511,6 +1511,7 @@ class LLM:
         *,
         tool_parser: str = "auto",
         reasoning_parser: str = "none",
+        reasoning_open: Optional[bool] = None,
         skip_special_tokens: bool = True,
     ) -> CompletionOutput:
         if not skip_special_tokens and ended_on_stop(finish_reason):
@@ -1524,6 +1525,7 @@ class LLM:
             self._model_dir,
             tool_parser=tool_parser,
             reasoning_parser=reasoning_parser,
+            reasoning_open=reasoning_open,
         )
         tool_calls = [call.to_openai() for call in parsed.tool_calls]
         return CompletionOutput(
@@ -1543,6 +1545,7 @@ class LLM:
         *,
         tool_parser: str = "auto",
         reasoning_parser: str = "none",
+        reasoning_open: Optional[bool] = None,
         on_handle=None,
     ) -> CompletionOutput:
         response = self._handle_request(request, on_handle=on_handle)
@@ -1561,6 +1564,7 @@ class LLM:
             tool_config,
             tool_parser=tool_parser,
             reasoning_parser=reasoning_parser,
+            reasoning_open=reasoning_open,
             skip_special_tokens=params.skip_special_tokens,
         )
         if params.num_logprobs > 0 and response.logprobs:

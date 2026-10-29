@@ -305,6 +305,7 @@ class OpenAIServingChat:
             self._model_dir,
             tool_parser=self._config.tool_call_parser,
             reasoning_parser=prepared.reasoning_parser,
+            reasoning_open=prepared.reasoning_open,
         )
 
     def stream_output_parser(
@@ -344,6 +345,7 @@ class OpenAIServingChat:
                 tool_config=prepared.tool_config,
                 tool_parser=self._config.tool_call_parser,
                 reasoning_parser=prepared.reasoning_parser,
+                reasoning_open=prepared.reasoning_open,
                 prepared=engine_request,
             )
         except ToolProtocolError as exc:

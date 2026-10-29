@@ -145,6 +145,18 @@ def test_extract_splits_the_thought_block(text, expected):
     assert Gemma4ReasoningParser().extract(text) == expected
 
 
+def test_extract_follows_the_prompt_hint():
+    parser = Gemma4ReasoningParser()
+    assert parser.extract("Unfinished",
+                          starts_open=True) == ("Unfinished", None)
+    assert parser.extract("a<channel|>b", starts_open=True) == ("a", "b")
+    assert parser.extract("a<channel|>b",
+                          starts_open=False) == (None, "a<channel|>b")
+    assert parser.extract(
+        _THOUGHT + "x",
+        starts_open=False) == ("Check the weather.\nUse the tool.", "x")
+
+
 @pytest.mark.parametrize("text", [
     _THOUGHT + "It is sunny.",
     "It is sunny.",

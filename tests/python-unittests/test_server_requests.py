@@ -2901,6 +2901,7 @@ def _gemma_complete_with(llm, text, finish_reason="stop"):
             tool_config,
             tool_parser=kwargs.get("tool_parser", "auto"),
             reasoning_parser=kwargs.get("reasoning_parser", "none"),
+            reasoning_open=kwargs.get("reasoning_open"),
             skip_special_tokens=params.skip_special_tokens)
 
     llm._complete_prepared_request = complete
@@ -3150,3 +3151,85 @@ def test_gemma_anthropic_thinking_stream_then_tool_use(tmp_path):
     assert starts == ["thinking", "tool_use"]
     assert thinking == "Check the weather."
     assert "<|channel>" not in response.text
+
+
+@pytest.mark.parametrize("text", [
+    "Paris is sunny, so",
+    "Maybe " + _GEMMA_CALL,
+])
+def test_gemma_truncated_thought_after_tool_response_stays_reasoning(
+        tmp_path, text):
+    client, llm = _gemma_thinking_client(tmp_path)
+    _gemma_complete_with(llm, text, finish_reason="length")
+    response = client.post("/v1/chat/completions",
+                           json=_thinking_body(tools=True,
+                                               messages=_AFTER_TOOL))
+    assert response.status_code == 200, response.text
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "length"
+    assert choice["message"]["reasoning_content"] == text
+    assert not choice["message"].get("content")
+    assert not choice["message"].get("tool_calls")
+
+
+def test_gemma_closing_marker_inside_a_tool_argument_is_literal(tmp_path):
+    client, llm = _gemma_thinking_client(tmp_path)
+    _gemma_complete_with(
+        llm, '<|tool_call>call:weather{location:<|"|>a<channel|>b<|"|>}'
+        "<tool_call|>")
+    response = client.post("/v1/chat/completions",
+                           json=_thinking_body(tools=True))
+    assert response.status_code == 200, response.text
+    message = response.json()["choices"][0]["message"]
+    assert not message.get("reasoning_content")
+    call = message["tool_calls"][0]["function"]
+    assert json.loads(call["arguments"]) == {"location": "a<channel|>b"}
+
+
+def test_gemma_anthropic_truncated_thought_after_tool_result(tmp_path):
+    client, llm = _gemma_thinking_client(tmp_path)
+    _gemma_complete_with(llm, "Still considering", finish_reason="length")
+    response = client.post("/v1/messages",
+                           json={
+                               "model":
+                               "fake-model",
+                               "max_tokens":
+                               16,
+                               "thinking": {
+                                   "type": "enabled",
+                                   "budget_tokens": 1024
+                               },
+                               "tools": [{
+                                   "name": "weather",
+                                   "input_schema": {
+                                       "type": "object"
+                                   },
+                               }],
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Weather?"
+                               }, {
+                                   "role":
+                                   "assistant",
+                                   "content": [{
+                                       "type": "tool_use",
+                                       "id": "call_1",
+                                       "name": "weather",
+                                       "input": {
+                                           "location": "Paris"
+                                       },
+                                   }],
+                               }, {
+                                   "role":
+                                   "user",
+                                   "content": [{
+                                       "type": "tool_result",
+                                       "tool_use_id": "call_1",
+                                       "content": "sunny",
+                                   }],
+                               }],
+                           })
+    assert response.status_code == 200, response.text
+    blocks = response.json()["content"]
+    assert [b["type"] for b in blocks] == ["thinking"]
+    assert blocks[0]["thinking"] == "Still considering"

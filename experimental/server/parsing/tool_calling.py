@@ -122,19 +122,25 @@ def parse_assistant_output(
         tool_config: ToolConfig,
         model_dir: str,
         tool_parser: str = "auto",
-        reasoning_parser: str = "none") -> ParsedAssistantOutput:
-    """Parse model text into ordered content, reasoning, and tool-call events."""
+        reasoning_parser: str = "none",
+        reasoning_open: Optional[bool] = None) -> ParsedAssistantOutput:
+    """Parse model text into ordered content, reasoning, and tool-call events.
+
+    ``reasoning_open`` says whether the prompt left generation inside a
+    reasoning span (``ReasoningParser.prompt_opens_reasoning``).
+    """
     if not tool_config.parse_output:
         return ParsedAssistantOutput(
             _split_reasoning_events(text,
                                     reasoning_parser,
                                     model_dir,
-                                    allow_implicit=True))
+                                    allow_implicit=True,
+                                    starts_open=reasoning_open))
 
     parser = _select_parser(model_dir, tool_parser)
     reasoning = REASONING_PARSERS.resolve(reasoning_parser, model_dir)
     if reasoning is not None and reasoning.precedes_tool_calls:
-        thought, content = reasoning.extract(text)
+        thought, content = reasoning.extract(text, starts_open=reasoning_open)
         events, malformed = parser.parse(content or "", tool_config)
         if thought:
             events = [{"type": "reasoning", "text": thought}] + events
@@ -295,15 +301,20 @@ def _validate_tool_messages(messages: Sequence[Dict[str, Any]]) -> None:
                     f"messages[{idx}].content must be text or JSON")
 
 
-def _split_reasoning_events(text: str, parser_name: str, model_dir: str, *,
-                            allow_implicit: bool) -> List[Dict[str, Any]]:
+def _split_reasoning_events(
+        text: str,
+        parser_name: str,
+        model_dir: str,
+        *,
+        allow_implicit: bool,
+        starts_open: Optional[bool] = None) -> List[Dict[str, Any]]:
     parser = REASONING_PARSERS.resolve(parser_name, model_dir)
     if parser is None:
         return [{"type": "content", "text": text}]
     if (not allow_implicit and parser.start_token not in text
             and parser.end_token not in text):
         return [{"type": "content", "text": text}]
-    reasoning, content = parser.extract(text)
+    reasoning, content = parser.extract(text, starts_open=starts_open)
     events: List[Dict[str, Any]] = []
     if reasoning:
         events.append({"type": "reasoning", "text": reasoning})

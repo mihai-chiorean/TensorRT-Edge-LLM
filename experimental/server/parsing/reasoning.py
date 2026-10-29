@@ -48,8 +48,18 @@ class ReasoningParser:
         self.end_token = end_token
         self.always_enabled = always_enabled
 
-    def extract(self, text: str) -> Tuple[Optional[str], Optional[str]]:
-        """Split output even when generation starts inside a reasoning span."""
+    def extract(
+        self,
+        text: str,
+        *,
+        starts_open: Optional[bool] = None
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Split output even when generation starts inside a reasoning span.
+
+        ``starts_open`` is the prompt hint from ``prompt_opens_reasoning``;
+        this parser always allows an implicit start and ignores it.
+        """
+        del starts_open
         _, start, after_start = text.partition(self.start_token)
         candidate = after_start if start else text
         if self.end_token not in candidate:
@@ -154,7 +164,13 @@ class MuseGlimmerReasoningParser(ReasoningParser):
             text = text.partition(_MUSE_MESSAGE_START)[2]
         return text.removesuffix(_MUSE_END)
 
-    def extract(self, text: str) -> Tuple[Optional[str], Optional[str]]:
+    def extract(
+        self,
+        text: str,
+        *,
+        starts_open: Optional[bool] = None
+    ) -> Tuple[Optional[str], Optional[str]]:
+        del starts_open
         if text.startswith(self.start_token):
             candidate = text[len(self.start_token):]
         elif self.start_token in text:
@@ -285,9 +301,20 @@ class Gemma4ReasoningParser(ReasoningParser):
     def __init__(self) -> None:
         super().__init__(_GEMMA4_CHANNEL_START, _GEMMA4_CHANNEL_END)
 
-    def extract(self, text: str) -> Tuple[Optional[str], Optional[str]]:
+    def extract(
+        self,
+        text: str,
+        *,
+        starts_open: Optional[bool] = None
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Without a prompt hint, a closing marker before any opening one
+        means the prompt opened the block."""
         if text.startswith(self.start_token):
             body = _strip_gemma4_header(text[len(self.start_token):])
+        elif starts_open:
+            body = text
+        elif starts_open is False:
+            return None, text or None
         else:
             end = text.find(self.end_token)
             start = text.find(self.start_token)
