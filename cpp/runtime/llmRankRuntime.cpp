@@ -3345,6 +3345,15 @@ bool LLMRankRuntime::runBaseModelPrefill(
         mGemma4Ple->reshapeOutputsTokenMajor(batch.shape.physicalTokens);
     }
     mPipelineIO->uploadRaggedMetadata(batch, context.stream);
+    if (mDeployment.base.compactedPrefillHidden && !mPipelineIO->specDecodePositionIds.isEmpty())
+    {
+        // The compacted base gathers attention_position_ids at its selected prefill rows, and the RoPE kernel reads
+        // -1 there as tree padding, so the binding must hold this step's positions, not the last verify step's.
+        int64_t const tokens = batch.shape.physicalTokens;
+        check::check(mPipelineIO->specDecodePositionIds.reshape({tokens}), "Prefill position-ID reshape failed");
+        CUDA_CHECK(cudaMemcpyAsync(mPipelineIO->specDecodePositionIds.rawPointer(), mPipelineIO->positions.rawPointer(),
+            static_cast<size_t>(tokens) * sizeof(int32_t), cudaMemcpyDeviceToDevice, context.stream));
+    }
     mSharedResources->cacheManagers[0]->materializeExecutionLengths(mPipelineIO->pastLengths, context.stream);
     if (mDeployment.base.ropeConfig.type == RopeType::kMRope)
     {
@@ -3368,7 +3377,9 @@ bool LLMRankRuntime::runBaseModelPrefill(
         "Ragged input embedding reshape failed");
     if (mDeployment.specConfig.has_value())
     {
-        check::check(mPipelineIO->baseHiddenStates.reshape({batch.shape.physicalTokens, baseOutputHiddenDim}),
+        int64_t const hiddenRows
+            = mDeployment.base.compactedPrefillHidden ? batch.shape.numSequences : batch.shape.physicalTokens;
+        check::check(mPipelineIO->baseHiddenStates.reshape({hiddenRows, baseOutputHiddenDim}),
             "Ragged base hidden-state output reshape failed");
     }
     check::check(mPipelineIO->outputHiddenStates.isEmpty()

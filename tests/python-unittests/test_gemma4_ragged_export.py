@@ -325,15 +325,186 @@ def test_gemma4_shared_kv_suffix_runs_compacted_rows_on_decode_path(tmp_path):
         assert list(markers[phase_input[0]].dims) == [3]
 
 
-def test_gemma4_shared_kv_compaction_keeps_rows_for_tree_base():
+def test_gemma4_mtp_base_compacts_suffix_to_logits_rows():
     config = _shared_kv_config()
     config.gemma4_mtp_base = True
-    spec = Gemma4ForCausalLM(config).onnx_export_spec()
+    model = Gemma4ForCausalLM(config)
+    spec = model.onnx_export_spec()
     logits, hidden_states, *_ = spec.wrapped(*spec.args)
     args = dict(zip(spec.input_names, spec.args))
 
+    assert model.emits_compacted_mtp_prefill_hidden
     assert logits.shape[0] == args["logits_indices"].shape[0]
+    assert hidden_states.shape[0] == args["logits_indices"].shape[0]
+
+
+def test_gemma4_mtp_base_suffix_runs_verify_path_in_onnx(tmp_path):
+    config = _shared_kv_config()
+    config.gemma4_mtp_base = True
+    output = tmp_path / "gemma4-mtp-base-compact.onnx"
+    _export_model(Gemma4ForCausalLM(config), str(output), optimize=False)
+    graph = onnx.load(str(output), load_external_data=False).graph
+    attention_nodes = [
+        node for node in graph.node if node.op_type == "AttentionPlugin"
+    ]
+    markers = {init.name: init for init in graph.initializer}
+
+    for node in attention_nodes[2:]:
+        phase_input = [name for name in node.input if name in markers]
+        assert len(phase_input) == 1
+        assert list(markers[phase_input[0]].dims) == [5]
+    # The context/verify switch comes from a shape, not a reduction over the
+    # carrier, which is empty in the decode profile.
+    assert not any(node.op_type == "ReduceSum" for node in graph.node)
+    assert sum(node.op_type == "Where" for node in graph.node) == 4
+
+
+def test_gemma4_mtp_base_without_shared_kv_layers_keeps_every_row():
+    config = _config()
+    config.gemma4_mtp_base = True
+    model = Gemma4ForCausalLM(config)
+    spec = model.onnx_export_spec()
+    _, hidden_states, *_ = spec.wrapped(*spec.args)
+    args = dict(zip(spec.input_names, spec.args))
+
+    assert not model.emits_compacted_mtp_prefill_hidden
     assert hidden_states.shape[0] == args["inputs_embeds"].shape[0]
+
+
+def _capture_suffix_metadata(monkeypatch, model):
+    calls = {}
+    first_shared = model.model.first_kv_shared_layer
+    for index, layer in enumerate(model.model.layers):
+
+        def fake_forward_ragged(hidden_states,
+                                past_key_value,
+                                rope,
+                                positions,
+                                query_start_offsets,
+                                query_lengths,
+                                past_lengths,
+                                attention_sequence_lengths,
+                                state_indices,
+                                execution_phase_marker,
+                                context_sequence_count_carrier,
+                                kv_page_table,
+                                index=index,
+                                **kwargs):
+            calls[index] = dict(
+                rows=hidden_states.shape[0],
+                rope_rows=rope.shape[0],
+                query_start_offsets=query_start_offsets.tolist(),
+                query_lengths=query_lengths.tolist(),
+                past_lengths=past_lengths.tolist(),
+                attention_sequence_lengths=attention_sequence_lengths.tolist(),
+                phase=execution_phase_marker.shape[0],
+                context_sequences=context_sequence_count_carrier.shape[0],
+                mask=kwargs["packed_attention_mask"].tolist(),
+                position_ids=kwargs["attention_position_ids"].tolist(),
+                shared_key_value=kwargs.get("shared_key_value"))
+            current = None if index >= first_shared else (hidden_states,
+                                                          hidden_states)
+            return hidden_states, past_key_value, current
+
+        monkeypatch.setattr(layer, "forward_ragged", fake_forward_ragged)
+    return calls
+
+
+def _mtp_base_step(model, query_lengths, past_lengths, context_sequences,
+                   logits_indices, mask):
+    config = model.config
+    spec = model.onnx_export_spec()
+    args = dict(zip(spec.input_names, spec.args))
+    tokens = sum(query_lengths)
+    sequences = len(query_lengths)
+    offsets = [0]
+    for length in query_lengths:
+        offsets.append(offsets[-1] + length)
+    positions = [
+        past + i for past, length in zip(past_lengths, query_lengths)
+        for i in range(length)
+    ]
+    args["inputs_embeds"] = torch.randn(tokens,
+                                        config.hidden_size,
+                                        dtype=torch.float16)
+    for i in range(config.num_hidden_layers):
+        args[f"ple_token_embeds_{i}"] = torch.zeros(
+            tokens, config.hidden_size_per_layer_input, dtype=torch.float16)
+    for name in ("rope_rotary_cos_sin_sliding", "rope_rotary_cos_sin_full"):
+        args[name] = torch.arange(tokens, dtype=torch.float32)[:, None].expand(
+            tokens, args[name].shape[1]).contiguous()
+    args["positions"] = torch.tensor(positions, dtype=torch.int32)
+    args["attention_position_ids"] = torch.tensor(positions, dtype=torch.int32)
+    args["query_start_offsets"] = torch.tensor(offsets, dtype=torch.int32)
+    args["query_lengths"] = torch.tensor(query_lengths, dtype=torch.int32)
+    args["past_lengths"] = torch.tensor(past_lengths, dtype=torch.int32)
+    args["attention_sequence_lengths"] = torch.tensor(
+        [p + q for p, q in zip(past_lengths, query_lengths)],
+        dtype=torch.int32)
+    args["state_indices"] = torch.arange(sequences, dtype=torch.int32)
+    args["execution_phase_marker"] = torch.zeros(1 if context_sequences else 5,
+                                                 dtype=torch.int32)
+    args["context_sequence_count_carrier"] = torch.zeros(context_sequences,
+                                                         dtype=torch.int32)
+    args["kv_page_table"] = torch.zeros(sequences, 2, 2, dtype=torch.int32)
+    args["logits_indices"] = torch.tensor(logits_indices, dtype=torch.int64)
+    args["packed_attention_mask"] = torch.tensor(mask, dtype=torch.int32)
+    args["tree_parent_ids"] = torch.full((tokens, ), -1, dtype=torch.int32)
+    args["tree_depths"] = torch.zeros(tokens, dtype=torch.int32)
+    args["valid_tree_counts"] = torch.tensor(query_lengths, dtype=torch.int32)
+    return spec.wrapped(*[args[name] for name in spec.input_names])
+
+
+def test_gemma4_mtp_base_prefill_runs_one_suffix_row_per_sequence(monkeypatch):
+    config = _shared_kv_config()
+    config.gemma4_mtp_base = True
+    model = Gemma4ForCausalLM(config)
+    calls = _capture_suffix_metadata(monkeypatch, model)
+
+    logits, hidden_states, *_ = _mtp_base_step(model,
+                                               query_lengths=[3, 2],
+                                               past_lengths=[4, 0],
+                                               context_sequences=2,
+                                               logits_indices=[2, 4],
+                                               mask=[[0]] * 5)
+
+    prefix, suffix = calls[1], calls[2]
+    assert prefix["rows"] == 5 and prefix["phase"] == 1
+    assert prefix["query_lengths"] == [3, 2]
+    assert suffix["rows"] == 2 and suffix["rope_rows"] == 2
+    assert suffix["query_start_offsets"] == [0, 1, 2]
+    assert suffix["query_lengths"] == [1, 1]
+    assert suffix["past_lengths"] == [6, 1]
+    assert suffix["attention_sequence_lengths"] == [7, 2]
+    assert suffix["phase"] == 5 and suffix["context_sequences"] == 0
+    assert suffix["mask"] == [[1], [1]]
+    assert suffix["position_ids"] == [6, 1]
+    assert suffix["shared_key_value"] is None
+    assert calls[3]["rows"] == 2
+    assert logits.shape[0] == 2 and hidden_states.shape[0] == 2
+
+
+def test_gemma4_mtp_base_verify_keeps_every_suffix_row(monkeypatch):
+    config = _shared_kv_config()
+    config.gemma4_mtp_base = True
+    model = Gemma4ForCausalLM(config)
+    calls = _capture_suffix_metadata(monkeypatch, model)
+    mask = [[1], [3], [7], [1], [3], [7]]
+
+    logits, hidden_states, *_ = _mtp_base_step(model,
+                                               query_lengths=[3, 3],
+                                               past_lengths=[9, 5],
+                                               context_sequences=0,
+                                               logits_indices=list(range(6)),
+                                               mask=mask)
+
+    prefix, suffix = calls[1], calls[2]
+    for key in ("query_start_offsets", "query_lengths", "past_lengths",
+                "attention_sequence_lengths", "mask", "position_ids"):
+        assert suffix[key] == prefix[key], key
+    assert suffix["rows"] == 6 and suffix["phase"] == 5
+    assert suffix["query_lengths"] == [3, 3]
+    assert logits.shape[0] == 6 and hidden_states.shape[0] == 6
 
 
 def test_gemma4_materializes_suffix_phase_marker_after_meta_init():
@@ -343,7 +514,9 @@ def test_gemma4_materializes_suffix_phase_marker_after_meta_init():
 
     model.materialize_checkpoint_defaults("cpu")
 
-    marker = model.model.suffix_phase_marker
-    assert marker.device.type == "cpu"
-    assert marker.dtype == torch.int32
-    assert tuple(marker.shape) == (3, )
+    for name, length in (("suffix_phase_marker", 3),
+                         ("suffix_verify_phase_marker", 5)):
+        marker = getattr(model.model, name)
+        assert marker.device.type == "cpu"
+        assert marker.dtype == torch.int32
+        assert tuple(marker.shape) == (length, )

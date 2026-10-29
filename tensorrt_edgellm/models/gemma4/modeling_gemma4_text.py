@@ -1719,6 +1719,11 @@ class Gemma4Transformer(nn.Module):
         self.register_buffer("suffix_phase_marker",
                              torch.zeros(3, dtype=torch.int32),
                              persistent=False)
+        # Tree-attention bases (MTP) run the suffix through the verify path
+        # (ExecutionPhase::kSpecTargetVerify) in every phase instead.
+        self.register_buffer("suffix_verify_phase_marker",
+                             torch.zeros(5, dtype=torch.int32),
+                             persistent=False)
         self.norm = Gemma4RMSNorm(config.hidden_size, config.rms_norm_eps)
 
         if self.ple_enabled:
@@ -1992,13 +1997,48 @@ class Gemma4Transformer(nn.Module):
                     # to a different result than the full prefill.
                     vision_block_ids = torch.index_select(
                         vision_block_ids, 0, compact_rows)
-                past_lengths = past_lengths + query_lengths - 1
-                query_lengths = torch.ones_like(query_lengths)
-                query_start_offsets = torch.arange(
+                decode_offsets = torch.arange(
                     query_start_offsets.shape[0],
                     dtype=query_start_offsets.dtype,
                     device=query_start_offsets.device)
-                execution_phase_marker = self.suffix_phase_marker
+                if packed_attention_mask is None:
+                    past_lengths = past_lengths + query_lengths - 1
+                    query_lengths = torch.ones_like(query_lengths)
+                    query_start_offsets = decode_offsets
+                    execution_phase_marker = self.suffix_phase_marker
+                else:
+                    # A tree base selects one row per sequence in context
+                    # phases and every verify row otherwise, so the suffix
+                    # keeps the verify metadata and switches to one query row
+                    # per sequence only when the step is a context step. The
+                    # verify path reads the donor's full cache, which already
+                    # holds this step's K/V, so a single row attends to its
+                    # whole prefix through a one-bit tree mask.
+                    # Taken from the carrier's shape: a reduction over the
+                    # empty decode-profile carrier miscompiles in TensorRT.
+                    is_context = torch.full(
+                        (),
+                        context_sequence_count_carrier.shape[0],
+                        dtype=torch.int32,
+                        device=past_lengths.device) > 0
+                    past_lengths = torch.where(
+                        is_context, past_lengths + query_lengths - 1,
+                        past_lengths)
+                    query_lengths = torch.where(is_context,
+                                                torch.ones_like(query_lengths),
+                                                query_lengths)
+                    query_start_offsets = torch.where(is_context,
+                                                      decode_offsets,
+                                                      query_start_offsets)
+                    selected_mask = torch.index_select(packed_attention_mask,
+                                                       0, compact_rows)
+                    packed_attention_mask = torch.where(
+                        is_context, torch.ones_like(selected_mask),
+                        selected_mask)
+                    if attention_position_ids is not None:
+                        attention_position_ids = torch.index_select(
+                            attention_position_ids, 0, compact_rows)
+                    execution_phase_marker = self.suffix_verify_phase_marker
                 context_sequence_count_carrier = (
                     context_sequence_count_carrier[:0])
             layer_rope = _select_rope_for_layer(layer, rope_rotary_cos_sin,
@@ -2093,12 +2133,29 @@ class Gemma4ForCausalLM(CausalLM):
         """Whether this Gemma4 export uses per-layer embedding inputs."""
         return self.model.ple_enabled
 
+    def _suffix_rows_compactable(self, collect_eagle_hidden_states: bool,
+                                 target_layer_ids) -> bool:
+        return (self.model.first_kv_shared_layer is not None
+                and not collect_eagle_hidden_states and not target_layer_ids
+                and not self.emit_hidden_states
+                and not self.config.is_diffusion_gemma)
+
+    @property
+    def emits_compacted_mtp_prefill_hidden(self) -> bool:
+        """Whether this MTP base emits one prefill hidden row per sequence."""
+        return bool(
+            self.config.gemma4_mtp_base) and self._suffix_rows_compactable(
+                False, None)
+
     def materialize_checkpoint_defaults(self, device: str) -> None:
-        marker = self.model.suffix_phase_marker
-        if marker.device.type == "meta":
-            self.model.suffix_phase_marker = torch.zeros(marker.shape,
-                                                         dtype=marker.dtype,
-                                                         device=device)
+        for name in ("suffix_phase_marker", "suffix_verify_phase_marker"):
+            marker = getattr(self.model, name)
+            if marker.device.type == "meta":
+                setattr(
+                    self.model, name,
+                    torch.zeros(marker.shape,
+                                dtype=marker.dtype,
+                                device=device))
 
     def onnx_export_spec(self) -> OnnxSpec:
         """Return Gemma4-specific ONNX export parameters."""
@@ -2412,15 +2469,17 @@ class Gemma4ForCausalLM(CausalLM):
                 break
         collect_eagle_hidden_states = (self.config.eagle_base
                                        and not target_layer_ids)
-        # Row compaction needs one logits row per sequence, as enforced by
-        # the runtime in validateRuntimeAdapterStep, and no per-row
-        # hidden-state consumer (EAGLE/MTP/DFlash/DSpark bases, tree verify).
+        # Row compaction needs logits_indices to pick one row per sequence in
+        # context phases, as enforced by the runtime in
+        # validateRuntimeAdapterStep, and no per-row hidden-state consumer
+        # (EAGLE/DFlash/DSpark bases). A Gemma 4 MTP base also verifies with
+        # logits_indices covering every row in order, so its suffix carries
+        # all verify rows and its drafter reads the compacted prefill row.
         compact_rows = (
-            logits_indices if self.model.first_kv_shared_layer is not None
-            and packed_attention_mask is None
-            and not collect_eagle_hidden_states and not target_layer_ids
-            and not self.emit_hidden_states and not self.config.gemma4_mtp_base
-            and not self.config.is_diffusion_gemma else None)
+            logits_indices if
+            (packed_attention_mask is None or self.config.gemma4_mtp_base)
+            and self._suffix_rows_compactable(collect_eagle_hidden_states,
+                                              target_layer_ids) else None)
         model_outputs = self.model.forward_ragged(
             inputs_embeds,
             past_key_values,
