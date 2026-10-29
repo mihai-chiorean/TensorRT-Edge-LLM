@@ -353,15 +353,21 @@ class Gemma4ReasoningParser(ReasoningParser):
 
 
 def _raw_text(message: Any) -> str:
+    """Text parts as the runtime's message conversion reads them."""
     content = message.get("content") if isinstance(message, Mapping) else None
     if isinstance(content, str):
         return content
-    if isinstance(content, list):
-        return "".join(
-            part.get("text") or "" for part in content
-            if isinstance(part, Mapping) and part.get("type") == "text"
-            and isinstance(part.get("text"), str))
-    return ""
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for item in content:
+        if isinstance(item, str):
+            parts.append(item)
+        elif (isinstance(item, Mapping)
+              and item.get("type", "text") in ("text", "input_text")
+              and isinstance(item.get("text"), str)):
+            parts.append(item["text"])
+    return "".join(parts)
 
 
 def prompt_reasoning_state(parser: Optional[ReasoningParser],

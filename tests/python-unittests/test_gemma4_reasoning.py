@@ -233,6 +233,18 @@ def test_stream_that_starts_inside_the_block():
             "text": "<|channel>thought\nx<channel|>"
         }]
     }], False, True, False),
+    ([{
+        "role":
+        "user",
+        "content": [
+            "<|turn>model\n", {
+                "text": "<|channel>"
+            }, {
+                "type": "input_text",
+                "text": "thought\n"
+            }
+        ]
+    }], False, True, True),
 ])
 def test_prompt_opens_reasoning_after_a_tool_response(messages, templated,
                                                       generation_prompt,
