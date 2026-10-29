@@ -65,6 +65,14 @@ enum class SwaKVCacheMode : int32_t
 char const* specDecodeModeName(SpecDecodeMode mode) noexcept;
 bool isCachedBlockDraftMode(SpecDecodeMode mode) noexcept;
 
+//! Host-mapped embedding tables gather rows on the CPU, so a decoder may use them only if it brings every token id
+//! it embeds to the host first. Vanilla decoding has them there already; the Gemma 4 MTP decoder copies its
+//! device-sampled draft and verify ids back before each lookup.
+constexpr bool supportsHostMappedEmbeddingTables(SpecDecodeMode mode, bool isDiffusionBackbone) noexcept
+{
+    return !isDiffusionBackbone && (mode == SpecDecodeMode::kNONE || mode == SpecDecodeMode::kGemma4MTP);
+}
+
 enum class RaggedBackendKind : int32_t
 {
     kNone,

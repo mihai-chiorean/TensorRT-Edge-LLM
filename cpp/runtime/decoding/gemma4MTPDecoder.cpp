@@ -158,6 +158,14 @@ Gemma4MTPDecoder::Gemma4MTPDecoder(DecodingRuntimeContext& runtime, SpecDecodeDr
         "Gemma4MTP::hostAcceptedTokenIds");
     mArgmaxScratch = Tensor(
         {maxRuntimeBatchSize * maxAcceptDepth}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "Gemma4MTP::argmax");
+    bool const pleHostResident = mRuntime.preprocess.gemma4Ple && mRuntime.preprocess.gemma4Ple->isHostResident();
+    if (mRuntime.preprocess.embedding.isHostResident() || pleHostResident)
+    {
+        mHostDraftStepTokenIds = Tensor(
+            {maxRuntimeBatchSize}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "Gemma4MTP::hostDraftStepTokenIds");
+        mHostVerifyTokenIds = Tensor({maxRuntimeBatchSize, std::max(draftingConfig.verifySize, maxAcceptDepth)},
+            DeviceType::kCPU, nvinfer1::DataType::kINT32, "Gemma4MTP::hostVerifyTokenIds");
+    }
 
     if (mUseTree)
     {
@@ -477,8 +485,7 @@ bool Gemma4MTPDecoder::prepareSeed(DecodingInferenceContext& context)
     CUDA_CHECK(cudaMemcpyAsync(mRuntime.preprocess.idsInput.rawPointer(), hostSeedTokens,
         activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
 
-    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
-        mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
+    embedTokens(mRuntime.preprocess.idsInput, hostSeedTokens, context.stream);
 
     Tensor& sourceHiddenStates = mRuntime.base.pipelineIO.baseHiddenStates;
     Coords const sourceShape = sourceHiddenStates.getShape();
@@ -619,9 +626,11 @@ bool Gemma4MTPDecoder::runAssistantDraftChain(DecodingInferenceContext& context)
 
         if (step + 1 < draftingStep)
         {
-            kernel::embeddingLookup(mRuntime.sampling.indices, mRuntime.preprocess.embedding.table,
-                mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds,
-                context.stream);
+            int32_t const* const hostIds = mRuntime.preprocess.embedding.isHostResident()
+                ? tokenIdsForHostTables(
+                      mRuntime.sampling.indices, activeBatchSize, mHostDraftStepTokenIds, context.stream)
+                : nullptr;
+            embedTokens(mRuntime.sampling.indices, hostIds, context.stream);
             CUDA_CHECK(cudaMemcpyAsync(mRuntime.base.pipelineIO.draftHiddenStatesIn.rawPointer(),
                 mRuntime.base.pipelineIO.draftHiddenStatesOut.rawPointer(),
                 activeBatchSize * baseHiddenSize
@@ -713,16 +722,11 @@ bool Gemma4MTPDecoder::runBaseVerification(DecodingInferenceContext& context)
         }
     }
 
-    check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape(
-                     {activeBatchSize, verifySize, mRuntime.deployment.base.hiddenSize}),
-        "Tensor reshape failed");
-    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
-        mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
     if (mRuntime.deployment.base.pleEnabled)
     {
         check::check(mRuntime.preprocess.gemma4Ple,
             "Gemma4 MTP base config has PLE enabled but the Gemma4 PLE preprocessor is missing.");
-        mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, nullptr, context.stream);
+        mRuntime.preprocess.gemma4Ple->reshapeOutputsTokenMajor(activeBatchSize * verifySize);
     }
     check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape(
                      {activeBatchSize * verifySize, mRuntime.deployment.base.hiddenSize}),
@@ -763,6 +767,21 @@ bool Gemma4MTPDecoder::runBaseVerification(DecodingInferenceContext& context)
         = mRuntime.base.executor.prepare(kDecodeProfile, verifyDims, mRuntime.base.tensorMap, context.stream);
     if (verifySuccess)
     {
+        // The lookups follow the CPU-side preparation above because with host-mapped tables they wait for the
+        // draft chain to finish; preparing first keeps that work off the critical path.
+        check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape(
+                         {activeBatchSize, verifySize, mRuntime.deployment.base.hiddenSize}),
+            "Tensor reshape failed");
+        int32_t const* const hostVerifyIds = tokenIdsForHostTables(
+            mRuntime.preprocess.idsInput, activeBatchSize * verifySize, mHostVerifyTokenIds, context.stream);
+        embedTokens(mRuntime.preprocess.idsInput, hostVerifyIds, context.stream);
+        if (mRuntime.deployment.base.pleEnabled)
+        {
+            mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, hostVerifyIds, context.stream);
+        }
+        check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape(
+                         {activeBatchSize * verifySize, mRuntime.deployment.base.hiddenSize}),
+            "Tensor reshape failed");
         verifySuccess = mRuntime.base.executor.execute(context.stream);
     }
     if (!verifySuccess)
@@ -890,6 +909,25 @@ bool Gemma4MTPDecoder::acceptAndCommit(DecodingInferenceContext& context)
     }
 
     return true;
+}
+
+int32_t const* Gemma4MTPDecoder::tokenIdsForHostTables(
+    Tensor const& deviceIds, int64_t count, Tensor& hostIds, cudaStream_t stream)
+{
+    // A host-mapped gather reads the ids on the CPU, so each lookup of device-sampled ids costs one stream sync.
+    return hostIds.isEmpty() ? nullptr : decoder_utils::copyTokenIdsToHost(deviceIds, count, hostIds, stream);
+}
+
+void Gemma4MTPDecoder::embedTokens(Tensor const& tokenIds, int32_t const* hostIds, cudaStream_t stream)
+{
+    if (mRuntime.preprocess.embedding.isHostResident())
+    {
+        mRuntime.preprocess.embeddingPreprocessor.embed(
+            tokenIds, hostIds, std::nullopt, std::nullopt, mRuntime.base.pipelineIO, stream);
+        return;
+    }
+    kernel::embeddingLookup(tokenIds, mRuntime.preprocess.embedding.table,
+        mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, stream);
 }
 
 bool Gemma4MTPDecoder::updateNextSeed(DecodingInferenceContext&)

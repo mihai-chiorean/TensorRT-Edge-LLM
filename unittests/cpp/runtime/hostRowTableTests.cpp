@@ -17,8 +17,12 @@
 
 #include "common/cudaUtils.h"
 #include "common/safetensorsUtils.h"
+#include "kernels/embeddingKernels/embeddingKernels.h"
+#include "runtime/decoding/decoderUtils.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/preprocess/embeddingPreprocessor.h"
 #include "runtime/preprocess/hostRowTable.h"
+#include "runtime/state/pipelineIO.h"
 #include "testUtils.h"
 
 #include <cuda_runtime.h>
@@ -203,5 +207,64 @@ TEST(HostRowTableTest, MapEmbeddingTableValidatesContract)
     EXPECT_FALSE(embedding.scalesAsOptional().has_value());
     EXPECT_EQ(embedding.hostTable->rows(), kRows);
     EXPECT_EQ(embedding.hostTable->scalesPerRow(), 1);
+    std::filesystem::remove_all(dir);
+}
+
+// Speculative decoders sample ids on the device. Copied back to the host, they must embed to exactly the rows a
+// device-resident table produces for the same device ids.
+TEST(HostRowTableTest, DeviceSampledIdsCopiedToHostEmbedLikeTheDeviceTable)
+{
+    constexpr int32_t kHidden = 64;
+    auto const dir = std::filesystem::temp_directory_path() / "trt_edgellm_device_sampled_host_lookup_test";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    std::vector<rt::Tensor> tensors;
+    tensors.emplace_back(rt::Coords{kRows, kHidden}, rt::DeviceType::kCPU, DataType::kINT8, "embedding");
+    auto* table = tensors.back().dataPointer<int8_t>();
+    for (int32_t idx = 0; idx < kRows * kHidden; ++idx)
+    {
+        table[idx] = static_cast<int8_t>((idx * 37) % 251 - 125);
+    }
+    tensors.emplace_back(rt::Coords{kRows}, rt::DeviceType::kCPU, DataType::kFLOAT, "embedding_scale");
+    for (int32_t row = 0; row < kRows; ++row)
+    {
+        tensors.back().dataPointer<float>()[row] = 0.0625F * static_cast<float>(row + 1);
+    }
+    auto const file = dir / "embedding.safetensors";
+    ASSERT_TRUE(rt::safetensors::saveSafetensors(file, tensors, nullptr));
+
+    cudaStream_t stream{};
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    rt::EmbeddingData const deviceEmbedding = rt::loadEmbeddingTable(file, stream);
+    rt::EmbeddingData const hostEmbedding = rt::mapEmbeddingTable(file);
+    rt::LLMEngineConfig config{};
+    config.hiddenSize = kHidden;
+    config.maxPhysicalTokens = 8;
+    config.imageTokenId = -1;
+    config.audioTokenId = -1;
+    rt::EmbeddingPreprocessor preprocessor(hostEmbedding, config);
+
+    std::vector<int32_t> const sampled{4, 0, 3, 3};
+    int64_t const count = static_cast<int64_t>(sampled.size());
+    rt::Tensor deviceIds(rt::Coords{count, 1}, rt::DeviceType::kGPU, DataType::kINT32, "deviceIds");
+    CUDA_CHECK(cudaMemcpyAsync(
+        deviceIds.rawPointer(), sampled.data(), sampled.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    rt::Tensor hostIds(rt::Coords{config.maxPhysicalTokens}, rt::DeviceType::kCPU, DataType::kINT32, "hostIds");
+    int32_t const* const copied = rt::decoder_utils::copyTokenIdsToHost(deviceIds, count, hostIds, stream);
+    ASSERT_EQ(std::vector<int32_t>(copied, copied + count), sampled);
+
+    rt::Tensor expected(rt::Coords{count, kHidden}, rt::DeviceType::kGPU, DataType::kHALF, "expected");
+    kernel::embeddingLookup(deviceIds, deviceEmbedding.table, deviceEmbedding.scalesAsOptional(), expected, stream);
+    rt::PipelineIO io{};
+    io.inputsEmbeds = rt::Tensor(rt::Coords{count, kHidden}, rt::DeviceType::kGPU, DataType::kHALF, "inputsEmbeds");
+    preprocessor.embed(deviceIds, copied, std::nullopt, std::nullopt, io, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    auto const expectedRows = copyDeviceToHost<uint16_t>(expected);
+    auto const stagedRows = copyDeviceToHost<uint16_t>(io.inputsEmbeds);
+    EXPECT_EQ(stagedRows, expectedRows);
+
+    EXPECT_THROW(rt::decoder_utils::copyTokenIdsToHost(deviceIds, count + 1, hostIds, stream), std::runtime_error);
+    CUDA_CHECK(cudaStreamDestroy(stream));
     std::filesystem::remove_all(dir);
 }

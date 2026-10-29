@@ -202,6 +202,21 @@ void appendSampledTokens(DecodingInferenceContext& context, int32_t const* sampl
     }
 }
 
+int32_t const* copyTokenIdsToHost(Tensor const& deviceIds, int64_t count, Tensor& hostIds, cudaStream_t stream)
+{
+    ELLM_CHECK(deviceIds.getDeviceType() == DeviceType::kGPU && hostIds.getDeviceType() == DeviceType::kCPU
+            && deviceIds.getDataType() == nvinfer1::DataType::kINT32
+            && hostIds.getDataType() == nvinfer1::DataType::kINT32,
+        "copyTokenIdsToHost copies INT32 ids from a device tensor into a pinned host tensor");
+    ELLM_CHECK(count > 0 && count <= deviceIds.getShape().volume()
+            && count * static_cast<int64_t>(sizeof(int32_t)) <= hostIds.getMemoryCapacity(),
+        "copyTokenIdsToHost count " + std::to_string(count) + " exceeds its source or destination");
+    CUDA_CHECK(cudaMemcpyAsync(hostIds.rawPointer(), deviceIds.rawPointer(),
+        static_cast<size_t>(count) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return hostIds.dataPointer<int32_t>();
+}
+
 void appendAcceptedTokens(DecodingInferenceContext& context, Tensor& hostAcceptLengths, Tensor& hostAcceptedTokenIds,
     Tensor const& deviceAcceptLength, Tensor const& deviceAcceptedTokenIds, int32_t maxAcceptDepth,
     tokenizer::Tokenizer const& tokenizer, cudaStream_t stream, int32_t proposedDraftsPerRound,

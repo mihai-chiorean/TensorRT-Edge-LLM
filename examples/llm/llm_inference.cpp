@@ -422,8 +422,9 @@ void printUsage(char const* programName)
     std::cerr << "\nMemory Options:" << std::endl;
     std::cerr << "  --hostEmbeddingTables     Keep the token-embedding and PLE sidecars mapped in host memory and"
               << std::endl;
-    std::cerr << "                            gather rows on the CPU each step (vanilla decoding, single rank)"
+    std::cerr << "                            gather rows on the CPU each step (vanilla or Gemma 4 MTP decoding, single"
               << std::endl;
+    std::cerr << "                            rank)" << std::endl;
     std::cerr << "\nContext Reuse Options:" << std::endl;
     std::cerr << "  --enable-context-reuse         Enable process-local content-addressed context reuse" << std::endl;
     std::cerr << "  --context-cache-max-records    Maximum retained context records (default: 1024)" << std::endl;
