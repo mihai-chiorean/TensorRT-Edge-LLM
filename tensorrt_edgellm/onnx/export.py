@@ -85,6 +85,8 @@ def export_onnx(
     config_filename: str = "config.json",
     write_shared_artifacts: bool = True,
     fp8_ple: bool = False,
+    *,
+    int8_embedding: bool = False,
 ) -> None:
     """Export *model* to ONNX using the dynamo exporter.
 
@@ -115,6 +117,8 @@ def export_onnx(
                                 redundant rewrites of identical sidecar files.
         fp8_ple: Quantize the Gemma4 or Qwen4-Exp PLE table to per-tensor
                  FP8 at export time.
+        int8_embedding: Write embedding.safetensors as symmetric INT8 with one
+                        FP32 scale per row.
     """
     out_dir = os.path.dirname(os.path.abspath(output_path))
     os.makedirs(out_dir, exist_ok=True)
@@ -140,6 +144,7 @@ def export_onnx(
                             model_dir,
                             out_dir,
                             fp8_embedding=fp8_embedding,
+                            int8_embedding=int8_embedding,
                             reduced_vocab_dir=reduced_vocab_dir,
                             config_filename=config_filename,
                             write_shared_artifacts=write_shared_artifacts)

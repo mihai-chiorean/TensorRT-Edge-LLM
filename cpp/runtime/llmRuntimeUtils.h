@@ -510,11 +510,12 @@ inline constexpr char const* kFp8EmbeddingScaleTensorName = "embedding_scale";
 inline constexpr char const* kNvfp4EmbeddingBlockScaleTensorName = "embedding_block_scale";
 inline constexpr char const* kNvfp4EmbeddingMultiplierScaleTensorName = "embedding_multiplier_scale";
 
-/*! \brief Embedding data - supports FP16, FP8, and packed NVFP4 formats
+/*! \brief Embedding data - supports FP16, FP8, INT8, and packed NVFP4 formats
  *
- *  The table datatype determines the FP16/FP8 formats. NVFP4 uses the descriptor:
+ *  The table datatype determines the FP16/FP8/INT8 formats. NVFP4 uses the descriptor:
  *  - FP16: table is FP16, tableScalingFactor is empty
  *  - FP8: table is FP8 (E4M3), tableScalingFactor contains FP32 per-group scales
+ *  - INT8: table is signed INT8, tableScalingFactor contains one FP32 scale per row
  *  - NVFP4: table is packed U8 and tableScalingFactor contains FP8 E4M3 block scales
  *
  *  Packed formats never infer their logical hidden width from the physical table shape.
@@ -522,7 +523,7 @@ inline constexpr char const* kNvfp4EmbeddingMultiplierScaleTensorName = "embeddi
 struct EmbeddingData
 {
     rt::Tensor table;              //!< Physical embedding table.
-    rt::Tensor tableScalingFactor; //!< FP32 scales for FP8 or FP8 E4M3 block scales for NVFP4.
+    rt::Tensor tableScalingFactor; //!< FP32 scales for FP8 and INT8, FP8 E4M3 block scales for NVFP4.
     kernel::EmbeddingTableDescriptor descriptor;
 
     //! \brief Returns scales as OptionalInputTensor (std::nullopt for FP16, a reference otherwise)
@@ -536,6 +537,7 @@ struct EmbeddingData
  *
  *  Loads embedding.safetensors and detects format by checking the "embedding" tensor dtype:
  *  - FP8: loads "embedding" (FP8) + "embedding_scale" (FP32)
+ *  - INT8: loads "embedding" (INT8) + "embedding_scale" (FP32 [vocabSize])
  *  - FP16: loads "embedding" (FP16)
  *  - NVFP4: requires descriptor metadata and loads a packed U8 table, FP8 block scales,
  *            and a normalized FP32 multiplier scale

@@ -319,6 +319,9 @@ def run_checkpoint_export(
         if config.fp8_embedding:
             extra_args.append("--fp8-embedding")
             label += " (FP8 embedding)"
+        if config.int8_embedding:
+            extra_args.append("--int8-embedding")
+            label += " (INT8 embedding)"
         if config.target_sm is not None:
             extra_args.extend(("--target-sm", str(config.target_sm)))
         if config.reduced_vocab_size:

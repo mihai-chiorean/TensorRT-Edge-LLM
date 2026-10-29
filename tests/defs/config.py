@@ -666,6 +666,8 @@ class TestConfig:
     # Quantize-time embedding tables (``tensorrt-edgellm-quantize llm``).
     token_embedding_precision: Optional[str] = None  # "fp8" or "nvfp4"
     ple_embedding_precision: Optional[str] = None  # "fp8"
+    int8_embedding: Optional[
+        bool] = None  # If true, write runtime embedding sidecars in INT8 format
 
     # Benchmark parameters
     batch_size: Optional[int] = None
@@ -791,6 +793,13 @@ class TestConfig:
                           TaskType.INFERENCE, TaskType.KERNEL_BENCH
                       }, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
+        ParameterSpec(
+            "int8_embedding",
+            "int8emb", {
+                TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
+                TaskType.INFERENCE
+            }, {ModelType.LLM, ModelType.VLM, ModelType.ASR, ModelType.OMNI},
+            is_required=False),
         ParameterSpec(
             "is_eagle",
             "eagle", {
@@ -1225,6 +1234,8 @@ class TestConfig:
                 parsed_params['token_embedding_precision'] = part[6:]
             elif part == "plefp8":
                 parsed_params['ple_embedding_precision'] = part[3:]
+            elif part == "int8emb":
+                parsed_params['int8_embedding'] = True
             elif part == "mtp":
                 parsed_params['is_mtp'] = True
                 parsed_params['is_eagle'] = True
@@ -1732,6 +1743,8 @@ class TestConfig:
             model_id += f"-TOKEMB{self.token_embedding_precision.upper()}"
         if self.ple_embedding_precision:
             model_id += f"-PLE{self.ple_embedding_precision.upper()}"
+        if self.int8_embedding:
+            model_id += "-INT8-EMB"
         if self.reduced_vocab_size:
             model_id += f"-rvs{self.reduced_vocab_size}"
         if self.trt_native_attn:
@@ -2443,6 +2456,8 @@ class TestConfig:
             onnx_model_id += f"-tokemb{self.token_embedding_precision}"
         if self.ple_embedding_precision:
             onnx_model_id += f"-ple{self.ple_embedding_precision}"
+        if self.int8_embedding:
+            onnx_model_id += "-int8emb"
         if self.reduced_vocab_size:
             onnx_model_id += f"-rvs{self.reduced_vocab_size}"
         if self.nvfp4_moe_target:

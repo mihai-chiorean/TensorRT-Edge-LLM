@@ -32,6 +32,7 @@ enum class EmbeddingTableFormat
     kFP16,
     kFP8,
     kNVFP4,
+    kINT8,
 };
 
 //! \brief Describes the physical representation of an embedding table.
@@ -51,19 +52,20 @@ struct EmbeddingTableDescriptor
     float modelOutputScale{1.0F};
 };
 
-//! \brief Embedding lookup for all modalities (supports FP16, FP8, and packed NVFP4 tables).
+//! \brief Embedding lookup for all modalities (supports FP16, FP8, INT8, and packed NVFP4 tables).
 //!
 //! Produces input embeddings for a batch of token ids. Text tokens are looked up from the embedding
 //! table. When image and/or audio embeddings are supplied (prefill), positions whose token id equals
 //! imageTokenId / audioTokenId are filled from imageEmbeds / audioEmbeds, selected by multimodalIndices;
 //! with no image/audio inputs (decode) it performs a pure text lookup. Automatically dispatches to the
-//! FP16 or FP8 implementation based on the embedding table's datatype. Packed NVFP4 requires an
-//! explicit descriptor because its physical byte width is half its logical hidden width.
+//! FP16, FP8, or INT8 implementation based on the embedding table's datatype. FP8 tables dequantize with
+//! per-group scales, INT8 tables with one scale per vocabulary row. Packed NVFP4 requires an explicit
+//! descriptor because its physical byte width is half its logical hidden width.
 //!
 //! \param[in] inputIds Input token IDs with shape [batchSize, seqLen]
-//! \param[in] embeddingTable Text embedding table with shape [vocabSize, hiddenSize] (FP16 or FP8)
-//! \param[in] scales FP32 per-group scales with shape [vocabSize / rowBlockSize, hiddenSize / blockSize];
-//!                   required when embeddingTable is FP8, std::nullopt for FP16
+//! \param[in] embeddingTable Text embedding table with shape [vocabSize, hiddenSize] (FP16, FP8, or INT8)
+//! \param[in] scales FP32 scales: [vocabSize / rowBlockSize, hiddenSize / blockSize] for FP8, [vocabSize] for
+//!                   INT8, std::nullopt for FP16
 //! \param[out] output Hidden states with shape [batchSize, seqLen, hiddenSize]
 //! \param[in] stream CUDA stream for execution
 //! \param[in] multimodalIndices Per-position indices into imageEmbeds/audioEmbeds [batchSize, seqLen];

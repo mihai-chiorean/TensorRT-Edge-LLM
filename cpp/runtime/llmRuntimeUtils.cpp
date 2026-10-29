@@ -954,7 +954,8 @@ EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cud
 
     EmbeddingData result;
 
-    if (embeddingPtr->getDataType() == trt_edgellm::DataType::kFP8)
+    auto const dtype = embeddingPtr->getDataType();
+    if (dtype == trt_edgellm::DataType::kFP8)
     {
         ELLM_CHECK(scalesPtr != nullptr,
             format::fmtstr("FP8 embedding requires 'embedding_scale' tensor: %s", embeddingPath.string().c_str()));
@@ -981,8 +982,31 @@ EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cud
         result.table = std::move(*embeddingPtr);
         result.tableScalingFactor = std::move(*scalesPtr);
     }
+    else if (dtype == trt_edgellm::DataType::kINT8)
+    {
+        ELLM_CHECK(scalesPtr != nullptr,
+            format::fmtstr("INT8 embedding requires 'embedding_scale' tensor: %s", embeddingPath.string().c_str()));
+        ELLM_CHECK(scalesPtr->getDataType() == trt_edgellm::DataType::kFLOAT,
+            format::fmtstr("embedding_scale must have FP32 dtype, got %d", static_cast<int>(scalesPtr->getDataType())));
+        ELLM_CHECK(scalesPtr->getShape().getNumDims() == 1,
+            format::fmtstr("INT8 embedding_scale must be 1D, got %d dimensions", scalesPtr->getShape().getNumDims()));
+        ELLM_CHECK(scalesPtr->getShape()[0] == vocabSize,
+            format::fmtstr(
+                "Vocab size mismatch: embedding has %ld, scales has %ld", vocabSize, scalesPtr->getShape()[0]));
+
+        LOG_INFO("Loaded INT8 embedding: [%ld, %ld], scales: [%ld]", vocabSize, hiddenSize, vocabSize);
+
+        result.table = std::move(*embeddingPtr);
+        result.tableScalingFactor = std::move(*scalesPtr);
+    }
     else
     {
+        ELLM_CHECK(dtype == trt_edgellm::DataType::kHALF,
+            format::fmtstr("Embedding tensor must be FP16, FP8, or INT8, got dtype %d: %s", static_cast<int>(dtype),
+                embeddingPath.string().c_str()));
+        ELLM_CHECK(scalesPtr == nullptr,
+            format::fmtstr(
+                "FP16 embedding must not have an 'embedding_scale' tensor: %s", embeddingPath.string().c_str()));
         LOG_INFO("Loaded FP16 embedding: [%ld, %ld]", vocabSize, hiddenSize);
 
         result.table = std::move(*embeddingPtr);

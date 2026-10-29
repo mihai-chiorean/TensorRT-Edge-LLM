@@ -1153,7 +1153,9 @@ def _export_llm(model_dir: str,
                 num_decoder_layers: "int | None" = None,
                 skip_softmax: "SkipSoftmaxDeployment | None" = None,
                 quantization_override: "str | None" = None,
-                fp8_ple: bool = False) -> None:
+                fp8_ple: bool = False,
+                *,
+                int8_embedding: bool = False) -> None:
     """Export LLM backbone via the standard tensorrt_edgellm pipeline.
 
     When ``tp_size > 1``, exports ``tp_size`` per-rank ONNX files named
@@ -1305,6 +1307,7 @@ def _export_llm(model_dir: str,
                         model_dir=model_dir,
                         fp8_embedding=fp8_embedding,
                         fp8_ple=fp8_ple,
+                        int8_embedding=int8_embedding,
                         reduced_vocab_dir=reduced_vocab_dir,
                         externalize_weights=externalize_weights,
                         config_filename=config_filename,
@@ -1456,7 +1459,9 @@ def _export_diffusion_gemma(model_dir: str,
                             fp8_embedding: bool = False,
                             reduced_vocab_dir: str = "",
                             externalize_weights: "list[str] | None" = None,
-                            tp_size: int = 1) -> None:
+                            tp_size: int = 1,
+                            *,
+                            int8_embedding: bool = False) -> None:
     """Export DiffusionGemma as one unified backbone graph."""
     if tp_size != 1:
         raise SystemExit(
@@ -1508,6 +1513,7 @@ def _export_diffusion_gemma(model_dir: str,
                     backbone_path,
                     model_dir=model_dir,
                     fp8_embedding=fp8_embedding,
+                    int8_embedding=int8_embedding,
                     reduced_vocab_dir=reduced_vocab_dir,
                     externalize_weights=backbone_externalize_weights)
     except (OSError, ValueError, RuntimeError) as exc:
@@ -2059,10 +2065,12 @@ def _patch_dflash_mask_embedding(llm_out_dir: str,
 
     with safe_open(emb_path, framework="pt", device="cpu") as f:
         if "embedding_scale" in set(f.keys()):
+            flag = ("--int8-embedding" if f.get_slice("embedding").get_dtype()
+                    == "I8" else "--fp8-embedding")
             raise ValueError(
-                label + " mask-embedding fold does not support FP8 "
-                "embedding.safetensors; re-export the base without "
-                "--fp8-embedding.")
+                label + " mask-embedding fold does not support a quantized "
+                "embedding.safetensors; re-export the base without " + flag +
+                ".")
         weight = f.get_tensor("embedding")
 
     patched_row = (draft_vec * embedding_scale).to(weight.dtype)
@@ -4656,7 +4664,8 @@ def main(argv=None, *, prog="tensorrt-edgellm-export") -> None:
               "the dense lm_head instead: the draft emits full-vocabulary "
               "logits and an identity d2t.safetensors."),
     )
-    p.add_argument(
+    embedding_group = p.add_mutually_exclusive_group()
+    embedding_group.add_argument(
         "--fp8-embedding",
         "--fp8_embedding",
         dest="fp8_embedding",
@@ -4669,6 +4678,14 @@ def main(argv=None, *, prog="tensorrt-edgellm-export") -> None:
         action="store_true",
         help=
         "Write a per-tensor FP8 Gemma4 or Qwen4-Exp PLE table beside the ONNX artifacts.",
+    )
+    embedding_group.add_argument(
+        "--int8-embedding",
+        "--int8_embedding",
+        dest="int8_embedding",
+        action="store_true",
+        help=("Write embedding.safetensors in symmetric INT8 format with one "
+              "FP32 scale per row."),
     )
     p.add_argument(
         "--reduced-vocab-dir",
@@ -5075,6 +5092,10 @@ def main(argv=None, *, prog="tensorrt-edgellm-export") -> None:
         except ValueError as exc:
             p.error(str(exc))
 
+    if args.int8_embedding and model_type.startswith("qwen3_omni"):
+        p.error("--int8-embedding is not supported by Qwen3-Omni talker "
+                "runtimes")
+
     # Cosmos3-Edge checkpoints carry two model families that run on DIFFERENT
     # runtime paths; ``--task`` selects which artifact set this invocation
     # exports (both by default):
@@ -5121,7 +5142,8 @@ def main(argv=None, *, prog="tensorrt-edgellm-export") -> None:
                 _export_llm(model_dir,
                             os.path.join(args.output_dir, "llm"),
                             model_type="cosmos3_edge",
-                            skip_softmax=skip_softmax)
+                            skip_softmax=skip_softmax,
+                            int8_embedding=args.int8_embedding)
             # SigLIP2 ViT + PatchMerger -> visual/ for the standard
             # visual_build + multimodal runtime. The vision tower is read
             # directly from its checkpoint shards (the root index maps it to
@@ -5373,6 +5395,8 @@ def main(argv=None, *, prog="tensorrt-edgellm-export") -> None:
         logger.info("  %-15s: %s", "visual", "yes" if wants_visual else "no")
         logger.info("FP8 embedding : %s",
                     "yes" if args.fp8_embedding else "no")
+        logger.info("INT8 embedding: %s",
+                    "yes" if args.int8_embedding else "no")
         logger.info("TP size       : %d", args.tp_size)
         logger.info("=" * 60)
         if wants_diffusion_engines:
@@ -5380,6 +5404,7 @@ def main(argv=None, *, prog="tensorrt-edgellm-export") -> None:
                 model_dir,
                 args.output_dir,
                 fp8_embedding=args.fp8_embedding,
+                int8_embedding=args.int8_embedding,
                 reduced_vocab_dir=args.reduced_vocab_dir,
                 externalize_weights=externalize_weights,
                 tp_size=args.tp_size,
@@ -5495,6 +5520,7 @@ def main(argv=None, *, prog="tensorrt-edgellm-export") -> None:
              gemma4_mtp_base=gemma4_mtp_requested,
              fp8_embedding=args.fp8_embedding,
              fp8_ple=args.fp8_ple,
+             int8_embedding=args.int8_embedding,
              reduced_vocab_dir=args.reduced_vocab_dir,
              externalize_weights=externalize_weights,
              tp_size=args.tp_size,
@@ -5574,6 +5600,7 @@ def main(argv=None, *, prog="tensorrt-edgellm-export") -> None:
     for enabled, component, _ in stages:
         logger.info("  %-15s: %s", component, "yes" if enabled else "no")
     logger.info("FP8 embedding : %s", "yes" if args.fp8_embedding else "no")
+    logger.info("INT8 embedding: %s", "yes" if args.int8_embedding else "no")
     logger.info("MTP capable   : %s", "yes" if has_mtp_draft else "no")
     logger.info("MTP export    : %s",
                 "yes" if args.mtp or gemma4_mtp_requested else "no")
@@ -5605,6 +5632,10 @@ def main(argv=None, *, prog="tensorrt-edgellm-export") -> None:
     if args.fp8_embedding and not _has_llm_component(model_type, "thinker"):
         logger.warning(
             "--fp8-embedding is not supported for Talker / CodePredictor; "
+            "using FP16 embeddings.")
+    if args.int8_embedding and not _has_llm_component(model_type, "thinker"):
+        logger.warning(
+            "--int8-embedding is not supported for Talker / CodePredictor; "
             "using FP16 embeddings.")
 
     if (_has_audio(model_type) and not args.skip_audio

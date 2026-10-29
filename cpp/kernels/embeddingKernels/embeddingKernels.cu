@@ -48,6 +48,27 @@ struct Fp16EmbeddingLoader
     }
 };
 
+//! \brief Signed INT8 embedding loader with one FP32 scale per vocabulary row
+struct Int8EmbeddingLoader
+{
+    static constexpr uint32_t vecSize = DVec<half>::vec_size;
+    int8_t const* table{nullptr};
+    float const* scales{nullptr};
+
+    __device__ __forceinline__ void load(int32_t tokenId, int64_t hiddenSize, uint32_t offset, DVec<half>& out) const
+    {
+        // One 8-byte load per 8 outputs; hiddenSize % vecSize == 0 keeps every row offset 8-byte aligned.
+        int2 const packed = *reinterpret_cast<int2 const*>(table + static_cast<int64_t>(tokenId) * hiddenSize + offset);
+        int8_t const* values = reinterpret_cast<int8_t const*>(&packed);
+        float const scale = scales[tokenId];
+#pragma unroll
+        for (uint32_t i = 0; i < vecSize; ++i)
+        {
+            out[i] = __float2half(static_cast<float>(values[i]) * scale);
+        }
+    }
+};
+
 #if SUPPORTS_FP8
 //! \brief FP8 embedding loader with per-group dequantization
 struct Fp8EmbeddingLoader
@@ -686,9 +707,19 @@ static void embeddingLookupImpl(rt::Tensor const& inputIds, rt::Tensor const& em
     int32_t const* multimodalIndicesPtr = hasMultimodal ? multimodalIndices->get().dataPointer<int32_t>() : nullptr;
     half* outputPtr = output.dataPointer<half>();
 
-    EmbeddingTableFormat const format = descriptor != nullptr         ? descriptor->format
-        : embeddingTable.getDataType() == trt_edgellm::DataType::kFP8 ? EmbeddingTableFormat::kFP8
-                                                                      : EmbeddingTableFormat::kFP16;
+    EmbeddingTableFormat format = EmbeddingTableFormat::kFP16;
+    if (descriptor != nullptr)
+    {
+        format = descriptor->format;
+    }
+    else if (embeddingTable.getDataType() == trt_edgellm::DataType::kFP8)
+    {
+        format = EmbeddingTableFormat::kFP8;
+    }
+    else if (embeddingTable.getDataType() == trt_edgellm::DataType::kINT8)
+    {
+        format = EmbeddingTableFormat::kINT8;
+    }
 
     if (format == EmbeddingTableFormat::kNVFP4)
     {
@@ -730,6 +761,23 @@ static void embeddingLookupImpl(rt::Tensor const& inputIds, rt::Tensor const& em
         check::check(
             false, "NVFP4 embedding lookup is unavailable: build does not support FP8 block scales (SUPPORTS_FP8=0)");
 #endif
+    }
+    else if (format == EmbeddingTableFormat::kINT8)
+    {
+        check::check(embeddingTable.getDataType() == trt_edgellm::DataType::kINT8,
+            "INT8 embedding table descriptor requires INT8 storage");
+        check::check(scales.has_value(), "scales must be provided for INT8 embedding table");
+        auto const& scalesTensor = scales.value().get();
+        auto const scaleShape = scalesTensor.getShape();
+
+        check::check(scaleShape.getNumDims() == 1, "INT8 scales must be 1D tensor [vocabSize]");
+        check::check(scaleShape[0] == vocabSize, "INT8 scale rows must match embeddingTable vocab size");
+        check::check(scalesTensor.getDataType() == trt_edgellm::DataType::kFLOAT, "INT8 scales must be FP32");
+
+        Int8EmbeddingLoader loader{embeddingTable.dataPointer<int8_t>(), scalesTensor.dataPointer<float>()};
+        launchEmbeddingLookupKernel(inputIdsPtr, loader, multimodalIndicesPtr, imageTokenIdValue, imageEmbedsPtr,
+            imageTokenLen, audioTokenIdValue, audioEmbedsPtr, audioTokenLen, outputPtr, batchSize, seqLen, vocabSize,
+            hiddenSize, stream);
     }
     else if (format == EmbeddingTableFormat::kFP8)
     {
