@@ -85,6 +85,17 @@ _QWEN_VISUAL_MODEL_TYPES = ("qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_5",
                             "qwen3_omni", "cosmos3_edge_vision")
 
 
+def _context_cache_counters(cc) -> Dict[str, Any]:
+    counters = {
+        field: getattr(cc, field)
+        for field in _CONTEXT_CACHE_COUNTER_FIELDS
+    }
+    for pool in _CONTEXT_CACHE_POOL_FIELDS:
+        gauge = getattr(cc, pool)
+        counters[pool] = {"free": gauge.free, "capacity": gauge.capacity}
+    return counters
+
+
 def _visual_model_family(model_type: str) -> Optional[str]:
     """Server-side media family for a visual model_type; None if unsupported."""
     # Audio-side Qwen3-Omni types share the qwen3_omni prefix with its visual
@@ -2403,23 +2414,32 @@ class LLM:
     def get_context_cache_counters(self):
         """Context-cache counters as a dict for ``/health``, or ``None``.
 
-        ``None`` also on the blocking path: reading the counters there waits
-        for the running request, which a health probe must not do.
+        Never waits for a running request. On the blocking path the last
+        snapshot is returned while a request holds the runtime (``None``
+        before the first read).
         """
         engine = getattr(self, "_engine", None)
-        if engine is None:
+        if engine is not None:
+            cc = engine.context_cache_metrics()
+            return None if cc is None else _context_cache_counters(cc)
+        if (not self.context_cache_enabled or self._closed
+                or self._runtime is None):
             return None
-        cc = engine.context_cache_metrics()
-        if cc is None:
-            return None
-        counters = {
-            field: getattr(cc, field)
-            for field in _CONTEXT_CACHE_COUNTER_FIELDS
-        }
-        for pool in _CONTEXT_CACHE_POOL_FIELDS:
-            gauge = getattr(cc, pool)
-            counters[pool] = {"free": gauge.free, "capacity": gauge.capacity}
-        return counters
+        if not self._infer_lock.acquire(blocking=False):
+            return getattr(self, "_context_cache_snapshot", None)
+        # The snapshot is published under the lock so a slower reader cannot
+        # overwrite newer counters; /health can also race with close().
+        try:
+            runtime = self._runtime
+            if self._closed or runtime is None:
+                return None
+            cc = runtime.get_context_cache_metrics()
+            if cc is None:
+                return None
+            self._context_cache_snapshot = _context_cache_counters(cc)
+            return self._context_cache_snapshot
+        finally:
+            self._infer_lock.release()
 
     @property
     def bundle_layout(self) -> BundleLayout:

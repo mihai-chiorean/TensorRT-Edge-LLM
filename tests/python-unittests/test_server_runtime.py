@@ -831,17 +831,39 @@ def test_ifb_context_cache_counters_do_not_wait_for_the_runtime_lock():
     assert read["counters"]["base_kv_pages"] == {"free": 40, "capacity": 96}
 
 
-def test_health_context_cache_counters_are_absent_on_the_blocking_path():
-    """Given the blocking path, when /health asks for context-cache counters,
-    then it gets None without reading the runtime a running request holds."""
-
-    class Runtime:
-
-        def get_context_cache_metrics(self):
-            raise AssertionError("a health probe must not wait on the runtime")
-
-    llm = _bare_llm(Runtime())
+def _blocking_metrics_llm(native):
+    llm = _bare_llm(SimpleNamespace(get_context_cache_metrics=lambda: native))
     llm._engine = None
+    llm._context_cache_config = SimpleNamespace(enabled=True)
+    return llm
+
+
+def test_blocking_context_cache_counters_do_not_wait_for_a_running_request():
+    """Given the blocking path and a request holding the runtime, when /health
+    asks for context-cache counters, then it gets the last snapshot (None
+    before the first read) without waiting."""
+    native = _NativeCacheMetrics(hit_sequences=1)
+    llm = _blocking_metrics_llm(native)
+    with llm._infer_lock:
+        assert llm.get_context_cache_counters() is None
+    assert llm.get_context_cache_counters()["hit_sequences"] == 1
+    native.hit_sequences = 2
+    with llm._infer_lock:
+        assert llm.get_context_cache_counters()["hit_sequences"] == 1
+    counters = llm.get_context_cache_counters()
+    assert counters["hit_sequences"] == 2
+    assert counters["base_kv_pages"] == {"free": 40, "capacity": 96}
+
+
+def test_blocking_context_cache_counters_are_none_when_closed_or_disabled():
+    llm = _blocking_metrics_llm(_NativeCacheMetrics(hit_sequences=1))
+    assert llm.get_context_cache_counters()["hit_sequences"] == 1
+    # The cached snapshot is served only while the runtime is open.
+    with llm._infer_lock:
+        llm._closed = True
+        assert llm.get_context_cache_counters() is None
+    llm._closed = False
+    llm._context_cache_config = SimpleNamespace(enabled=False)
     assert llm.get_context_cache_counters() is None
 
 
