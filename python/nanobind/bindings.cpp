@@ -1106,7 +1106,8 @@ NB_MODULE(_edgellm_runtime, m)
         .def(py::init<>())
         .def_rw("enabled", &ContextCacheConfig::enabled)
         .def_rw("max_records", &ContextCacheConfig::maxRecords)
-        .def_rw("max_snapshots", &ContextCacheConfig::maxSnapshots);
+        .def_rw("max_snapshots", &ContextCacheConfig::maxSnapshots)
+        .def_rw("encoder_embedding_cache_budget_bytes", &ContextCacheConfig::encoderEmbeddingCacheBudgetBytes);
 
     // ========================================================================
     // Image utilities

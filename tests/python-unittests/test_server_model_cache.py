@@ -404,12 +404,16 @@ class _FakeRuntime:
         return self.kwargs.get("draft_checkpoint_dir") is not None
 
 
+_256_MIB = 256 * 1024 * 1024
+
+
 class _FakeContextCacheConfig:
 
     def __init__(self):
         self.enabled = False
         self.max_records = 0
         self.max_snapshots = 0
+        self.encoder_embedding_cache_budget_bytes = -1
 
 
 class _FakeBindings:
@@ -468,6 +472,8 @@ def test_llm_pairs_cached_bundle_with_resolved_checkpoints(
     assert llm._runtime.kwargs["checkpoint_dir"] == str(base)
     assert llm._runtime.kwargs["draft_checkpoint_dir"] == str(draft)
     assert not llm._runtime.kwargs["context_cache_config"].enabled
+    assert llm._runtime.kwargs[
+        "context_cache_config"].encoder_embedding_cache_budget_bytes == _256_MIB
 
 
 def test_muse_glimmer_dflash2_server_loads_paired_runtime(

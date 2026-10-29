@@ -867,6 +867,8 @@ def _native_context_cache_config(rt, config: ContextCacheConfig):
     native.enabled = config.enabled
     native.max_records = config.max_records
     native.max_snapshots = config.max_snapshots
+    native.encoder_embedding_cache_budget_bytes = (
+        config.encoder_embedding_cache_budget_bytes)
     return native
 
 

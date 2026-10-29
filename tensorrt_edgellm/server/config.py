@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Sequence, Union
 
 _INT32_MAX = 2**31 - 1
+_INT64_MAX = 2**63 - 1
+_DEFAULT_ENCODER_EMBEDDING_CACHE_BUDGET_BYTES = 256 * 1024 * 1024
 
 
 class ServerConfigError(ValueError):
@@ -208,19 +210,29 @@ class ContextCacheConfig:
     max_records: int = 1024
     # Total snapshots on a model with recurrent layers; 0 keeps 4 x max batch size.
     max_snapshots: int = 0
+    # Device budget for the content-addressed ViT/audio encoder output cache.
+    # Independent of `enabled` (the runtime keys it only on media engines);
+    # zero disables the cache.
+    encoder_embedding_cache_budget_bytes: int = (
+        _DEFAULT_ENCODER_EMBEDDING_CACHE_BUDGET_BYTES)
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
             raise ServerConfigError("context_cache.enabled must be boolean")
-        for name in ("max_records", "max_snapshots"):
+        for name, limit, width in (
+            ("max_records", _INT32_MAX, 32),
+            ("max_snapshots", _INT32_MAX, 32),
+            ("encoder_embedding_cache_budget_bytes", _INT64_MAX, 64),
+        ):
             value = getattr(self, name)
             if isinstance(value,
                           bool) or not isinstance(value, int) or value < 0:
                 raise ServerConfigError(
                     f"context_cache.{name} must be a non-negative integer")
-            if value > _INT32_MAX:
+            if value > limit:
                 raise ServerConfigError(
-                    f"context_cache.{name} must fit a signed 32-bit integer")
+                    f"context_cache.{name} must fit a signed {width}-bit integer"
+                )
         if not self.enabled and (self.max_records != 1024
                                  or self.max_snapshots):
             raise ServerConfigError(
@@ -240,7 +252,12 @@ class ContextCacheConfig:
             raise ServerConfigError(
                 "context_cache_config must be a mapping or ContextCacheConfig")
         raw = dict(value)
-        supported = {"enabled", "max_records", "max_snapshots"}
+        supported = {
+            "enabled",
+            "max_records",
+            "max_snapshots",
+            "encoder_embedding_cache_budget_bytes",
+        }
         unsupported = sorted(set(raw) - supported)
         if unsupported:
             raise ServerConfigError("unsupported context-cache keys: " +
@@ -690,6 +707,14 @@ def create_argument_parser(
         default=0,
         help=("Total snapshots kept for context reuse on a model with "
               "recurrent layers (default: 4 x max batch size)"))
+    model.add_argument(
+        "--context-cache-encoder-embedding-budget-bytes",
+        type=_non_negative_int,
+        default=_DEFAULT_ENCODER_EMBEDDING_CACHE_BUDGET_BYTES,
+        help="Device memory budget for the ViT/audio encoder output cache; "
+        "0 disables it. Applies to media engines regardless of "
+        "--enable-context-reuse.",
+    )
     return parser
 
 
@@ -716,6 +741,8 @@ def parse_server_config(argv: Optional[Sequence[str]] = None,
         enabled=args.enable_context_reuse,
         max_records=args.context_cache_max_records,
         max_snapshots=args.context_cache_max_snapshots,
+        encoder_embedding_cache_budget_bytes=(
+            args.context_cache_encoder_embedding_budget_bytes),
     )
     model = ModelConfig(
         model=args.model,
