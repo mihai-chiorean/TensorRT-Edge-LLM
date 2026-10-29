@@ -38,6 +38,8 @@ class ReasoningParser:
     #: Tool calls are parsed from the text after the reasoning span instead of
     #: from the whole output.
     precedes_tool_calls = False
+    #: The delimiters are special tokens, so decoding must keep them.
+    needs_special_tokens = False
 
     def __init__(self,
                  start_token: str = "<think>",
@@ -297,6 +299,7 @@ class Gemma4ReasoningParser(ReasoningParser):
     """
 
     precedes_tool_calls = True
+    needs_special_tokens = True
 
     def __init__(self) -> None:
         super().__init__(_GEMMA4_CHANNEL_START, _GEMMA4_CHANNEL_END)

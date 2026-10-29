@@ -340,8 +340,8 @@ def test_python_api_applies_the_prompt_hint(tmp_path):
     llm._make_generation_request = lambda *args, **kwargs: object()
     seen = []
 
-    def complete(_request, _params, tool_config, **kwargs):
-        seen.append(kwargs["reasoning_open"])
+    def complete(_request, params, tool_config, **kwargs):
+        seen.append((kwargs["reasoning_open"], params.skip_special_tokens))
         return llm._parse_generation_output(
             "Maybe " + _CALL, [1],
             7,
@@ -349,7 +349,7 @@ def test_python_api_applies_the_prompt_hint(tmp_path):
             tool_config,
             reasoning_parser=kwargs["reasoning_parser"],
             reasoning_open=kwargs["reasoning_open"],
-            skip_special_tokens=False)
+            skip_special_tokens=params.skip_special_tokens)
 
     llm._complete_prepared_request = complete
     messages = [{
@@ -386,6 +386,6 @@ def test_python_api_applies_the_prompt_hint(tmp_path):
                       SamplingParams(enable_thinking=True),
                       tools=tools,
                       reasoning_parser="gemma4")
-    assert seen == [True]
+    assert seen == [(True, False)]
     assert output.reasoning == "Maybe " + _CALL
     assert output.tool_calls == []

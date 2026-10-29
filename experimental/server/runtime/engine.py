@@ -1720,6 +1720,12 @@ class LLM:
             List of ``CompletionOutput`` objects, one per prompt.
         """
         params = sampling_params or SamplingParams()
+        reasoning = REASONING_PARSERS.resolve(
+            reasoning_parser,
+            self._model_dir) if reasoning_parser != "none" else None
+        if (reasoning is not None and reasoning.needs_special_tokens
+                and params.skip_special_tokens):
+            params = replace(params, skip_special_tokens=False)
 
         if isinstance(prompts, str):
             prompts = [prompts]
