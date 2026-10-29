@@ -36,6 +36,20 @@ INT8_SIDECAR_FORMATS = {
     "embedding": "int8_symmetric_per_row",
     "ple_embedding": "int8_symmetric_column_groups_per_row",
 }
+# Packed INT4: two columns per byte, one FP16 scale per 32 contiguous columns.
+INT4_GROUP_SIZE = 32
+INT4_SYMMETRIC_MAX = 7.0
+INT4_SIDECAR_VERSION = "1"
+INT4_SIDECAR_FORMAT = "int4_symmetric_group32_packed"
+INT4_SIDECAR_ROLES = ("embedding", "ple_embedding")
+# "absmax": d = amax / 7, codes in [-7, 7].
+# "q4_0_grid": codes in [-8, 7] with a signed step per group, since Q4_0 maps
+# the largest-magnitude value to -8 and so stores a negative d when that value
+# is positive. Candidates d = max(max / 7, -min / 8) and
+# d = -max(max / 8, -min / 7); the one with the smaller FP16 reconstruction
+# error is kept (ties keep the positive step). Reproduces tables that already
+# lie on a Q4_0 group grid (QAT Q4_0 checkpoints).
+INT4_SCALE_MODES = ("absmax", "q4_0_grid")
 
 
 def int8_sidecar_metadata(tensor_role: str) -> dict[str, str]:
@@ -48,6 +62,151 @@ def int8_sidecar_metadata(tensor_role: str) -> dict[str, str]:
         "trt_edge_llm_quantization_version": INT8_SIDECAR_VERSION,
         "trt_edge_llm_tensor_role": tensor_role,
     }
+
+
+def int4_sidecar_metadata(tensor_role: str) -> dict[str, str]:
+    """Return the versioned safetensors metadata for a packed INT4 sidecar."""
+    if tensor_role not in INT4_SIDECAR_ROLES:
+        raise ValueError(
+            f"Unsupported INT4 sidecar tensor role: {tensor_role!r}")
+    return {
+        "trt_edge_llm_quantization": INT4_SIDECAR_FORMAT,
+        "trt_edge_llm_quantization_version": INT4_SIDECAR_VERSION,
+        "trt_edge_llm_tensor_role": tensor_role,
+    }
+
+
+def _int4_quantize_groups(
+        grouped: torch.Tensor, group_step: torch.Tensor,
+        code_min: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Round ``grouped`` against the FP16 form of ``group_step`` (the scale the
+    runtime sees); a step that is zero in FP16 becomes scale 1.0."""
+    group_scales = group_step.to(torch.float16)
+    group_scales = torch.where(group_scales != 0, group_scales,
+                               torch.ones_like(group_scales))
+    quantized = torch.round(grouped / group_scales.float().unsqueeze(2))
+    return group_scales, quantized.clamp(code_min, INT4_SYMMETRIC_MAX)
+
+
+def _int4_group_error(grouped: torch.Tensor, group_scales: torch.Tensor,
+                      quantized: torch.Tensor) -> torch.Tensor:
+    """Squared error of the runtime's FP16 decode, summed per group."""
+    decoded = (quantized * group_scales.float().unsqueeze(2)).to(
+        torch.float16).float()
+    return (decoded - grouped).square().sum(dim=2)
+
+
+def quantize_embedding_to_int4(
+    embedding_weight: torch.Tensor,
+    *,
+    group_size: int = INT4_GROUP_SIZE,
+    scale_mode: str = "absmax",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize an embedding table to packed symmetric INT4 with FP16 scales.
+
+    Every ``group_size`` contiguous columns of a row share one FP16 scale.
+    ``scale_mode`` selects the scale and code range (see
+    ``INT4_SCALE_MODES``); values are rounded with the FP16-rounded scale, so
+    the runtime's ``fp16((nibble - 8) * scale)`` reproduces the quantizer's
+    own grid and zero stays exact. Two columns are packed per byte: the even
+    column in the low nibble, the odd column in the high nibble, each stored
+    as ``value + 8``. Returns ``(uint8 [vocab, width // 2],
+    fp16 [vocab, width // group_size])``. An all-zero group gets scale 1.0.
+    """
+    if scale_mode not in INT4_SCALE_MODES:
+        raise ValueError(f"scale_mode must be one of {INT4_SCALE_MODES}, "
+                         f"got {scale_mode!r}")
+    if embedding_weight.dim() != 2:
+        raise ValueError(
+            f"Embedding must be 2D, got {embedding_weight.dim()}D")
+    if embedding_weight.shape[0] <= 0 or embedding_weight.shape[1] <= 0:
+        raise ValueError(
+            f"Embedding dimensions must be positive, got {list(embedding_weight.shape)}"
+        )
+    if not embedding_weight.is_floating_point():
+        raise ValueError(
+            f"Embedding must have a floating-point dtype, got {embedding_weight.dtype}"
+        )
+    if group_size <= 0 or group_size % 2 != 0:
+        raise ValueError(
+            f"group_size must be a positive even number, got {group_size}")
+    if embedding_weight.shape[1] % group_size != 0:
+        raise ValueError(
+            f"Embedding width {embedding_weight.shape[1]} must be divisible "
+            f"by group_size {group_size}")
+
+    vocab_size, width = embedding_weight.shape
+    num_groups = width // group_size
+    rows_per_chunk = max(1, INT8_QUANTIZATION_CHUNK_ELEMENTS // width)
+    packed = torch.empty((vocab_size, width // 2),
+                         dtype=torch.uint8,
+                         device=embedding_weight.device)
+    scales = torch.empty((vocab_size, num_groups),
+                         dtype=torch.float16,
+                         device=embedding_weight.device)
+
+    for row_start in range(0, vocab_size, rows_per_chunk):
+        row_end = min(vocab_size, row_start + rows_per_chunk)
+        weight_fp32 = embedding_weight[row_start:row_end].float()
+        if not torch.isfinite(weight_fp32).all():
+            raise ValueError("Embedding contains non-finite values")
+
+        grouped = weight_fp32.view(row_end - row_start, num_groups, group_size)
+        if scale_mode == "absmax":
+            group_scales, quantized = _int4_quantize_groups(
+                grouped,
+                grouped.abs().amax(dim=2) / INT4_SYMMETRIC_MAX,
+                -INT4_SYMMETRIC_MAX)
+        else:
+            group_max = grouped.amax(dim=2)
+            group_min = grouped.amin(dim=2)
+            code_min = -(INT4_SYMMETRIC_MAX + 1)
+            pos_scales, pos_quantized = _int4_quantize_groups(
+                grouped,
+                torch.maximum(group_max / INT4_SYMMETRIC_MAX,
+                              -group_min / (INT4_SYMMETRIC_MAX + 1)), code_min)
+            neg_scales, neg_quantized = _int4_quantize_groups(
+                grouped, -torch.maximum(group_max / (INT4_SYMMETRIC_MAX + 1),
+                                        -group_min / INT4_SYMMETRIC_MAX),
+                code_min)
+            use_negative = _int4_group_error(
+                grouped, neg_scales,
+                neg_quantized) < _int4_group_error(grouped, pos_scales,
+                                                   pos_quantized)
+            group_scales = torch.where(use_negative, neg_scales, pos_scales)
+            quantized = torch.where(use_negative.unsqueeze(2), neg_quantized,
+                                    pos_quantized)
+        decoded = (quantized * group_scales.float().unsqueeze(2)).to(
+            torch.float16)
+        if not torch.isfinite(decoded).all():
+            raise ValueError(
+                "INT4 quantization would decode to non-finite FP16 values")
+        offset = (quantized + 8).to(torch.uint8).view(row_end - row_start,
+                                                      width)
+        packed[row_start:row_end] = offset[:, 0::2] | (offset[:, 1::2] << 4)
+        scales[row_start:row_end] = group_scales
+
+    logger.info(
+        "Quantized embedding to packed INT4: [%d, %d] -> %s, scales: %s",
+        vocab_size, width, list(packed.shape), list(scales.shape))
+    return packed, scales
+
+
+def dequantize_int4_embedding(
+        packed: torch.Tensor,
+        scales: torch.Tensor,
+        *,
+        group_size: int = INT4_GROUP_SIZE) -> torch.Tensor:
+    """Reference inverse of :func:`quantize_embedding_to_int4` (FP16 result)."""
+    vocab_size, half_width = packed.shape
+    values = torch.empty((vocab_size, half_width * 2),
+                         dtype=torch.float32,
+                         device=packed.device)
+    values[:, 0::2] = (packed & 0x0F).float() - 8.0
+    values[:, 1::2] = (packed >> 4).float() - 8.0
+    grouped = values.view(vocab_size, -1, group_size)
+    return (grouped * scales.float().unsqueeze(2)).view(vocab_size,
+                                                        -1).to(torch.float16)
 
 
 def quantize_embedding_to_int8(

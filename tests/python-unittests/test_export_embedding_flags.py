@@ -80,6 +80,16 @@ def test_int8_embedding_rejects_qwen3_omni(monkeypatch, tmp_path, capsys):
     ).err
 
 
+def test_int4_embedding_rejects_qwen3_omni(monkeypatch, tmp_path, capsys):
+    checkpoint = _checkpoint(tmp_path, "qwen3_omni_moe")
+
+    with pytest.raises(SystemExit, match="2"):
+        _run_export_main(monkeypatch, checkpoint, tmp_path, "--int4-embedding")
+
+    assert "--int4-embedding is not supported by Qwen3-Omni" in capsys.readouterr(
+    ).err
+
+
 def test_cosmos3_reasoning_forwards_int8_embedding(monkeypatch, tmp_path):
     checkpoint = _checkpoint(tmp_path, "cosmos3_edge")
     captured = _capture_export_llm(monkeypatch)
