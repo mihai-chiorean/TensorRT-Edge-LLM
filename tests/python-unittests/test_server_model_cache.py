@@ -313,6 +313,19 @@ def test_model_source_rejects_cache_artifacts_and_onnx(tmp_path):
         engine_build.resolve_model_dir(str(bundle))
 
 
+@pytest.mark.parametrize("engine_name", ["llm.engine", "dllm.engine"])
+@pytest.mark.parametrize("engine_subdir", ["", "llm"])
+def test_prepare_model_refuses_plain_bundle_without_config(
+        tmp_path, engine_name, engine_subdir):
+    bundle = tmp_path / "engines"
+    engine_dir = bundle / engine_subdir
+    engine_dir.mkdir(parents=True)
+    (engine_dir / engine_name).touch()
+
+    with pytest.raises(ValueError, match=r"missing config\.json"):
+        engine_build.prepare_model(str(bundle), str(tmp_path / "cache"))
+
+
 def test_prepare_model_serves_prebuilt_bundle_without_building(
         tmp_path, monkeypatch):
     bundle = tmp_path / "engines"
@@ -560,13 +573,168 @@ def test_load_model_keeps_prebuilt_tree_root(tmp_path, monkeypatch):
     assert llm._runtime.args[:2] == (str(bundle / "llm"), str(bundle))
 
 
-def test_prepare_model_refuses_prebuilt_speculative_bundle(tmp_path):
-    bundle = tmp_path / "engines"
-    (bundle / "llm").mkdir(parents=True)
-    (bundle / "llm" / "spec_base.engine").touch()
-    (bundle / "llm" / "spec_draft.engine").touch()
-    with pytest.raises(ValueError, match="only pre-built LLM bundles"):
+def _prebuilt_gemma4_mtp_tree(root, *, configs=True, media=True):
+    """The llm_build tree of a Gemma 4 MTP pair: no config.json, no llm.engine."""
+    llm_dir = root / "llm"
+    llm_dir.mkdir(parents=True)
+    for name in ("spec_base.engine", "spec_draft.engine",
+                 "embedding.safetensors", "ple_embedding.safetensors",
+                 "tokenizer.json"):
+        (llm_dir / name).touch()
+    _write_json(llm_dir / "tokenizer_config.json", {"eos_token": "<eos>"})
+    if configs:
+        _write_json(
+            llm_dir / "base_config.json", {
+                "model": "gemma4_text",
+                "spec_decode_type": "gemma4_mtp",
+                "engine_role": "base",
+                "kv_cache_dtype": "fp16",
+                "builder_config": {
+                    "max_input_len": 4096,
+                    "max_batch_size": 1,
+                    "max_kv_cache_capacity": 8192,
+                    "max_verify_tree_size": 16,
+                    "spec_base": True,
+                },
+            })
+        _write_json(
+            llm_dir / "draft_config.json", {
+                "model": "gemma4_assistant",
+                "spec_decode_type": "gemma4_mtp",
+                "engine_role": "draft",
+                "builder_config": {
+                    "max_draft_tree_size": 16,
+                    "spec_draft": True,
+                },
+            })
+    if media:
+        (root / "visual").mkdir()
+        (root / "visual" / "visual.engine").touch()
+        (root / "audio").mkdir()
+        (root / "audio" / "audio_encoder.engine").touch()
+    return root
+
+
+def test_prepare_model_serves_prebuilt_speculative_bundle(tmp_path):
+    bundle = _prebuilt_gemma4_mtp_tree(tmp_path / "engines")
+    prepared = engine_build.prepare_model(str(bundle), str(tmp_path / "cache"))
+    assert prepared.prebuilt
+    assert prepared.bundle_dir == str(bundle)
+    assert prepared.model_dir == str(bundle / "llm")
+    assert not prepared.draft_model_dir
+
+
+def test_prepare_model_refuses_speculative_bundle_without_configs(tmp_path):
+    bundle = _prebuilt_gemma4_mtp_tree(tmp_path / "engines", configs=False)
+    with pytest.raises(ValueError, match="missing base_config.json"):
         engine_build.prepare_model(str(bundle), str(tmp_path / "cache"))
+
+
+def _load_mtp(tmp_path, monkeypatch, **kwargs):
+    from experimental.server.runtime.engine import load_model
+
+    bundle = _prebuilt_gemma4_mtp_tree(tmp_path / "engines")
+    monkeypatch.setattr("experimental.server.runtime.engine._import_runtime",
+                        lambda: _FakeBindings)
+    return bundle, load_model(model=str(bundle),
+                              cache_dir=str(tmp_path / "cache"),
+                              **kwargs)
+
+
+def test_load_model_serves_prebuilt_gemma4_mtp_with_linear_depth_four(
+        tmp_path, monkeypatch):
+    bundle, llm = _load_mtp(tmp_path, monkeypatch)
+    assert llm.has_draft_model
+    assert llm.model_dir == str(bundle / "llm")
+    args = llm._runtime.args
+    assert args[:3] == (str(bundle / "llm"), str(bundle), {})
+    assert args[3:6] == (1, 4, 5)
+    assert args[6:8] == ("", "")
+    assert llm._runtime.kwargs == {"host_embedding_tables": False}
+    assert llm._max_input_len == 4096
+    assert llm._max_kv_cache_capacity == 8192
+
+
+def test_prebuilt_gemma4_mtp_tree_shape_from_speculative_config(
+        tmp_path, monkeypatch):
+    _bundle, llm = _load_mtp(tmp_path,
+                             monkeypatch,
+                             speculative_config={
+                                 "method": "mtp",
+                                 "num_speculative_tokens": 3,
+                                 "draft_top_k": 2,
+                                 "verify_tree_size": 7,
+                             })
+    assert llm._runtime.args[3:6] == (2, 3, 7)
+
+
+def test_prebuilt_speculative_bundle_rejects_another_method(
+        tmp_path, monkeypatch):
+    from experimental.server.runtime.engine import load_model
+
+    bundle = _prebuilt_gemma4_mtp_tree(tmp_path / "engines")
+    base_config = bundle / "llm" / "base_config.json"
+    _write_json(
+        base_config,
+        json.loads(base_config.read_text()) | {"spec_decode_type": "eagle3"})
+    monkeypatch.setattr("experimental.server.runtime.engine._import_runtime",
+                        lambda: _FakeBindings)
+    with pytest.raises(ValueError, match="compiled bundle uses 'eagle3'"):
+        load_model(model=str(bundle),
+                   cache_dir=str(tmp_path / "cache"),
+                   speculative_config={"method": "mtp"})
+
+
+def test_prebuilt_vanilla_bundle_rejects_a_speculative_method(
+        tmp_path, monkeypatch):
+    from experimental.server.runtime.engine import load_model
+
+    bundle = _prebuilt_text_tree(tmp_path / "engines", True)
+    monkeypatch.setattr("experimental.server.runtime.engine._import_runtime",
+                        lambda: _FakeBindings)
+    with pytest.raises(ValueError, match="no spec_base/spec_draft"):
+        load_model(model=str(bundle),
+                   cache_dir=str(tmp_path / "cache"),
+                   speculative_config={"method": "mtp"})
+
+
+def test_prebuilt_gemma4_mtp_forwards_host_tables(tmp_path, monkeypatch):
+    _bundle, llm = _load_mtp(tmp_path, monkeypatch, host_embedding_tables=True)
+    assert llm._runtime.kwargs == {"host_embedding_tables": True}
+
+
+def test_prebuilt_gemma4_mtp_forwards_ple_only_table(tmp_path, monkeypatch):
+    _bundle, llm = _load_mtp(tmp_path, monkeypatch, host_ple_table=True)
+    assert llm._runtime.kwargs == {
+        "host_embedding_tables": False,
+        "host_ple_table": True,
+    }
+
+
+def test_prebuilt_gemma4_mtp_refuses_in_flight_batching(tmp_path, monkeypatch):
+    with pytest.raises(ValueError,
+                       match="--enable-in-flight-batching is not "
+                       "supported.*speculative decoding"):
+        _load_mtp(tmp_path, monkeypatch, enable_in_flight_batching=True)
+
+
+def test_prebuilt_gemma4_mtp_selects_gemma4_parsers(tmp_path):
+    from experimental.server.parsing.tool_calling import _parser_name_for_model
+
+    bundle = _prebuilt_gemma4_mtp_tree(tmp_path / "engines")
+    assert _parser_name_for_model(str(bundle / "llm")) == "gemma4"
+
+
+def test_prebuilt_gemma4_mtp_capabilities(tmp_path, monkeypatch):
+    from experimental.server.runtime.engine_client import _capabilities_for
+
+    _bundle, llm = _load_mtp(tmp_path, monkeypatch)
+    capabilities = _capabilities_for(llm)
+    assert capabilities.speculative_decoding
+    assert capabilities.speculative_method == "mtp"
+    assert capabilities.max_input_len == 4096
+    assert capabilities.max_model_len == 8192
+    assert set(capabilities.input_modalities) == {"text", "image", "audio"}
 
 
 def test_prebuilt_tree_capabilities_read_the_nested_engine_config(
@@ -600,3 +768,33 @@ def test_reasoning_parser_recognizes_runtime_config_model_name(tmp_path):
     engines.mkdir()
     _write_json(engines / "config.json", _engine_config(model="qwen3"))
     assert REASONING_PARSERS.resolve("auto", str(engines)) is not None
+
+
+def test_reasoning_parser_reads_a_speculative_base_config(tmp_path):
+    from experimental.server.parsing.reasoning import REASONING_PARSERS
+
+    engines = tmp_path / "engines"
+    engines.mkdir()
+    _write_json(engines / "base_config.json",
+                _engine_config(model="qwen3", spec="eagle3"))
+    assert REASONING_PARSERS.resolve("auto", str(engines)) is not None
+
+
+def test_prebuilt_paired_bundle_takes_a_model_free_speculative_config(
+        tmp_path, monkeypatch):
+    from experimental.server.runtime.engine import load_model
+
+    bundle = _prebuilt_gemma4_mtp_tree(tmp_path / "engines")
+    base_config = bundle / "llm" / "base_config.json"
+    _write_json(
+        base_config,
+        json.loads(base_config.read_text()) | {"spec_decode_type": "eagle3"})
+    monkeypatch.setattr("experimental.server.runtime.engine._import_runtime",
+                        lambda: _FakeBindings)
+    llm = load_model(model=str(bundle),
+                     cache_dir=str(tmp_path / "cache"),
+                     speculative_config={
+                         "method": "eagle3",
+                         "num_speculative_tokens": 3
+                     })
+    assert llm._runtime.args[3:5] == (10, 3)

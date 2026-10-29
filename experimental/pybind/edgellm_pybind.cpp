@@ -238,9 +238,15 @@ int32_t runStandaloneTTS(Qwen3OmniTTSRuntime& ttsRuntime, Code2WavRunner& code2w
     return talkerResponse.batchRvqCodes.empty() ? 0 : static_cast<int32_t>(talkerResponse.batchRvqCodes[0].size());
 }
 
-EmbeddingTableResidency embeddingTableResidency(bool hostEmbeddingTables)
+EmbeddingTableResidency embeddingTableResidency(bool hostEmbeddingTables, bool hostPleTable)
 {
-    return hostEmbeddingTables ? EmbeddingTableResidency::kHostMapped : EmbeddingTableResidency::kDevice;
+    ELLM_CHECK(!(hostEmbeddingTables && hostPleTable),
+        "host_embedding_tables already keeps the PLE table in host memory; pass only one of it and host_ple_table");
+    if (hostEmbeddingTables)
+    {
+        return EmbeddingTableResidency::kHostMapped;
+    }
+    return hostPleTable ? EmbeddingTableResidency::kHostMappedPle : EmbeddingTableResidency::kDevice;
 }
 
 // Called synchronously by constructors while the Python caller holds the GIL.
@@ -263,12 +269,12 @@ public:
     //! identity-page runtime path unchanged when callers omit it.
     PyLLMRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, std::string const& checkpointDir,
-        ContextCacheConfig const& contextCacheConfig, bool hostEmbeddingTables)
+        ContextCacheConfig const& contextCacheConfig, bool hostEmbeddingTables, bool hostPleTable)
     {
         mPluginHandle = loadEdgellmPluginLib();
         auto artifacts = ModelArtifacts::loadFromEngineDir(engineDir, std::nullopt, checkpointDir, "",
             contextCacheConfig.enabled, mStream.get(), checkLoadingSignals, std::nullopt,
-            embeddingTableResidency(hostEmbeddingTables));
+            embeddingTableResidency(hostEmbeddingTables, hostPleTable));
         mRuntime = std::make_unique<LLMInferenceRuntime>(std::move(artifacts), engineDir, multimodalEngineDir,
             loraWeightsMap, std::nullopt, mStream.get(), contextCacheConfig);
     }
@@ -277,13 +283,15 @@ public:
     PyLLMRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, int32_t draftTopK, int32_t draftStep,
         int32_t verifyTreeSize, std::string const& checkpointDir, std::string const& draftCheckpointDir,
-        ContextCacheConfig const& contextCacheConfig, int32_t dflashBlockSize)
+        ContextCacheConfig const& contextCacheConfig, int32_t dflashBlockSize, bool hostEmbeddingTables,
+        bool hostPleTable)
     {
         mPluginHandle = loadEdgellmPluginLib();
         SpecDecodeDraftingConfig draftingConfig{draftTopK, draftStep, verifyTreeSize};
         draftingConfig.dflashBlockSize = dflashBlockSize;
         auto artifacts = ModelArtifacts::loadFromEngineDir(engineDir, draftingConfig, checkpointDir, draftCheckpointDir,
-            contextCacheConfig.enabled, mStream.get(), checkLoadingSignals);
+            contextCacheConfig.enabled, mStream.get(), checkLoadingSignals, std::nullopt,
+            embeddingTableResidency(hostEmbeddingTables, hostPleTable));
         mRuntime = std::make_unique<LLMInferenceRuntime>(std::move(artifacts), engineDir, multimodalEngineDir,
             loraWeightsMap, draftingConfig, mStream.get(), contextCacheConfig);
     }
@@ -527,14 +535,14 @@ public:
     PyRequestEngine(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, std::string const& checkpointDir,
         ContextCacheConfig const& contextCacheConfig, int32_t maxBatchSize, int32_t maxPendingRequests,
-        int32_t commandQueueCapacity, bool captureCudaGraph, bool hostEmbeddingTables)
+        int32_t commandQueueCapacity, bool captureCudaGraph, bool hostEmbeddingTables, bool hostPleTable)
     {
         mPluginHandle = loadEdgellmPluginLib();
         // Single rank only in this release: tensor-parallel deployments stay on the blocking path
         // until the stepped command stream reaches the other ranks (see the IFB support matrix).
         auto artifacts = ModelArtifacts::loadFromEngineDir(engineDir, std::nullopt, checkpointDir, "",
             contextCacheConfig.enabled, mStream.get(), checkLoadingSignals, std::nullopt,
-            embeddingTableResidency(hostEmbeddingTables));
+            embeddingTableResidency(hostEmbeddingTables, hostPleTable));
         auto runtime = std::make_unique<LLMInferenceRuntime>(std::move(artifacts), engineDir, multimodalEngineDir,
             loraWeightsMap, std::nullopt, mStream.get(), contextCacheConfig);
         // Capture happens here because after the constructor hands the runtime over, nothing but
@@ -1129,25 +1137,29 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readwrite("output_texts", &LLMGenerationResponse::outputTexts)
         .def_readwrite("logprobs", &LLMGenerationResponse::logprobs)
         .def_readonly("finish_reasons", &LLMGenerationResponse::finishReasons)
-        .def_readonly("prompt_token_counts", &LLMGenerationResponse::inputTokenCounts);
+        .def_readonly("prompt_token_counts", &LLMGenerationResponse::inputTokenCounts)
+        .def_readonly("spec_verify_counts", &LLMGenerationResponse::specVerifyCounts)
+        .def_readonly("spec_acceptance_lengths", &LLMGenerationResponse::specAcceptanceLengths);
 
     // ========================================================================
     // Runtime: unified (vanilla + Eagle speculative decoding)
     // ========================================================================
     py::class_<PyLLMRuntime>(m, "LLMRuntime", "Unified LLM inference runtime with optional speculative decoding.")
         .def(py::init<std::string const&, std::string const&, std::unordered_map<std::string, std::string> const&,
-                 std::string const&, ContextCacheConfig const&, bool>(),
+                 std::string const&, ContextCacheConfig const&, bool, bool>(),
             py::arg("engine_dir"), py::arg("multimodal_engine_dir") = "",
             py::arg("lora_weights_map") = std::unordered_map<std::string, std::string>{},
             py::arg("checkpoint_dir") = "", py::arg("context_cache_config") = ContextCacheConfig{},
-            py::arg("host_embedding_tables") = false, "Construct for vanilla (non-speculative) decoding")
+            py::arg("host_embedding_tables") = false, py::arg("host_ple_table") = false,
+            "Construct for vanilla (non-speculative) decoding")
         .def(py::init<std::string const&, std::string const&, std::unordered_map<std::string, std::string> const&,
-                 int32_t, int32_t, int32_t, std::string const&, std::string const&, ContextCacheConfig const&,
-                 int32_t>(),
+                 int32_t, int32_t, int32_t, std::string const&, std::string const&, ContextCacheConfig const&, int32_t,
+                 bool, bool>(),
             py::arg("engine_dir"), py::arg("multimodal_engine_dir"), py::arg("lora_weights_map"),
             py::arg("draft_top_k"), py::arg("draft_step"), py::arg("verify_tree_size"), py::arg("checkpoint_dir") = "",
             py::arg("draft_checkpoint_dir") = "", py::arg("context_cache_config") = ContextCacheConfig{},
-            py::arg("dflash_block_size") = 0, "Construct for speculative decoding")
+            py::arg("dflash_block_size") = 0, py::arg("host_embedding_tables") = false,
+            py::arg("host_ple_table") = false, "Construct for speculative decoding")
         .def("handle_request", &PyLLMRuntime::handleRequest, py::arg("request"),
             py::call_guard<py::gil_scoped_release>(), "Process a generation request and return the response")
         .def("load_omni", &PyLLMRuntime::loadOmni, py::arg("talker_engine_dir"), py::arg("code_predictor_engine_dir"),
@@ -1224,13 +1236,13 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         "Owns a runtime and the actor thread that drives it; submissions from any thread, "
         "responses through RequestHandle.")
         .def(py::init<std::string const&, std::string const&, std::unordered_map<std::string, std::string> const&,
-                 std::string const&, ContextCacheConfig const&, int32_t, int32_t, int32_t, bool, bool>(),
+                 std::string const&, ContextCacheConfig const&, int32_t, int32_t, int32_t, bool, bool, bool>(),
             py::arg("engine_dir"), py::arg("multimodal_engine_dir") = "",
             py::arg("lora_weights_map") = std::unordered_map<std::string, std::string>{},
             py::arg("checkpoint_dir") = "", py::arg("context_cache_config") = ContextCacheConfig{},
             py::arg("max_batch_size") = 1, py::arg("max_pending_requests") = 256,
             py::arg("command_queue_capacity") = 64, py::arg("capture_cuda_graph") = true,
-            py::arg("host_embedding_tables") = false)
+            py::arg("host_embedding_tables") = false, py::arg("host_ple_table") = false)
         .def("submit", &PyRequestEngine::submit, py::arg("request"), py::call_guard<py::gil_scoped_release>(),
             "Queue a request. Returns immediately with a RequestHandle; raises SubmitError when refused.")
         .def("cancel", &PyRequestEngine::cancel, py::arg("request_id"), py::call_guard<py::gil_scoped_release>(),

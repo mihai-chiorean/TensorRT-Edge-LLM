@@ -92,8 +92,7 @@ A directory of engines that were built outside the cache is served as-is: a
 builder bundle (`llm.engine` at the root), or the tree written by `llm_build`
 and `visual_build` (`llm/llm.engine` next to `visual/visual.engine`). Such a
 bundle carries its own weights, tokenizer, and chat template, so no checkpoint
-is resolved and nothing is built. Pre-built speculative-decoding bundles are
-not served this way; pass the checkpoint instead:
+is resolved and nothing is built:
 
 ```bash
 tensorrt-edgellm-serve /opt/models/gemma-4-e4b-engines \
@@ -101,6 +100,25 @@ tensorrt-edgellm-serve /opt/models/gemma-4-e4b-engines \
   --max-kv-cache-capacity 16384 \
   --enable-context-reuse
 ```
+
+A pre-built speculative-decoding tree holds `spec_base.engine`,
+`spec_draft.engine`, `base_config.json`, and `draft_config.json` in place of
+`llm.engine` and `config.json`. The server takes the method from
+`base_config.json` (`spec_decode_type`); `--speculative-config` may restate it
+and set the drafting shape, but must not name a draft `model`. A Gemma 4 MTP
+tree defaults to a linear depth of 4:
+
+```bash
+tensorrt-edgellm-serve /opt/models/gemma-4-e4b-mtp-engines \
+  --enable-context-reuse \
+  --host-embedding-tables \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":4}'
+```
+
+`--host-embedding-tables` keeps the INT8 token-embedding and PLE sidecars of an
+`--int8-embedding` export mapped in host memory; with speculative decoding it
+is supported for Gemma 4 MTP only. `--host-ple-table` keeps only the PLE
+sidecar in host memory and uploads the token-embedding table.
 
 Compiled bundles use a 50 GiB least-recently-used cache by default. Set
 `--engine-cache-max-size-gb` to another positive limit. Use
@@ -111,8 +129,10 @@ invalidate its cached bundle. Python callers can perform cache maintenance with
 
 ## Speculative Decoding
 
-`--speculative-config` accepts `method`, `model`, and
-`num_speculative_tokens`. The base, draft, and auxiliary model components are
+`--speculative-config` accepts `method`, `model`, `num_speculative_tokens`,
+`draft_top_k`, and `verify_tree_size`; the last two are the same as
+`--draft-top-k` and `--verify-tree-size`, and a conflicting pair is rejected.
+The base, draft, and auxiliary model components are
 built and cached as one paired runtime. When omitted, the server reads the
 proposal length from the draft checkpoint. For EAGLE3 and MTP,
 `num_speculative_tokens` is the number of sequential draft steps. For DFlash
@@ -175,7 +195,10 @@ trtedge serve Qwen/Qwen3-4B \
 ```
 
 For a checkpoint containing native MTP layers, select `mtp` without `model`.
-Gemma MTP instead supplies its separate assistant checkpoint as `model`. The
+Gemma MTP instead supplies its separate assistant checkpoint as `model`; it
+defaults to 4 sequential draft steps. For a pre-built Gemma MTP tree, omit
+`model`; a top-2 configuration is
+`{"method":"mtp","num_speculative_tokens":3,"draft_top_k":2,"verify_tree_size":7}`. The
 server defaults MTP, DFlash, JetSpec, and dSpark to their linear contracts.
 Where the method supports branching, setting `--draft-top-k` above 1 selects
 its tree contract and causes the direct builder to compile matching tree-base
