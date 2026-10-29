@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <tensorrt_edgellm/builder/hardwareCompatibility.h>
 #include <tensorrt_edgellm/builder/visualBuilder.h>
 #include <tensorrt_edgellm/common/fileUtils.h>
 #include <tensorrt_edgellm/common/logger.h>
@@ -49,7 +50,8 @@ enum VLMBuildOptionId : int
     SAFETY = 609,
     MSS_PROFILE = 610,
     REMOTE_AUTO_TUNING_CONFIG = 611,
-    SAFETY_PLUGIN_LIBRARY = 612
+    SAFETY_PLUGIN_LIBRARY = 612,
+    HARDWARE_COMPATIBILITY = 613
 };
 
 struct CommonViTBuildArgs
@@ -66,6 +68,7 @@ struct ViTBuildArgs : CommonViTBuildArgs
 {
     int64_t minImageTokens{4};
     int64_t maxImageTokens{1024};
+    builder::HardwareCompatibility hardwareCompatibility{builder::HardwareCompatibility::kNONE};
 };
 
 #ifdef ENABLE_SAFETY_RUNTIME
@@ -115,6 +118,9 @@ void printUsage(char const* programName)
     std::cerr << "  --profiling-detailed  Enable detailed profiling verbosity to include ONNX op names. "
                  "Use for DLSim analysis."
               << std::endl;
+    std::cerr << "  --hardware-compatibility  none: the engine targets the build GPU. same_compute_capability: the "
+                 "engine runs on any GPU with the same compute capability (TensorRT >= 10.9). Default = none"
+              << std::endl;
 #ifdef ENABLE_SAFETY_RUNTIME
     std::cerr << "Safety Builder options:" << std::endl
               << "  --safety                    Build a visual engine with TensorRT kSAFETY capability." << std::endl
@@ -148,6 +154,8 @@ bool parseViTBuildArgs(CommonViTBuildArgs& commonArgs, ViTBuildArgs& args,
         {"maxImageTokensPerImage", required_argument, 0, VLMBuildOptionId::MAX_IMAGE_TOKENS_PER_IMAGE},
         {"profiling-detailed", no_argument, 0, VLMBuildOptionId::PROFILING_DETAILED},
         {"profilingDetailed", no_argument, 0, VLMBuildOptionId::PROFILING_DETAILED},
+        {"hardware-compatibility", required_argument, 0, VLMBuildOptionId::HARDWARE_COMPATIBILITY},
+        {"hardwareCompatibility", required_argument, 0, VLMBuildOptionId::HARDWARE_COMPATIBILITY},
         {"safety", no_argument, 0, VLMBuildOptionId::SAFETY},
         {"mss-profile", required_argument, 0, VLMBuildOptionId::MSS_PROFILE},
         {"mssProfile", required_argument, 0, VLMBuildOptionId::MSS_PROFILE},
@@ -204,6 +212,17 @@ bool parseViTBuildArgs(CommonViTBuildArgs& commonArgs, ViTBuildArgs& args,
             }
             break;
         case VLMBuildOptionId::PROFILING_DETAILED: commonArgs.profilingDetailed = true; break;
+        case VLMBuildOptionId::HARDWARE_COMPATIBILITY:
+        {
+            auto const compatibility = builder::parseHardwareCompatibility(optarg);
+            if (!compatibility)
+            {
+                LOG_ERROR("--hardware-compatibility must be none or same_compute_capability, got %s.", optarg);
+                return false;
+            }
+            args.hardwareCompatibility = *compatibility;
+            break;
+        }
 #ifdef ENABLE_SAFETY_RUNTIME
         case VLMBuildOptionId::SAFETY: useSafety = true; break;
         case VLMBuildOptionId::MSS_PROFILE:
@@ -374,6 +393,7 @@ int main(int argc, char** argv)
     config.maxImageTokens = args.maxImageTokens;
     config.maxImageTokensPerImage = args.maxImageTokensPerImage;
     config.profilingDetailed = args.profilingDetailed;
+    config.hardwareCompatibility = args.hardwareCompatibility;
 
     // Create and run the builder
     builder::VisualBuilder visualBuilder(args.onnxDir, actualEngineDir, config);

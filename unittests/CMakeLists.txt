@@ -203,6 +203,9 @@ edgellm_add_unit_test(
   cpp/builder
   cpp/sampler
   cpp/multimodal)
+# edgellmBuilder is not part of edgellmCore, and the builder tests call
+# builderUtils.
+target_link_libraries(unitTestCommon PRIVATE edgellmBuilder)
 
 if(ENABLE_SAFETY_RUNTIME)
   file(GLOB SAFETY_TEST_SRCS CONFIGURE_DEPENDS "cpp/safety/*.cpp")

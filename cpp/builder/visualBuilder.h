@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "builder/hardwareCompatibility.h"
+#include "common/checkMacros.h"
 #include "multimodal/common/imageUtils.h"
 #include "multimodal/common/modelTypes.h"
 #include <NvInfer.h>
@@ -43,6 +45,7 @@ struct VisualBuilderConfig
     int64_t maxImageTokensPerImage{512}; //!< Maximum number of image tokens per image
     bool profilingDetailed{false};       //!< Enable detailed profiling verbosity for layer info extraction
     bool useTrtNativeVitAttn{false};     //!< Use TRT IAttention
+    HardwareCompatibility hardwareCompatibility{HardwareCompatibility::kNONE};
 
     //! Convert configuration to JSON format for serialization.
     //! @return JSON object containing all configuration parameters
@@ -56,6 +59,10 @@ struct VisualBuilderConfig
         // media against the real engine limit instead of re-deriving it.
         json["max_cu_seqlen_groups"] = rt::imageUtils::maxCuSeqlenGroups(maxImageTokens);
         json["use_trt_native_vit_attn"] = useTrtNativeVitAttn;
+        if (hardwareCompatibility != HardwareCompatibility::kNONE)
+        {
+            json["hardware_compatibility"] = hardwareCompatibilityName(hardwareCompatibility);
+        }
         return json;
     }
 
@@ -81,6 +88,14 @@ struct VisualBuilderConfig
         {
             config.useTrtNativeVitAttn = json["use_trt_native_vit_attn"];
         }
+        if (json.contains("hardware_compatibility"))
+        {
+            auto const& value = json["hardware_compatibility"];
+            ELLM_CHECK(value.is_string(), "VisualBuilderConfig: hardware_compatibility must be a string.");
+            auto const compatibility = parseHardwareCompatibility(value.get<std::string>());
+            ELLM_CHECK(compatibility.has_value(), "VisualBuilderConfig: unknown hardware_compatibility value.");
+            config.hardwareCompatibility = *compatibility;
+        }
         return config;
     }
 
@@ -93,6 +108,7 @@ struct VisualBuilderConfig
         oss << "  minImageTokens: " << minImageTokens << "\n";
         oss << "  maxImageTokens: " << maxImageTokens << "\n";
         oss << "  maxImageTokensPerImage: " << maxImageTokensPerImage << "\n";
+        oss << "  hardwareCompatibility: " << hardwareCompatibilityName(hardwareCompatibility) << "\n";
         return oss.str();
     }
 };
