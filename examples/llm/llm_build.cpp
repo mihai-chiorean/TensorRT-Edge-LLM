@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "builder/hardwareCompatibility.h"
 #include "builder/llmBuilder.h"
 #include "common/cudaUtils.h"
 #include "common/fileUtils.h"
@@ -49,7 +50,8 @@ enum LLMBuildOptionId : int
     MAX_KV_POOL_PAGES = 714,
     TP_SIZE = 715,
     TP_RANK = 716,
-    LOCAL_DEVICE = 717
+    LOCAL_DEVICE = 717,
+    HARDWARE_COMPATIBILITY = 718
 };
 
 struct LLMBuildArgs
@@ -74,6 +76,7 @@ struct LLMBuildArgs
     bool tpSizeSet{false};
     bool tpRankSet{false};
     bool localDeviceSet{false};
+    builder::HardwareCompatibility hardwareCompatibility{builder::HardwareCompatibility::kNONE};
 };
 
 namespace
@@ -95,7 +98,7 @@ void printUsage(char const* programName)
                  " [--max-kv-pool-pages <int>]"
                  " [--spec-draft] [--spec-base] [--max-verify-tree-size <int>] "
                  "[--max-draft-tree-size <int>] [--profiling-detailed] [--tp-size <int> --tp-rank <int>] "
-                 "[--local-device <int>]"
+                 "[--local-device <int>] [--hardware-compatibility <none|same_compute_capability>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --help                   Display this help message" << std::endl;
@@ -133,6 +136,10 @@ void printUsage(char const* programName)
               << std::endl
               << "  --local-device           Node-local CUDA device ordinal for an explicit TP build. Defaults to "
                  "tpRank."
+              << std::endl
+              << "  --hardware-compatibility none: the engine targets the build GPU. same_compute_capability: the "
+                 "engine runs on any GPU with the same compute capability (TensorRT >= 10.9; rejected with "
+                 "TensorRT-RTX). Default = none"
               << std::endl
               << std::endl;
     std::cerr << "Legacy camelCase option spellings remain accepted.\n";
@@ -175,7 +182,9 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
         {"tp-rank", required_argument, 0, LLMBuildOptionId::TP_RANK},
         {"tpRank", required_argument, 0, LLMBuildOptionId::TP_RANK},
         {"local-device", required_argument, 0, LLMBuildOptionId::LOCAL_DEVICE},
-        {"localDevice", required_argument, 0, LLMBuildOptionId::LOCAL_DEVICE}, {0, 0, 0, 0}};
+        {"localDevice", required_argument, 0, LLMBuildOptionId::LOCAL_DEVICE},
+        {"hardware-compatibility", required_argument, 0, LLMBuildOptionId::HARDWARE_COMPATIBILITY},
+        {"hardwareCompatibility", required_argument, 0, LLMBuildOptionId::HARDWARE_COMPATIBILITY}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", buildOptions, nullptr)) != -1)
@@ -272,6 +281,17 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
                 args.localDeviceSet = true;
             }
             break;
+        case LLMBuildOptionId::HARDWARE_COMPATIBILITY:
+        {
+            auto const compatibility = builder::parseHardwareCompatibility(optarg);
+            if (!compatibility)
+            {
+                LOG_ERROR("--hardware-compatibility must be none or same_compute_capability, got %s.", optarg);
+                return false;
+            }
+            args.hardwareCompatibility = *compatibility;
+            break;
+        }
         default: LOG_ERROR("Invalid Argument %c is %s.", opt, optarg); return false;
         }
     }
@@ -385,6 +405,7 @@ int main(int argc, char** argv)
     config.profilingDetailed = args.profilingDetailed;
     config.tpSize = tpSize;
     config.tpRank = tpRank;
+    config.hardwareCompatibility = args.hardwareCompatibility;
 
     // Create and run the builder
     builder::LLMBuilder llmBuilder(args.onnxDir, args.engineDir, config);
