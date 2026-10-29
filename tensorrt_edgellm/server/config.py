@@ -21,6 +21,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Sequence, Union
 
+from .runtime.engine_layout import is_prebuilt_engine_tree
+
 _INT32_MAX = 2**31 - 1
 _INT64_MAX = 2**63 - 1
 _DEFAULT_ENCODER_EMBEDDING_CACHE_BUDGET_BYTES = 256 * 1024 * 1024
@@ -122,9 +124,15 @@ class SpeculativeConfig:
     verify_tokens: Optional[int] = None
 
     @classmethod
-    def parse(
-        cls, value: Union[str, Mapping[str, Any], "SpeculativeConfig", None]
-    ) -> Optional["SpeculativeConfig"]:
+    def parse(cls,
+              value: Union[str, Mapping[str, Any], "SpeculativeConfig", None],
+              *,
+              prebuilt: bool = False) -> Optional["SpeculativeConfig"]:
+        """Validate a speculative configuration.
+
+        ``prebuilt`` marks a pre-built engine tree, whose draft engine is part
+        of the bundle, so no paired method needs a draft ``model``.
+        """
         if not value:
             return None
         if isinstance(value, cls):
@@ -132,8 +140,8 @@ class SpeculativeConfig:
                 "method": value.method,
                 "num_speculative_tokens": value.num_speculative_tokens,
                 # An absent draft model is stored as "", which re-parsing would
-                # reject as a malformed model id. MTP is the only method that
-                # legitimately has none, so re-parsing must round-trip.
+                # reject as a malformed model id. MTP and pre-built trees
+                # legitimately have none, so re-parsing must round-trip.
                 "model": value.draft_model or None,
                 "draft_top_k": value.draft_top_k,
                 "verify_tokens": value.verify_tokens,
@@ -175,8 +183,8 @@ class SpeculativeConfig:
             raise ServerConfigError(
                 "--speculative-config.model must be a checkpoint path or "
                 "Hugging Face model ID")
-        if method in {"eagle3", "dflash", "jetspec", "domino", "dspark"
-                      } and not draft_model:
+        if (method in {"eagle3", "dflash", "jetspec", "domino", "dspark"}
+                and not draft_model and not prebuilt):
             raise ServerConfigError(
                 f"--speculative-config.method {method!r} requires "
                 "speculative-config.model")
@@ -605,7 +613,9 @@ def create_argument_parser(
         help=(
             "Speculative decoding JSON, e.g. "
             "{\"method\":\"mtp\",\"num_speculative_tokens\":3}. Paired drafts "
-            "also use \"model\""))
+            "also use \"model\". A pre-built speculative bundle selects its "
+            "method from base_config.json when this is omitted; Gemma 4 MTP "
+            "then drafts a linear chain of 4 tokens."))
     model.add_argument(
         "--enable-context-reuse",
         action="store_true",
@@ -735,9 +745,27 @@ def parse_server_config(argv: Optional[Sequence[str]] = None,
     if args.queue_timeout <= 0:
         raise ServerConfigError("--queue-timeout must be positive")
 
-    speculative = SpeculativeConfig.parse(args.speculative_config)
+    speculative = SpeculativeConfig.parse(args.speculative_config,
+                                          prebuilt=is_prebuilt_engine_tree(
+                                              args.model))
     draft_step = args.spec_draft_step
     proposal_tokens = args.spec_proposal_tokens
+    if speculative:
+        iterative = speculative.method in {"eagle3", "mtp"}
+        for key, from_config, flag, from_flag in (
+            ("draft_top_k", speculative.draft_top_k, "--draft-top-k",
+             args.draft_top_k),
+            ("verify_tokens", speculative.verify_tokens,
+             "--spec-verify-tokens", args.spec_verify_tokens),
+            ("num_speculative_tokens", speculative.num_speculative_tokens,
+             "--spec-draft-step" if iterative else "--spec-proposal-tokens",
+             draft_step if iterative else proposal_tokens),
+        ):
+            if (from_config is not None and from_flag is not None
+                    and from_config != from_flag):
+                raise ServerConfigError(
+                    f"--speculative-config.{key}={from_config} conflicts "
+                    f"with {flag} {from_flag}")
     if (speculative and speculative.method in {"eagle3", "mtp"}
             and speculative.num_speculative_tokens is not None):
         draft_step = speculative.num_speculative_tokens

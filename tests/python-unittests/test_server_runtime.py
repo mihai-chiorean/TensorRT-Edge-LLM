@@ -1166,6 +1166,110 @@ def test_runtime_load_forwards_context_cache_config(monkeypatch, engine_type,
     assert native.encoder_embedding_cache_budget_bytes == 512
 
 
+@pytest.mark.parametrize("method,step", [("gemma4_mtp", 4), ("mtp", 6)])
+def test_mtp_default_depth_follows_the_compiled_method(tmp_path, method, step):
+    (tmp_path / "base_config.json").write_text(
+        json.dumps({
+            "spec_decode_type": method,
+            "builder_config": {
+                "max_spec_verify_tokens": 16
+            },
+        }))
+
+    options = _resolve_spec_decode_runtime_options(str(tmp_path), method, None,
+                                                   None, None, None, None)
+
+    assert (options.top_k, options.draft_step,
+            options.verify_tokens) == (1, step, step + 1)
+
+
+def _gemma4_mtp_request_llm(monkeypatch):
+    from tensorrt_edgellm.server.runtime import engine as engine_module
+
+    class NativeValue:
+
+        def __init__(self, **values):
+            self.__dict__.update(values)
+
+    llm = _bare_llm(SimpleNamespace(has_draft_model=lambda: True))
+    llm._rt = SimpleNamespace(
+        LLMGenerationRequest=NativeValue,
+        Request=NativeValue,
+        ToolChoice=NativeValue,
+        ToolChoiceMode=SimpleNamespace(NONE="none",
+                                       AUTO="auto",
+                                       REQUIRED="required",
+                                       FUNCTION="function"),
+        ContextCacheLookupPolicy=SimpleNamespace(USE_CACHE="use",
+                                                 BYPASS="bypass"),
+        ContextCacheCommitPolicy=SimpleNamespace(
+            INCLUDING_GENERATED_TOKENS="all", PREFILL_STATE_ONLY="prefill"),
+    )
+    llm._context_cache_config = ContextCacheConfig()
+    llm._spec_decode_type = "gemma4_mtp"
+    llm._prepare_messages_for_runtime = lambda _messages: ([], [])
+    monkeypatch.setattr(engine_module, "_load_audio_buffers",
+                        lambda *_args: [])
+    return llm
+
+
+_HELLO = [{"role": "user", "content": "hello"}]
+
+
+def test_gemma4_mtp_serves_sampled_requests_greedily(monkeypatch, caplog):
+    llm = _gemma4_mtp_request_llm(monkeypatch)
+    with caplog.at_level("WARNING", logger="edgellm.server"):
+        request = llm._make_generation_request(
+            _HELLO, SamplingParams(temperature=0.7, top_p=0.9, top_k=50))
+        llm._make_generation_request(_HELLO, SamplingParams(temperature=0.7))
+    assert (request.temperature, request.top_p, request.top_k) == (0.0, 1.0, 1)
+    assert sum("verifies greedily" in record.message
+               for record in caplog.records) == 1
+
+
+def test_gemma4_mtp_keeps_greedy_and_invalid_temperatures(monkeypatch):
+    llm = _gemma4_mtp_request_llm(monkeypatch)
+    greedy = llm._make_generation_request(_HELLO,
+                                          SamplingParams(temperature=0.0))
+    assert (greedy.temperature, greedy.top_k) == (0.0, 1)
+    negative = llm._make_generation_request(_HELLO,
+                                            SamplingParams(temperature=-1.0))
+    assert negative.temperature == -1.0
+
+
+def test_gemma4_mtp_refuses_disable_spec_decode(monkeypatch):
+    llm = _gemma4_mtp_request_llm(monkeypatch)
+    with pytest.raises(ValueError, match="disable_spec_decode"):
+        llm._make_generation_request(
+            _HELLO, SamplingParams(temperature=0.0, disable_spec_decode=True))
+
+
+def test_other_speculative_decoders_keep_sampling(monkeypatch):
+    llm = _gemma4_mtp_request_llm(monkeypatch)
+    llm._spec_decode_type = "dspark"
+    request = llm._make_generation_request(
+        _HELLO, SamplingParams(temperature=0.7, disable_spec_decode=True))
+    assert request.temperature == 0.7
+    assert request.disable_spec_decode
+
+
+def test_handle_request_logs_draft_acceptance(caplog):
+    response = SimpleNamespace(spec_verify_counts=[12],
+                               spec_acceptance_lengths=[3.25])
+    llm = _bare_llm(SimpleNamespace(handle_request=lambda _request: response))
+    with caplog.at_level("INFO", logger="edgellm.server"):
+        assert llm._handle_request(object()) is response
+    assert "verify_steps=12 acceptance=3.25" in caplog.text
+
+    caplog.clear()
+    vanilla = SimpleNamespace(spec_verify_counts=[0],
+                              spec_acceptance_lengths=[0.0])
+    llm = _bare_llm(SimpleNamespace(handle_request=lambda _request: vanilla))
+    with caplog.at_level("INFO", logger="edgellm.server"):
+        llm._handle_request(object())
+    assert "[spec-decode]" not in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # In-flight batching: the engine-backed request paths
 # ---------------------------------------------------------------------------

@@ -321,6 +321,8 @@ def test_native_mtp_uses_base_checkpoint():
 @pytest.mark.parametrize("payload", [
     '{"method":"mtp","num_speculative_tokens":2}',
     '{"method":"mtp"}',
+    '{"method":"mtp","num_speculative_tokens":3,"draft_top_k":2,'
+    '"verify_tokens":7}',
     '{"method":"eagle3","model":"org/draft-ckpt"}',
 ])
 def test_speculative_config_parse_is_idempotent(payload):
@@ -477,3 +479,63 @@ def test_invalid_ifb_scheduling_combinations_are_refused_while_parsing(
     options with the RequestEngine's own message, naming the requirement."""
     with pytest.raises(ServerConfigError, match=match):
         parse_server_config(["Qwen/Qwen3-0.6B", *argv.split()])
+
+
+def test_speculative_config_selects_the_mtp_tree_shape():
+    config = parse_server_config([
+        "/opt/models/gemma-4-e4b-mtp",
+        "--speculative-config",
+        ('{"method":"mtp","num_speculative_tokens":3,"draft_top_k":2,'
+         '"verify_tokens":7}'),
+    ])
+    kwargs = config.model.llm_kwargs()
+    assert (kwargs["draft_top_k"], kwargs["draft_step"],
+            kwargs["verify_tokens"]) == (2, 3, 7)
+
+
+def test_speculative_config_agrees_with_matching_flags():
+    config = parse_server_config([
+        "model",
+        "--draft-top-k",
+        "2",
+        "--speculative-config",
+        '{"method":"mtp","draft_top_k":2}',
+    ])
+    assert config.model.draft_top_k == 2
+
+
+@pytest.mark.parametrize("flags,payload,match", [
+    (["--draft-top-k", "1"], '{"method":"mtp","draft_top_k":2}',
+     "draft_top_k=2 conflicts with --draft-top-k 1"),
+    (["--spec-verify-tokens", "5"], '{"method":"mtp","verify_tokens":7}',
+     "verify_tokens=7 conflicts with --spec-verify-tokens 5"),
+    (["--spec-draft-step", "4"], '{"method":"mtp","num_speculative_tokens":3}',
+     "num_speculative_tokens=3 conflicts with --spec-draft-step 4"),
+    (["--spec-proposal-tokens", "4"
+      ], '{"method":"dflash","model":"draft","num_speculative_tokens":3}',
+     "num_speculative_tokens=3 conflicts with --spec-proposal-tokens 4"),
+])
+def test_speculative_config_rejects_conflicting_flags(flags, payload, match):
+    with pytest.raises(ServerConfigError, match=match):
+        parse_server_config(["model", *flags, "--speculative-config", payload])
+
+
+@pytest.mark.parametrize("key", ["draft_top_k", "verify_tokens"])
+def test_speculative_config_rejects_invalid_tree_sizes(key):
+    with pytest.raises(ServerConfigError, match=key):
+        SpeculativeConfig.parse({"method": "mtp", key: 0})
+
+
+def test_prebuilt_tree_needs_no_draft_model(tmp_path):
+    (tmp_path / "llm").mkdir()
+    for name in ("spec_base.engine", "spec_draft.engine"):
+        (tmp_path / "llm" / name).touch()
+    config = parse_server_config([
+        str(tmp_path),
+        "--speculative-config",
+        '{"method":"dflash","num_speculative_tokens":4}',
+    ])
+    spec = config.model.speculative_config
+    assert spec.method == "dflash"
+    assert not spec.draft_model
+    assert SpeculativeConfig.parse(spec, prebuilt=True) == spec

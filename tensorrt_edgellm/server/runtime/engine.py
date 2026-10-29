@@ -54,7 +54,8 @@ from ..parsing.terminal_tokens import (ended_on_stop, strip_terminal_tokens,
 from ..parsing.tool_calling import (ToolConfig, inject_tool_requirement,
                                     parse_assistant_output,
                                     validate_tool_request)
-from .engine_layout import BundleLayout, EngineType, inspect_bundle
+from .engine_layout import (SPEC_BASE_CONFIG_FILE, BundleLayout, EngineType,
+                            inspect_bundle, runtime_config_path)
 
 logger = logging.getLogger("edgellm.server")
 
@@ -71,6 +72,8 @@ _DEFAULT_MAX_BATCH_SIZE = 1
 _DEFAULT_MAX_KV_CACHE_CAPACITY = 8192
 _DEFAULT_DRAFT_TOP_K = 10
 _DEFAULT_DRAFT_STEP = 6
+# Linear depth 4 was the fastest Gemma 4 E4B MTP shape on Orin (AGX, 2026-10).
+_DEFAULT_GEMMA4_MTP_DRAFT_STEP = 4
 _CONTEXT_CACHE_COUNTER_FIELDS = ("admitted_sequences", "hit_sequences",
                                  "media_aware_sequences",
                                  "lookup_bypass_sequences",
@@ -602,7 +605,8 @@ def _resolve_spec_decode_runtime_options(
         resolved_step = (num_speculative_tokens
                          if num_speculative_tokens is not None else draft_step)
         if resolved_step is None:
-            resolved_step = _DEFAULT_DRAFT_STEP
+            resolved_step = (_DEFAULT_GEMMA4_MTP_DRAFT_STEP if engine_method
+                             == "gemma4_mtp" else _DEFAULT_DRAFT_STEP)
         expected_verify = resolved_step + 1
         if top_k == 1 and (verify_tokens is not None
                            and verify_tokens != expected_verify):
@@ -626,6 +630,44 @@ def _resolve_spec_decode_runtime_options(
         )
 
     raise ValueError(f"unsupported speculative engine mode {engine_method!r}")
+
+
+def _log_spec_decode_metrics(response) -> None:
+    """Log draft acceptance per request; vanilla responses report no steps."""
+    verify_counts = list(getattr(response, "spec_verify_counts", ()) or ())
+    if not any(verify_counts):
+        return
+    acceptance = list(getattr(response, "spec_acceptance_lengths", ()) or ())
+    logger.info("[spec-decode] request: verify_steps=%s acceptance=%s",
+                ",".join(str(count) for count in verify_counts),
+                ",".join(f"{length:.2f}" for length in acceptance))
+
+
+def _prebuilt_spec_method(layout: BundleLayout, requested: str) -> str:
+    """Return the speculative method a pre-built bundle was compiled for.
+
+    The draft engine is part of the bundle, so its presence alone enables
+    speculative decoding; a requested method must match the compiled one,
+    which ``_resolve_spec_decode_runtime_options`` verifies.
+    """
+    if layout.engine_type != EngineType.SPEC_DECODE:
+        if requested != "none":
+            raise ValueError(
+                f"speculative method {requested!r} was requested, but the "
+                f"pre-built bundle {layout.engine_dir!r} has no "
+                "spec_base/spec_draft engine pair")
+        return requested
+    if requested != "none":
+        return requested
+    method = _read_json(os.path.join(layout.engine_dir,
+                                     SPEC_BASE_CONFIG_FILE)).get(
+                                         "spec_decode_type", "none")
+    if not isinstance(method, str) or method == "none":
+        raise ValueError(
+            f"pre-built speculative bundle {layout.engine_dir!r} does not "
+            "name its method (base_config.json spec_decode_type); pass "
+            "--speculative-config")
+    return method
 
 
 def _ensure_plugin_path() -> None:
@@ -1080,8 +1122,10 @@ class LLM:
         num_speculative_tokens = None
         if speculative_config:
             from ..config import SpeculativeConfig
+            from .engine_layout import is_prebuilt_engine_tree
 
-            spec = SpeculativeConfig.parse(speculative_config)
+            spec = SpeculativeConfig.parse(
+                speculative_config, prebuilt=is_prebuilt_engine_tree(model))
             if spec.draft_top_k is not None:
                 draft_top_k = spec.draft_top_k
             if spec.verify_tokens is not None:
@@ -1112,8 +1156,18 @@ class LLM:
         self._checkpoint_dir = "" if prepared.prebuilt else prepared.model_dir
         self._draft_checkpoint_dir = ("" if prepared.prebuilt else
                                       prepared.draft_model_dir)
+        layout = inspect_bundle(prepared.bundle_dir)
+        if prepared.prebuilt:
+            spec_method = _prebuilt_spec_method(layout, spec_method)
+        self._spec_decode_type = ""
+        if layout.engine_type == EngineType.SPEC_DECODE:
+            self._spec_decode_type = str(
+                _read_json(
+                    os.path.join(layout.engine_dir,
+                                 SPEC_BASE_CONFIG_FILE)).get(
+                                     "spec_decode_type", ""))
         runtime_options = _resolve_spec_decode_runtime_options(
-            prepared.bundle_dir,
+            layout.engine_dir,
             spec_method,
             num_speculative_tokens,
             draft_top_k,
@@ -1508,6 +1562,8 @@ class LLM:
             self._rt, tool_config)
         request.parallel_tool_calls = tool_config.parallel_tool_calls
         request.disable_spec_decode = params.disable_spec_decode
+        if getattr(self, "_spec_decode_type", "") == "gemma4_mtp":
+            self._apply_gemma4_mtp_request_limits(request, params)
         request.skip_special_tokens = params.skip_special_tokens
         request.ignore_eos = params.ignore_eos
         request.num_logprobs = params.num_logprobs
@@ -1516,6 +1572,34 @@ class LLM:
                                             prefill_state_only)
         request.context_cache_replay_tail_length = replay_tail_length
         return request
+
+    def _apply_gemma4_mtp_request_limits(self, request,
+                                         params: SamplingParams) -> None:
+        """Hold a request to what a Gemma 4 MTP verification engine serves.
+
+        The base engine cannot decode without its draft, and verification is
+        argmax-only: the linear decoder silently decodes greedily and the tree
+        decoder refuses sampled requests. Sampled requests are therefore
+        served greedily on both shapes, with one warning per process.
+        """
+        if params.disable_spec_decode:
+            raise ValueError(
+                "disable_spec_decode is not supported by a Gemma 4 MTP "
+                "deployment: its base engine only runs with the draft. Serve "
+                "a standalone target bundle for target-only decoding.")
+        # A negative temperature is left for the native range check.
+        if (params.temperature < GREEDY_TEMPERATURE_EPSILON
+                or params.top_k == GREEDY_TOP_K):
+            return
+        if not getattr(self, "_warned_spec_greedy", False):
+            self._warned_spec_greedy = True
+            logger.warning(
+                "Gemma 4 MTP verifies greedily: sampled requests "
+                "(temperature=%g, top_p=%g, top_k=%d) are served with greedy "
+                "decoding", params.temperature, params.top_p, params.top_k)
+        request.temperature = 0.0
+        request.top_p = GREEDY_TOP_P
+        request.top_k = GREEDY_TOP_K
 
     def _make_completion_request(
         self,
@@ -1722,6 +1806,7 @@ class LLM:
         if (cache_config is not None and cache_config.enabled
                 and self._runtime is not None):
             self._log_context_reuse_metrics()
+        _log_spec_decode_metrics(response)
         return response
 
     def close(self) -> None:
@@ -2597,7 +2682,7 @@ def load_model(**kwargs):
     else:
         resolved = resolve_model_dir(original_model,
                                      kwargs.get("cache_dir", ""))
-    with open(os.path.join(resolved, "config.json"), encoding="utf-8") as file:
+    with open(runtime_config_path(resolved), encoding="utf-8") as file:
         model_type = json.load(file).get("model_type")
     if model_type == "qwen3_tts":
         runtime_class = TTS

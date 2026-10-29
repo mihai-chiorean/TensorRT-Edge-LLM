@@ -19,6 +19,8 @@ import os
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from ..runtime.engine_layout import runtime_config_path
+
 
 @dataclass(frozen=True)
 class ReasoningDelta:
@@ -289,9 +291,9 @@ class ReasoningParserRegistry:
 def _model_identifiers(model_dir: str) -> List[str]:
     """Read architecture identifiers without relying on checkpoint location."""
     identifiers = [os.path.basename(os.path.normpath(model_dir)).lower()]
-    config_path = os.path.join(model_dir, "config.json")
     try:
-        with open(config_path, encoding="utf-8") as config_file:
+        with open(runtime_config_path(model_dir),
+                  encoding="utf-8") as config_file:
             config = json.load(config_file)
     except (OSError, TypeError, ValueError):
         return identifiers

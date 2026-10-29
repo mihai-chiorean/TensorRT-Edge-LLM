@@ -98,15 +98,26 @@ builder bundle (`llm.engine` at the root), or the tree written by `llm_build`
 and `visual_build` (`llm/llm.engine` next to `visual/visual.engine`). The
 server resolves no checkpoint and builds nothing. A bundle whose runtime config
 lists checkpoint-backed weights loads them from the `checkpoint_dir` recorded
-in that config, so that directory must exist on the serving host. Pre-built
-speculative-decoding bundles are not served this way; pass the checkpoint
-instead:
+in that config, so that directory must exist on the serving host:
 
 ```bash
 tensorrt-edgellm-serve /opt/models/gemma-4-e4b-engines \
   --max-input-len 8192 \
   --max-kv-cache-capacity 16384 \
   --enable-context-reuse
+```
+
+A pre-built speculative-decoding tree holds `spec_base.engine`,
+`spec_draft.engine`, `base_config.json`, and `draft_config.json` in place of
+`llm.engine` and `config.json`. The server takes the method from
+`base_config.json` (`spec_decode_type`); `--speculative-config` may restate it
+and set the drafting shape, but must not name a draft `model`. A Gemma 4 MTP
+tree defaults to a linear depth of 4:
+
+```bash
+tensorrt-edgellm-serve /opt/models/gemma-4-e4b-mtp-engines \
+  --enable-context-reuse \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":4}'
 ```
 
 Compiled bundles use a 50 GiB least-recently-used cache by default. Set
@@ -155,7 +166,9 @@ it is not a limit on total host memory usage.
 ## Speculative Decoding
 
 `--speculative-config` accepts `method`, `model`, `num_speculative_tokens`,
-`draft_top_k`, and `verify_tokens`. The base, draft, and auxiliary model components are
+`draft_top_k`, and `verify_tokens`; a value that disagrees with the matching
+flag (`--draft-top-k`, `--spec-verify-tokens`, `--spec-draft-step` or
+`--spec-proposal-tokens`) is rejected. The base, draft, and auxiliary model components are
 built and cached as one paired runtime. When omitted, the server reads the
 proposal length from the draft checkpoint. For EAGLE3 and MTP,
 `num_speculative_tokens` is the number of sequential draft steps. For DFlash,
@@ -241,7 +254,9 @@ trtedge serve Qwen/Qwen3-4B \
 ```
 
 For a checkpoint containing native MTP layers, select `mtp` without `model`.
-Gemma MTP instead supplies its separate assistant checkpoint as `model`. The
+Gemma MTP instead supplies its separate assistant checkpoint as `model`; it
+defaults to 4 sequential draft steps. For a pre-built Gemma MTP tree, omit
+`model`. The
 server defaults MTP, DFlash, JetSpec, Domino, and dSpark to their linear contracts.
 Where the method supports branching, setting `--draft-top-k` above 1 selects
 its tree contract at runtime. The fixed-ABI base artifact supports both linear
