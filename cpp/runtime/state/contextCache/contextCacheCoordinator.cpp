@@ -802,10 +802,15 @@ public:
         std::vector<int32_t> derived;
         if (commonStateLengths == nullptr || commonStateLengths->empty())
         {
+            auto const& impl = mCoordinator.checkedImpl(request);
+            ELLM_CHECK(advances.size() == impl.sequences.size(),
+                "Context cache decode advances must describe every active sequence");
             derived.reserve(advances.size());
-            for (auto const& advance : advances)
+            for (size_t slot = 0; slot < advances.size(); ++slot)
             {
-                derived.push_back(advance.committedStateLength);
+                bool const held = advances[slot].acceptedTokenCount == 0
+                    && advances[slot].committedStateLength == ContextCacheSequenceAdvance::kHoldCommittedStateLength;
+                derived.push_back(held ? impl.sequences[slot].commonStateLength : advances[slot].committedStateLength);
             }
             commonStateLengths = &derived;
         }
@@ -1718,6 +1723,16 @@ void ContextCacheCoordinator::validateEagleDecodeAdvances(RequestHandle::Impl co
         auto const& sequence = request.sequences[slot];
         auto const& delta = advances[slot];
         int32_t const commonLength = (*commonStateLengths)[slot];
+        // A slot cancelled at the top of a step holds its committed length, as in
+        // validateCommittedLookaheadAdvances; its common state cannot move past that ledger.
+        if (delta.acceptedTokenCount == 0)
+        {
+            ELLM_CHECK(delta.committedStateLength == ContextCacheSequenceAdvance::kHoldCommittedStateLength,
+                "Context cache zero advance must carry the hold sentinel");
+            ELLM_CHECK(commonLength >= sequence.commonStateLength && commonLength <= sequence.committedStateLength,
+                "EAGLE common state is not a monotonic base-state prefix");
+            continue;
+        }
         int64_t const expectedCommittedStateLength
             = static_cast<int64_t>(sequence.committedStateLength) + static_cast<int64_t>(delta.acceptedTokenCount);
         int64_t const expectedTokenCount = static_cast<int64_t>(sequence.committedStateLength) + 1;
