@@ -125,6 +125,17 @@ TEST(WOQInt4GemvTest, accuracyGemv)
     TestInt4GroupwiseGemvAccuracy(1, 640, 1024, 128);
 }
 
+// Group 32 (symmetric Q4_0-style checkpoints): one scale per 32-element K chunk,
+// which is exactly one thread's dequantized span. Cover every instantiated M.
+TEST(WOQInt4GemvTest, accuracyGemvGroup32)
+{
+    for (int m = 1; m <= 6; ++m)
+    {
+        TestInt4GroupwiseGemvAccuracy(m, 384, 896, 32);
+        TestInt4GroupwiseGemvAccuracy(m, 640, 1024, 32);
+    }
+}
+
 // Small-N coverage: when N < CTA_N (=128) the plugin dispatcher falls back to GEMV
 // even for M > 1 (split into <=6-row chunks).  Qwen3.5-4B's GDN in_proj_a / in_proj_b
 // project hidden=2560 -> num_recurrent_heads=32, so N=32, K=2560 is the production

@@ -52,26 +52,27 @@ Each compiled variant exports one C function with the signature:
   per-call memset.
 - `swizzle` — runtime `Int32` grouped-M rasterization width (`1` = none).
 
-## Baked configuration space (16 GEMM variants)
+## Baked configuration space (32 GEMM variants)
 
 An AOT artifact cannot pick a config at runtime, so one exported function is
-baked per selected tile / stage / split-K config and the plugin selects per
-shape:
+baked per selected tile / stage / split-K config and group size, and the plugin
+selects per shape:
 
 | Dimension | Values | Baked? |
 |---|---|---|
 | CTA tile `(M,N,K)` | `16x128x64`, `32x128x64`, `64x128x64`, `128x128x64` | yes |
 | `num_stages` | `2`, `3`, `4` | yes |
 | `split_k` | selected values from `1`, `2`, `4` (in-kernel reduction for `>1`) | yes |
-| `group_size` | `128` only (kernel also supports `32`) | **yes — but fixed at 128 today** |
+| `group_size` | `128`, `32` | yes — one module set per group size (`_g32` suffix for 32) |
 | `swizzle` | grouped-M width | **no — runtime arg** |
 | `num_k_tiles` | `ceil(K/64)` | **no — dynamic in K** |
 
 The 16-entry set is listed in `_INT4_FP16_GEMM_CONFIGS` in
 `kernelSrcs/build_cutedsl.py` and mirrored by the plugin and C++ test X-macros.
-All use the single baked `group_size = 128` and names of the form
-`int4_fp16_gemm_<tile>_s<stages>_sk<splitk>`. Building another group size, or
-shipping both, would multiply the artifact count.
+Each config is baked once per group size in `_INT4_FP16_GROUP_SIZES` (128 and
+32): names of the form `int4_fp16_gemm_<tile>_s<stages>_sk<splitk>` for 128 and
+`..._g32` for 32 (32 GEMM functions in total). The plugin selects the set by its
+`group_size` attribute; the tactic table is shared.
 
 ### Important: split-K correctness contract
 
@@ -91,7 +92,8 @@ prebuilt tarball by default. Follow the shared
 [CuTe DSL kernel development workflow](../README.md#cute-dsl-kernel-development-workflow)
 for the supported Docker and local-venv commands, dependency versions,
 cross-compilation, artifact layout, and CMake configuration. This group emits
-the 16 selected GEMM variants plus eight small-M GEMV variants.
+16 selected GEMM configs and eight small-M GEMV configs, each baked for group
+sizes 128 and 32: 32 GEMM and 16 GEMV functions in total.
 
 Supported SMs: **SM80 and newer**. The kernel uses the SM80 instruction floor
 (`cp.async` + `mma.sync` 16×8×16 + `ldmatrix`), which is forward-compatible and
@@ -135,8 +137,8 @@ imports Torch via `int4_reference`.
 
 | File | Role |
 |---|---|
-| `unittests/kernelSrcs/int4_fp16_gemm_cutedsl/int4Fp16GemmCuteDslTests.cu` | gtest: random inputs → CPU FP32 reference → launch → compare. Covers all 16 baked GEMM variants plus residual-M and non-64-aligned-N cases; tolerance `relErr < 0.05`. |
-| `unittests/kernelSrcs/int4_fp16_gemm_cutedsl/int4Fp16GemvCuteDslTests.cu` | gtest for the eight decode GEMV variants, including non-64-aligned `N`. |
+| `unittests/kernelSrcs/int4_fp16_gemm_cutedsl/int4Fp16GemmCuteDslTests.cu` | gtest: random inputs → CPU FP32 reference → launch → compare. Covers all 32 baked GEMM variants plus residual-M and non-64-aligned-N cases; tolerance `relErr < 0.05`. |
+| `unittests/kernelSrcs/int4_fp16_gemm_cutedsl/int4Fp16GemvCuteDslTests.cu` | gtest for the 16 decode GEMV variants, including non-64-aligned `N`. |
 
 The tests drive the AOT artifact directly, independently of
 `Int4GroupwiseGemmPluginV2`: an X-macro table generates module declarations,

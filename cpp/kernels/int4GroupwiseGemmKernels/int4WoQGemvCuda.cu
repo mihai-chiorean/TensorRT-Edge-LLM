@@ -213,10 +213,16 @@ __global__ void gemv_kernel(
     }
 }
 
-void gemv_forward_cuda_new(half const* in_feats, int8_t const* weights_device, half const* scaling_factors,
-    half* out_feats, int m, int n, int k, int group_size, cudaStream_t stream)
+namespace
 {
-    auto kernel = reinterpret_cast<uint32_t const*>(weights_device);
+// Each thread dequantizes 32 contiguous K elements (MEM_ACCESS_SIZE / 4) with one
+// scale, and those chunks start at multiples of 32, so any GroupSize that is a
+// multiple of 32 maps a thread's chunk into a single group.
+template <int GroupSize>
+void launch_gemv(half const* in_feats, uint32_t const* kernel, half const* scaling_factors, half* out_feats, int m,
+    int n, int k, cudaStream_t stream)
+{
+    static_assert(GroupSize % (MEM_ACCESS_SIZE / 4) == 0, "GroupSize must cover whole per-thread K chunks");
     static constexpr int N_PER_BLOCK = 2;
     static constexpr int K_INTERLEAVE = 4;
     static constexpr int BLOCK_SIZE = 256;
@@ -224,35 +230,49 @@ void gemv_forward_cuda_new(half const* in_feats, int8_t const* weights_device, h
     dim3 num_blocks(n / N_PER_BLOCK / K_INTERLEAVE);
     dim3 num_threads(BLOCK_SIZE);
 
-    ELLM_CHECK(group_size == 128,
-        "Unsupported group size " + std::to_string(group_size) + " for gemv kernel; only 128 is supported.");
     switch (m)
     {
     case 1:
-        gemv_kernel<N_PER_BLOCK, 1, BLOCK_SIZE, 128>
+        gemv_kernel<N_PER_BLOCK, 1, BLOCK_SIZE, GroupSize>
             <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
         break;
     case 2:
-        gemv_kernel<N_PER_BLOCK, 2, BLOCK_SIZE, 128>
+        gemv_kernel<N_PER_BLOCK, 2, BLOCK_SIZE, GroupSize>
             <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
         break;
     case 3:
-        gemv_kernel<N_PER_BLOCK, 3, BLOCK_SIZE, 128>
+        gemv_kernel<N_PER_BLOCK, 3, BLOCK_SIZE, GroupSize>
             <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
         break;
     case 4:
-        gemv_kernel<N_PER_BLOCK, 4, BLOCK_SIZE, 128>
+        gemv_kernel<N_PER_BLOCK, 4, BLOCK_SIZE, GroupSize>
             <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
         break;
     case 5:
-        gemv_kernel<N_PER_BLOCK, 5, BLOCK_SIZE, 128>
+        gemv_kernel<N_PER_BLOCK, 5, BLOCK_SIZE, GroupSize>
             <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
         break;
     case 6:
-        gemv_kernel<N_PER_BLOCK, 6, BLOCK_SIZE, 128>
+        gemv_kernel<N_PER_BLOCK, 6, BLOCK_SIZE, GroupSize>
             <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
         break;
     default: throw std::runtime_error("Unsupported batch size for gemv kernel.\n");
+    }
+}
+} // namespace
+
+void gemv_forward_cuda_new(half const* in_feats, int8_t const* weights_device, half const* scaling_factors,
+    half* out_feats, int m, int n, int k, int group_size, cudaStream_t stream)
+{
+    auto kernel = reinterpret_cast<uint32_t const*>(weights_device);
+    switch (group_size)
+    {
+    case 128: launch_gemv<128>(in_feats, kernel, scaling_factors, out_feats, m, n, k, stream); break;
+    case 32: launch_gemv<32>(in_feats, kernel, scaling_factors, out_feats, m, n, k, stream); break;
+    default:
+        ELLM_CHECK(false,
+            "Unsupported group size " + std::to_string(group_size)
+                + " for gemv kernel; only 32 and 128 are supported.");
     }
 }
 
