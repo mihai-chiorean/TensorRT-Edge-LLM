@@ -946,6 +946,7 @@ class LLM:
         context_cache_config: Optional[Union[ContextCacheConfig,
                                              Mapping[str, Any]]] = None,
         enable_in_flight_batching: bool = False,
+        host_embedding_tables: bool = False,
         on_progress: Optional[Callable[[str], None]] = None,
     ):
         if not model:
@@ -979,6 +980,7 @@ class LLM:
         self._context_cache_config = ContextCacheConfig.parse(
             context_cache_config)
         self._enable_in_flight_batching = enable_in_flight_batching
+        self._host_embedding_tables = host_embedding_tables
         self._admission_sem = threading.Semaphore(1)
         self._infer_lock = threading.Lock()
         self._close_lock = threading.Lock()
@@ -1110,6 +1112,9 @@ class LLM:
             reason = ifb_unsupported_reason(self._layout)
             if reason:
                 raise _ifb_unsupported_error(reason)
+        host_embedding_tables = getattr(self, "_host_embedding_tables", False)
+        if host_embedding_tables:
+            _check_host_embedding_tables(self._layout, self._engine_dir)
         if self._layout.engine_type == EngineType.SPEC_DECODE:
             logger.info(
                 "Speculative decoding enabled (top_k=%d, step=%d, "
@@ -1146,6 +1151,7 @@ class LLM:
                     self._checkpoint_dir,
                     context_cache_config,
                     max_batch_size=self._max_batch_size,
+                    host_embedding_tables=host_embedding_tables,
                 )
                 logger.info("In-flight batching enabled (max_batch_size=%d)",
                             self._max_batch_size)
@@ -1175,6 +1181,7 @@ class LLM:
                 {},
                 self._checkpoint_dir,
                 context_cache_config,
+                host_embedding_tables=host_embedding_tables,
             )
         if getattr(self, "_runtime", None) is not None:
             self._runtime.capture_decoding_cuda_graph()
@@ -2406,6 +2413,24 @@ class TTS:
         run_http_server(EngineClient(self, config), config)
 
 
+def _check_host_embedding_tables(layout, engine_dir: str) -> None:
+    if layout.engine_type == EngineType.SPEC_DECODE:
+        raise ValueError("--host-embedding-tables is not supported with "
+                         "speculative decoding")
+    if layout.has_speech:
+        raise ValueError(
+            "--host-embedding-tables does not support Qwen3-Omni audio "
+            "output: the Talker reads the Thinker embedding table on the GPU")
+    # Only an export with an embedding sidecar (--int8-embedding) can be
+    # host-mapped; engines this server builds from a checkpoint keep the
+    # tables checkpoint-backed.
+    if not os.path.isfile(os.path.join(engine_dir, "embedding.safetensors")):
+        raise ValueError(
+            "--host-embedding-tables needs an engine tree with the "
+            "embedding.safetensors sidecar, as written by an "
+            "--int8-embedding export")
+
+
 def load_model(**kwargs):
     """Select the model-specific runtime from provider checkpoint metadata."""
     from .engine_build import prebuilt_bundle_layout, resolve_model_dir
@@ -2429,6 +2454,9 @@ def load_model(**kwargs):
         if kwargs.pop("speculative_config", None):
             raise ValueError(
                 "standalone TTS models do not support speculative decoding")
+        if kwargs.pop("host_embedding_tables", False):
+            raise ValueError(
+                "standalone TTS models have no embedding sidecar tables")
         if kwargs.pop("enable_in_flight_batching", False):
             raise _ifb_unsupported_error(
                 ifb_unsupported_reason(None, model_type=model_type))
