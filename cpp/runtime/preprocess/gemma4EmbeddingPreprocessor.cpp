@@ -32,22 +32,41 @@ namespace rt
 
 Gemma4EmbeddingPreprocessor::Gemma4EmbeddingPreprocessor(std::filesystem::path const& engineDir,
     LLMEngineConfig const& config, int32_t maxBatchSize, int32_t maxSeqLen, TensorMap& tensorMap, cudaStream_t stream,
-    std::optional<Tensor> checkpointTable)
+    std::optional<Tensor> checkpointTable, EmbeddingTableResidency residency)
     : mConfig(config)
 {
     ELLM_CHECK(mConfig.pleEnabled, "Gemma4EmbeddingPreprocessor constructed while PLE is disabled");
     ELLM_CHECK(maxBatchSize > 0, "Gemma4EmbeddingPreprocessor requires positive max batch size");
     ELLM_CHECK(maxSeqLen > 0, "Gemma4EmbeddingPreprocessor requires positive max sequence length");
 
-    if (checkpointTable.has_value())
+    std::filesystem::path const plePath = engineDir / binding_names::kPleEmbeddingFileName;
+    nvinfer1::DataType tableDataType{};
+    Coords tableShape;
+    std::optional<Coords> scaleShape;
+    if (residency == EmbeddingTableResidency::kHostMapped)
+    {
+        ELLM_CHECK(!checkpointTable.has_value(), "A checkpoint-backed PLE table cannot stay host-mapped");
+        mHostTable = std::make_unique<HostRowTable>(plePath, "weight", "weight_scale");
+        tableDataType = mHostTable->dataType();
+        tableShape = mHostTable->shape();
+        if (mHostTable->hasScales())
+        {
+            scaleShape = mHostTable->scaleShape();
+        }
+        mStaging = std::make_unique<RowStaging>(
+            *mHostTable, static_cast<int64_t>(maxBatchSize) * maxSeqLen, "Gemma4EmbeddingPreprocessor::staging");
+        mStagedIds.resize(static_cast<size_t>(maxBatchSize) * maxSeqLen);
+    }
+    else if (checkpointTable.has_value())
     {
         ELLM_CHECK(checkpointTable->getDataType() != nvinfer1::DataType::kINT8,
             "Checkpoint-backed INT8 PLE requires scale ownership and is not supported");
         mPleTable = std::move(*checkpointTable);
+        tableDataType = mPleTable.getDataType();
+        tableShape = mPleTable.getShape();
     }
     else
     {
-        std::filesystem::path const plePath = engineDir / binding_names::kPleEmbeddingFileName;
         std::vector<Tensor> pleTensors;
         ELLM_CHECK(safetensors::loadSafetensors(plePath, pleTensors, stream),
             "Failed to load " + std::string(binding_names::kPleEmbeddingFileName)
@@ -73,6 +92,8 @@ Gemma4EmbeddingPreprocessor::Gemma4EmbeddingPreprocessor(std::filesystem::path c
             ELLM_CHECK(pleTensors.size() == 2 && scales != nullptr,
                 "INT8 ple_embedding.safetensors must contain exactly weight and weight_scale");
             mPleScales = std::move(*scales);
+            ELLM_CHECK(mPleScales.getDataType() == nvinfer1::DataType::kFLOAT, "INT8 PLE scales must be FP32");
+            scaleShape = mPleScales.getShape();
         }
         else
         {
@@ -80,35 +101,35 @@ Gemma4EmbeddingPreprocessor::Gemma4EmbeddingPreprocessor(std::filesystem::path c
                 "FP16/BF16 ple_embedding.safetensors must contain exactly one tensor named weight");
         }
         mPleTable = std::move(*weight);
+        tableDataType = mPleTable.getDataType();
+        tableShape = mPleTable.getShape();
     }
 
-    auto const pleShape = mPleTable.getShape();
-    ELLM_CHECK(pleShape.getNumDims() == 2, "PLE table must be 2D [vocab, num_layers * hidden]");
-    ELLM_CHECK(pleShape[0] > 0, "PLE table vocab dimension must be positive");
-    ELLM_CHECK(pleShape[1] == static_cast<int64_t>(mConfig.numPleInputs) * mConfig.pleHiddenSize,
+    ELLM_CHECK(tableShape.getNumDims() == 2, "PLE table must be 2D [vocab, num_layers * hidden]");
+    ELLM_CHECK(tableShape[0] > 0, "PLE table vocab dimension must be positive");
+    ELLM_CHECK(tableShape[1] == static_cast<int64_t>(mConfig.numPleInputs) * mConfig.pleHiddenSize,
         "PLE table second dimension must equal num_ple_inputs * ple_hidden_size");
+    mVocabSize = static_cast<int32_t>(tableShape[0]);
+    bool const isInt8Ple = tableDataType == nvinfer1::DataType::kINT8;
     if (mConfig.imageTokenId >= 0 || mConfig.audioTokenId >= 0)
     {
-        ELLM_CHECK(mConfig.padTokenId >= 0 && mConfig.padTokenId < pleShape[0],
+        ELLM_CHECK(mConfig.padTokenId >= 0 && mConfig.padTokenId < tableShape[0],
             "Gemma4 multimodal PLE pad_token_id is outside the PLE table vocabulary");
     }
-    bool const isInt8Ple = mPleTable.getDataType() == nvinfer1::DataType::kINT8;
-    ELLM_CHECK(mPleTable.getDataType() == nvinfer1::DataType::kHALF
-            || mPleTable.getDataType() == nvinfer1::DataType::kBF16 || isInt8Ple,
+    ELLM_CHECK(tableDataType == nvinfer1::DataType::kHALF || tableDataType == nvinfer1::DataType::kBF16 || isInt8Ple,
         "PLE table must be FP16, BF16, or INT8");
     if (isInt8Ple)
     {
-        ELLM_CHECK(mPleScales.getDataType() == nvinfer1::DataType::kFLOAT, "INT8 PLE scales must be FP32");
-        ELLM_CHECK(mPleScales.getShape().getNumDims() == 2, "INT8 PLE scales must be 2D [vocab, num_layers]");
-        ELLM_CHECK(mPleScales.getShape()[0] == pleShape[0], "INT8 PLE scale rows must match the table vocab size");
         ELLM_CHECK(
-            mPleScales.getShape()[1] == mConfig.numPleInputs, "INT8 PLE scale columns must match num_ple_inputs");
+            scaleShape.has_value() && scaleShape->getNumDims() == 2, "INT8 PLE scales must be 2D [vocab, num_layers]");
+        ELLM_CHECK((*scaleShape)[0] == tableShape[0], "INT8 PLE scale rows must match the table vocab size");
+        ELLM_CHECK((*scaleShape)[1] == mConfig.numPleInputs, "INT8 PLE scale columns must match num_ple_inputs");
         mPleOutputDataType = nvinfer1::DataType::kHALF;
     }
     else
     {
-        ELLM_CHECK(mPleScales.getShape().volume() == 0, "PLE scales are only valid for an INT8 table");
-        mPleOutputDataType = mPleTable.getDataType();
+        ELLM_CHECK(!scaleShape.has_value(), "PLE scales are only valid for an INT8 table");
+        mPleOutputDataType = tableDataType;
     }
 
     mPleOutputBuffer = Tensor({mConfig.numPleInputs, maxBatchSize, maxSeqLen, mConfig.pleHiddenSize}, DeviceType::kGPU,
@@ -121,9 +142,9 @@ Gemma4EmbeddingPreprocessor::Gemma4EmbeddingPreprocessor(std::filesystem::path c
         tensorMap.set(mPleOutputViews.back().getName(), mPleOutputViews.back());
     }
 
-    LOG_INFO("Initialized Gemma4 PLE preprocessor: table=%s outputBuffer=%s numPleInputs=%d pleHiddenSize=%d",
-        mPleTable.getShape().formatString().c_str(), mPleOutputBuffer.getShape().formatString().c_str(),
-        mConfig.numPleInputs, mConfig.pleHiddenSize);
+    LOG_INFO("Initialized Gemma4 PLE preprocessor: table=%s (%s) outputBuffer=%s numPleInputs=%d pleHiddenSize=%d",
+        tableShape.formatString().c_str(), isHostResident() ? "host-mapped" : "device",
+        mPleOutputBuffer.getShape().formatString().c_str(), mConfig.numPleInputs, mConfig.pleHiddenSize);
 }
 
 Tensor Gemma4EmbeddingPreprocessor::makeTokenMajorOutputViewForLayer(int32_t layerIdx, int64_t physicalTokens)
@@ -150,15 +171,39 @@ void Gemma4EmbeddingPreprocessor::reshapeOutputsTokenMajor(int64_t physicalToken
     }
 }
 
-void Gemma4EmbeddingPreprocessor::embed(Tensor const& tokenIds, cudaStream_t stream)
+void Gemma4EmbeddingPreprocessor::embed(Tensor const& tokenIds, int32_t const* hostTokenIds, cudaStream_t stream)
 {
     auto const tokenShape = tokenIds.getShape();
     ELLM_CHECK(tokenShape.getNumDims() == 2, "Gemma4 PLE token IDs must be [batch, seq_len]");
-    OptionalInputTensor const scales
-        = mPleScales.getShape().volume() > 0 ? OptionalInputTensor{mPleScales} : std::nullopt;
-    kernel::gemma4PleGather(tokenIds, mPleTable, mPleOutputBuffer, mConfig.numPleInputs, mConfig.pleHiddenSize,
-        mConfig.imageTokenId, mConfig.audioTokenId, mConfig.padTokenId, stream, scales);
-    reshapeOutputsTokenMajor(tokenShape[0] * tokenShape[1]);
+    int64_t const physicalTokens = tokenShape[0] * tokenShape[1];
+    if (mStaging)
+    {
+        ELLM_CHECK(hostTokenIds != nullptr, "A host-mapped PLE table needs the token ids in host memory");
+        // Staged rows are indexed by position, so media placeholders must stage the PAD row here.
+        int32_t const* stagedIds = hostTokenIds;
+        if (mConfig.imageTokenId >= 0 || mConfig.audioTokenId >= 0)
+        {
+            for (int64_t i = 0; i < physicalTokens; ++i)
+            {
+                int32_t const id = hostTokenIds[i];
+                bool const media = id == mConfig.imageTokenId || id == mConfig.audioTokenId;
+                mStagedIds[i] = media ? mConfig.padTokenId : id;
+            }
+            stagedIds = mStagedIds.data();
+        }
+        mStaging->upload(stagedIds, physicalTokens, stream);
+        kernel::gemma4PleGather(tokenIds, mStaging->rows(), mPleOutputBuffer, mConfig.numPleInputs,
+            mConfig.pleHiddenSize, mConfig.imageTokenId, mConfig.audioTokenId, mConfig.padTokenId, stream,
+            mStaging->scales(), mVocabSize);
+    }
+    else
+    {
+        OptionalInputTensor const scales
+            = mPleScales.getShape().volume() > 0 ? OptionalInputTensor{mPleScales} : std::nullopt;
+        kernel::gemma4PleGather(tokenIds, mPleTable, mPleOutputBuffer, mConfig.numPleInputs, mConfig.pleHiddenSize,
+            mConfig.imageTokenId, mConfig.audioTokenId, mConfig.padTokenId, stream, scales);
+    }
+    reshapeOutputsTokenMajor(physicalTokens);
 }
 
 } // namespace rt

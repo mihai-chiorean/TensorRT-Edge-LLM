@@ -55,6 +55,8 @@ struct ModelArtifacts
     //! publishes it into its own tensor map.
     ExternalWeightManager draftWeights;
     EmbeddingData embedding;
+    //! Residency of `embedding` and of the Gemma4 PLE sidecar the runtime loads for a PLE-enabled base engine.
+    EmbeddingTableResidency embeddingTableResidency{EmbeddingTableResidency::kDevice};
     std::optional<Tensor> pleEmbedding; //!< Gemma4 per-layer embedding; absent unless the base engine enables PLE.
     std::optional<Tensor> vocabMap;     //!< Reduced-vocab mapping table; absent unless the base vocab is reduced.
     std::unique_ptr<tokenizer::Tokenizer> tokenizer;
@@ -67,11 +69,14 @@ struct ModelArtifacts
     //!
     //! `draftCheckpointDir` must be empty for native MTP, whose draft weights are part of `checkpointDir`; the
     //! returned artifacts record it as equal to `checkpointDir` in that case.
+    //! `embeddingTableResidency` of kHostMapped keeps the embedding sidecar mapped in host memory; it requires the
+    //! sidecar files (no checkpoint-backed tables).
     static ModelArtifacts loadFromEngineDir(std::filesystem::path const& engineDir,
         std::optional<SpecDecodeDraftingConfig> const& draftingConfig, std::filesystem::path const& checkpointDir,
         std::filesystem::path const& draftCheckpointDir, bool contextReuseEnabled, cudaStream_t stream,
         std::function<void()> const& checkCancelled = {},
-        std::optional<std::filesystem::path> const& runtimeCachePath = std::nullopt);
+        std::optional<std::filesystem::path> const& runtimeCachePath = std::nullopt,
+        EmbeddingTableResidency embeddingTableResidency = EmbeddingTableResidency::kDevice);
 };
 
 } // namespace rt

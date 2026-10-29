@@ -479,6 +479,46 @@ TEST_F(RequestValidationTest, RejectsMediaThisDeploymentHasNoRunnerFor)
     expectRejectedWithoutRunning(withTrajectory);
 }
 
+// The Qwen3-Omni Talker pipeline reads the Thinker embedding table as a dense device tensor, and a host-mapped
+// table has no device copy of it.
+//
+// Given a deployment whose embedding table stays mapped in host memory
+// When a request asks for the Thinker embedding output the Talker consumes
+// Then it is refused without running a forward pass, while an ordinary request still runs
+TEST_F(RequestValidationTest, RejectsThinkerEmbeddingOutputForAHostMappedEmbeddingTable)
+{
+    auto const sidecarDir = makeScratchDir("requestValidationTests");
+    std::vector<rt::Tensor> tensors;
+    tensors.emplace_back(rt::Coords{kVocabSize, 64}, rt::DeviceType::kCPU, nvinfer1::DataType::kHALF, "embedding");
+    ASSERT_TRUE(rt::safetensors::saveSafetensors(sidecarDir / "embedding.safetensors", tensors, nullptr));
+
+    auto engine = makeEngine();
+    EXPECT_CALL(*engine, execute(::testing::_)).Times(0);
+    auto artifacts = makeVanillaArtifacts(mModelDir, std::move(engine), mStream);
+    artifacts.embedding = rt::mapEmbeddingTable(sidecarDir / "embedding.safetensors");
+    artifacts.embeddingTableResidency = rt::EmbeddingTableResidency::kHostMapped;
+    auto runtime = makeRuntime(std::move(artifacts));
+
+    rt::LLMGenerationResponse response;
+    EXPECT_FALSE(runtime.handleRequest(validRequest(), response, mStream, /*outputThinkerEmbeddings=*/true));
+    EXPECT_TRUE(response.outputIds.empty());
+    EXPECT_TRUE(response.outputTexts.empty());
+    EXPECT_TRUE(response.finishReasons.empty());
+
+    // The refusal is about the embedding output, not about the host-mapped table: the same deployment answers
+    // a request that does not ask for it.
+    auto runningEngine = makeEngine();
+    EXPECT_CALL(*runningEngine, execute(::testing::_)).WillRepeatedly(emit({}));
+    auto runningArtifacts = makeVanillaArtifacts(mModelDir, std::move(runningEngine), mStream);
+    runningArtifacts.embedding = rt::mapEmbeddingTable(sidecarDir / "embedding.safetensors");
+    runningArtifacts.embeddingTableResidency = rt::EmbeddingTableResidency::kHostMapped;
+    auto runningRuntime = makeRuntime(std::move(runningArtifacts));
+    rt::LLMGenerationResponse runningResponse;
+    EXPECT_TRUE(runningRuntime.handleRequest(validRequest(), runningResponse, mStream));
+
+    std::filesystem::remove_all(sidecarDir);
+}
+
 // The response is cleared before validation, not after it. Without that, a
 // caller that reuses one response object and ignores the return value reads the
 // previous request's tokens as this request's answer.

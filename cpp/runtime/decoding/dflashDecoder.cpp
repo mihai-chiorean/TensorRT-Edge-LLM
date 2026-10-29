@@ -1015,7 +1015,7 @@ void DFlashDecoder::runBaseVerificationEmbeddingLookup(int32_t batchSize, int32_
         mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, stream);
     if (mRuntime.preprocess.gemma4Ple)
     {
-        mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, stream);
+        mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, nullptr, stream);
     }
 }
 

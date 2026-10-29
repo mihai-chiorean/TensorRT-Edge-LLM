@@ -111,7 +111,8 @@ public:
         ParallelMapping const& mapping, tokenizer::Tokenizer& tokenizer,
         chat_template::ChatTemplate const& chatTemplate, ContextCacheConfig const& contextCacheConfig,
         std::string const& checkpointDir, std::string const& draftCheckpointDir,
-        std::optional<std::filesystem::path> const& runtimeCachePath = std::nullopt);
+        std::optional<std::filesystem::path> const& runtimeCachePath = std::nullopt,
+        EmbeddingTableResidency embeddingTableResidency = EmbeddingTableResidency::kDevice);
 
     LLMRankRuntime(ModelArtifacts&& artifacts, std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap,
@@ -432,6 +433,7 @@ public:
     //! Get the embedding table (for Talker streaming pipeline)
     rt::Tensor const& getEmbeddingTable() const
     {
+        ELLM_CHECK(!mEmbedding.isHostResident(), "The embedding table is host-mapped and has no device copy");
         return mEmbedding.table;
     }
 
@@ -519,7 +521,7 @@ private:
         ParallelMapping const& mapping, tokenizer::Tokenizer& tokenizer,
         chat_template::ChatTemplate const& chatTemplate, ContextCacheConfig const& contextCacheConfig,
         std::string const& checkpointDir, std::string const& draftCheckpointDir,
-        std::optional<std::filesystem::path> const& runtimeCachePath);
+        std::optional<std::filesystem::path> const& runtimeCachePath, EmbeddingTableResidency embeddingTableResidency);
 
     void initializeCommon(ModelArtifacts&& artifacts, std::string const& engineDir,
         std::string const& multimodalEngineDir, std::unordered_map<std::string, std::string> const& loraWeightsMap,
