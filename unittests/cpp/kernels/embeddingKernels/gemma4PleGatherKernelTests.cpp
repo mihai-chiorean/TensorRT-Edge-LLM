@@ -204,7 +204,7 @@ int8_t int8TableValue(int32_t tokenId, int32_t layerIdx, int32_t hiddenIdx)
 
 void runInt8GatherTest(std::vector<int32_t> const& inputIds, int32_t batchSize, int32_t seqLen, int32_t maxBatchSize,
     int32_t maxSeqLen, int32_t vocabSize, int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId,
-    int32_t audioTokenId)
+    int32_t audioTokenId, int32_t padTokenId = 0)
 {
     rt::Tensor inputIdsDevice({batchSize, seqLen}, rt::DeviceType::kGPU, DataType::kINT32);
     rt::Tensor tableDevice({vocabSize, numLayers * pleHiddenSize}, rt::DeviceType::kGPU, DataType::kINT8);
@@ -240,7 +240,7 @@ void runInt8GatherTest(std::vector<int32_t> const& inputIds, int32_t batchSize, 
     copyHostToDevice(outputDevice, initialOutput);
 
     kernel::gemma4PleGather(inputIdsDevice, tableDevice, outputDevice, numLayers, pleHiddenSize, imageTokenId,
-        audioTokenId, /* padTokenId = */ 0, nullptr, rt::OptionalInputTensor{scalesDevice});
+        audioTokenId, padTokenId, nullptr, rt::OptionalInputTensor{scalesDevice});
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<half> const output = copyDeviceToHost<half>(outputDevice);
@@ -253,7 +253,8 @@ void runInt8GatherTest(std::vector<int32_t> const& inputIds, int32_t batchSize, 
             for (int32_t seqIdx = 0; seqIdx < seqLen; ++seqIdx)
             {
                 size_t const tokenOffset = static_cast<size_t>(batchIdx) * seqLen + seqIdx;
-                int32_t const tokenId = inputIds[tokenOffset];
+                int32_t const row
+                    = expectedRow(inputIds[tokenOffset], vocabSize, imageTokenId, audioTokenId, padTokenId);
                 for (int32_t hiddenIdx = 0; hiddenIdx < pleHiddenSize; ++hiddenIdx)
                 {
                     size_t const outputOffset
@@ -261,10 +262,10 @@ void runInt8GatherTest(std::vector<int32_t> const& inputIds, int32_t batchSize, 
                     written[outputOffset] = true;
                     // The kernel rounds the single-precision product to FP16 once; the reference does the same,
                     // so the comparison is exact.
-                    half const expected = shouldZeroFill(tokenId, vocabSize, imageTokenId, audioTokenId)
+                    half const expected = row < 0
                         ? half{}
-                        : __float2half(static_cast<float>(int8TableValue(tokenId, layerIdx, hiddenIdx))
-                              * scales[static_cast<size_t>(tokenId) * numLayers + layerIdx]);
+                        : __float2half(static_cast<float>(int8TableValue(row, layerIdx, hiddenIdx))
+                              * scales[static_cast<size_t>(row) * numLayers + layerIdx]);
                     EXPECT_EQ(__half2float(output[outputOffset]), __half2float(expected))
                         << "layer=" << layerIdx << " batch=" << batchIdx << " seq=" << seqIdx
                         << " hidden=" << hiddenIdx;
@@ -330,7 +331,7 @@ TEST(Gemma4PleGatherKernelTest, GathersBfloat16LayerOutputs)
         kPleHiddenSize, /* imageTokenId = */ -1, /* audioTokenId = */ -1);
 }
 
-TEST(Gemma4PleGatherKernelTest, DequantizesInt8RowsAndZeroFillsSpecialTokens)
+TEST(Gemma4PleGatherKernelTest, DequantizesInt8RowsZeroFillsInvalidAndPadsMultimodalTokens)
 {
     constexpr int32_t kBatchSize = 1;
     constexpr int32_t kSeqLen = 6;
@@ -344,7 +345,7 @@ TEST(Gemma4PleGatherKernelTest, DequantizesInt8RowsAndZeroFillsSpecialTokens)
     std::vector<int32_t> const inputIds{0, 2, -1, kVocabSize, kImageTokenId, kAudioTokenId};
 
     runInt8GatherTest(inputIds, kBatchSize, kSeqLen, kMaxBatchSize, kMaxSeqLen, kVocabSize, kNumLayers, kPleHiddenSize,
-        kImageTokenId, kAudioTokenId);
+        kImageTokenId, kAudioTokenId, /* padTokenId = */ 1);
 }
 
 // Gemma 4 E4B geometry: 42 layer inputs of 256 elements; a 256-element slice is exactly one warp of 8-element
@@ -548,13 +549,14 @@ TEST(Gemma4PleGatherKernelTest, Int8SidecarLoadsThroughPreprocessor)
 }
 
 // The host-mapped preprocessor gathers rows on the CPU and must produce the same bytes as the device-resident one,
-// including zero rows for placeholder and out-of-vocabulary ids.
+// including PAD rows for media placeholders and zero rows for out-of-vocabulary ids.
 TEST(Gemma4PleGatherKernelTest, HostMappedInt8SidecarMatchesDeviceResident)
 {
     constexpr int32_t kVocabSize = 7;
     constexpr int32_t kNumLayers = 3;
     constexpr int32_t kPleHiddenSize = 16;
     constexpr int32_t kImageTokenId = 5;
+    constexpr int32_t kPadTokenId = 2;
     std::vector<int8_t> table(static_cast<size_t>(kVocabSize) * kNumLayers * kPleHiddenSize);
     for (size_t idx = 0; idx < table.size(); ++idx)
     {
@@ -583,6 +585,7 @@ TEST(Gemma4PleGatherKernelTest, HostMappedInt8SidecarMatchesDeviceResident)
     config.numPleInputs = kNumLayers;
     config.pleHiddenSize = kPleHiddenSize;
     config.imageTokenId = kImageTokenId;
+    config.padTokenId = kPadTokenId;
     std::vector<int32_t> const ids{3, kImageTokenId, 0, -1, kVocabSize, 6};
     rt::Tensor inputIds({2, 3}, rt::DeviceType::kGPU, DataType::kINT32);
     copyHostToDevice(inputIds, ids);
@@ -621,11 +624,22 @@ TEST(Gemma4PleGatherKernelTest, HostMappedInt8SidecarMatchesDeviceResident)
             << "layer " << layerIdx;
         EXPECT_EQ(std::memcmp(pleOnly[layerIdx].data(), host[layerIdx].data(), host[layerIdx].size() * sizeof(half)), 0)
             << "layer " << layerIdx;
-        // Row 0 is token 3, layer layerIdx; row 1 is the image placeholder and must be zero.
-        float const expected = static_cast<float>(table[(3 * kNumLayers + layerIdx) * kPleHiddenSize])
-            * scales[3 * kNumLayers + layerIdx];
-        EXPECT_EQ(__half2float(host[layerIdx][0]), __half2float(__float2half(expected)));
-        EXPECT_EQ(__half2float(host[layerIdx][kPleHiddenSize]), 0.0F);
+        // Rows hold ids {3, image, 0, -1, vocab, 6}; the image row must equal the PAD row, and the -1/vocab
+        // rows must stay zero.
+        for (int32_t hiddenIdx = 0; hiddenIdx < kPleHiddenSize; ++hiddenIdx)
+        {
+            float const expected
+                = static_cast<float>(table[(3 * kNumLayers + layerIdx) * kPleHiddenSize + hiddenIdx])
+                    * scales[3 * kNumLayers + layerIdx];
+            EXPECT_EQ(__half2float(host[layerIdx][hiddenIdx]), __half2float(__float2half(expected)));
+            float const padExpected
+                = static_cast<float>(table[(kPadTokenId * kNumLayers + layerIdx) * kPleHiddenSize + hiddenIdx])
+                    * scales[kPadTokenId * kNumLayers + layerIdx];
+            EXPECT_EQ(
+                __half2float(host[layerIdx][kPleHiddenSize + hiddenIdx]), __half2float(__float2half(padExpected)));
+            EXPECT_EQ(__half2float(host[layerIdx][3 * kPleHiddenSize + hiddenIdx]), 0.0F);
+            EXPECT_EQ(__half2float(host[layerIdx][4 * kPleHiddenSize + hiddenIdx]), 0.0F);
+        }
     }
     std::filesystem::remove_all(testDir);
 }
@@ -712,6 +726,7 @@ TEST(Gemma4PleGatherKernelTest, Int4SidecarMatchesReferenceInBothResidencies)
     constexpr int32_t kRowWidth = kNumLayers * kPleHiddenSize;
     constexpr int32_t kGroup = 32;
     constexpr int32_t kImageTokenId = 2;
+    constexpr int32_t kPadTokenId = 1;
     std::vector<uint8_t> packed(static_cast<size_t>(kVocabSize) * kRowWidth / 2, 0);
     std::vector<half> scales(static_cast<size_t>(kVocabSize) * kRowWidth / kGroup);
     std::vector<float> reference(static_cast<size_t>(kVocabSize) * kRowWidth);
@@ -748,6 +763,7 @@ TEST(Gemma4PleGatherKernelTest, Int4SidecarMatchesReferenceInBothResidencies)
     config.numPleInputs = kNumLayers;
     config.pleHiddenSize = kPleHiddenSize;
     config.imageTokenId = kImageTokenId;
+    config.padTokenId = kPadTokenId;
     std::vector<int32_t> const ids{4, kImageTokenId, 0, kVocabSize, 3, 1};
     rt::Tensor inputIds({1, 6}, rt::DeviceType::kGPU, DataType::kINT32);
     copyHostToDevice(inputIds, ids);
@@ -784,12 +800,13 @@ TEST(Gemma4PleGatherKernelTest, Int4SidecarMatchesReferenceInBothResidencies)
         for (size_t pos = 0; pos < ids.size(); ++pos)
         {
             int32_t const tokenId = ids[pos];
+            int32_t const row = tokenId == kImageTokenId ? kPadTokenId : tokenId;
             for (int32_t h = 0; h < kPleHiddenSize; ++h)
             {
                 float expected = 0.0F;
-                if (tokenId >= 0 && tokenId < kVocabSize && tokenId != kImageTokenId)
+                if (row >= 0 && row < kVocabSize)
                 {
-                    expected = reference[static_cast<size_t>(tokenId) * kRowWidth + layerIdx * kPleHiddenSize + h];
+                    expected = reference[static_cast<size_t>(row) * kRowWidth + layerIdx * kPleHiddenSize + h];
                 }
                 ASSERT_EQ(__half2float(device[layerIdx][pos * kPleHiddenSize + h]), expected)
                     << "layer " << layerIdx << " pos " << pos << " h " << h;
