@@ -215,31 +215,55 @@ def _native_audio_params(rt, audio: "AudioParams"):
 
 
 class _CancellableIterator:
-    """Iterator whose thread-safe close signal can interrupt native waits."""
+    """Iterator whose thread-safe close signal can interrupt native waits.
+
+    close() never touches the generator while another thread is inside
+    next(): CPython 3.12's generator close() inspects the running frame's
+    next instruction and can mistake an inline-cache word for a ``yield
+    from`` resume point, then call ``close`` on an arbitrary stack slot
+    (SIGSEGV) instead of raising "generator already executing". The last
+    thread to leave next() closes the generator when that call returns.
+    """
 
     def __init__(self, iterator, cancel) -> None:
         self._iterator = iterator
         self._cancel = cancel
-        self._cancel_lock = threading.Lock()
+        self._lock = threading.Lock()
         self._cancelled = False
+        self._advancing = 0
+        self._closing = False
+        self._closed = False
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        return next(self._iterator)
+        with self._lock:
+            if self._closing:
+                raise StopIteration
+            self._advancing += 1
+        try:
+            return next(self._iterator)
+        finally:
+            with self._lock:
+                self._advancing -= 1
+                close_now = (self._closing and not self._closed
+                             and self._advancing == 0)
+                self._closed = self._closed or close_now
+            if close_now:
+                self._iterator.close()
 
     def close(self) -> None:
-        with self._cancel_lock:
-            if not self._cancelled:
-                self._cancelled = True
-                self._cancel()
-        try:
+        with self._lock:
+            cancel = not self._cancelled
+            self._cancelled = True
+            self._closing = True
+            close_now = self._advancing == 0 and not self._closed
+            self._closed = self._closed or close_now
+        if cancel:
+            self._cancel()
+        if close_now:
             self._iterator.close()
-        except (RuntimeError, ValueError):
-            # Another thread is inside next(). The cancel signal wakes it; the
-            # async adapter waits for that call before releasing admission.
-            pass
 
 
 def _pump_channels(rt, run, text_channel, audio_channel, sem=None):
