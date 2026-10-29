@@ -15,7 +15,12 @@
 
 import asyncio
 import json
+import os
+import pathlib
 import queue
+import subprocess
+import sys
+import textwrap
 import threading
 import time
 from types import SimpleNamespace
@@ -34,6 +39,8 @@ from experimental.server.runtime.engine_client import (_AdmissionController,
                                                        _IFBAdmissionGate,
                                                        _iterate_sync)
 from experimental.server.runtime.engine_layout import EngineType
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
 def test_gemma4_mtp_tree_runtime_options_follow_compiled_profile(tmp_path):
@@ -593,6 +600,132 @@ def test_async_disconnect_cancels_before_first_stream_chunk():
 
     asyncio.run(exercise())
     assert channel.cancelled.is_set()
+
+
+def test_close_during_next_defers_generator_close_to_the_advancing_thread():
+    inside_next = threading.Event()
+    may_return = threading.Event()
+    events = []
+
+    class Generator:
+
+        def __next__(self):
+            inside_next.set()
+            may_return.wait()
+            events.append("next returned")
+            return "item"
+
+        def close(self):
+            events.append("close")
+
+    cancels = []
+    stream = engine.CancellableIterator(Generator(), lambda: cancels.append(1))
+    advancing = threading.Thread(target=lambda: events.append(next(stream)),
+                                 daemon=True)
+    advancing.start()
+    assert inside_next.wait(1.0)
+
+    try:
+        stream.close()
+        assert cancels == [1]
+        assert events == [], "generator closed while another thread ran it"
+    finally:
+        may_return.set()
+        advancing.join(1.0)
+    assert events == ["next returned", "close", "item"]
+    with pytest.raises(StopIteration):
+        next(stream)
+    stream.close()
+    assert cancels == [1]
+    assert events.count("close") == 1
+
+
+def test_close_waits_for_every_overlapping_next_to_leave():
+    inside_next = threading.Event()
+    may_return = threading.Event()
+    closed = []
+
+    class Generator:
+
+        def __init__(self):
+            self.running = False
+
+        def __next__(self):
+            if self.running:
+                raise ValueError("generator already executing")
+            self.running = True
+            inside_next.set()
+            may_return.wait()
+            self.running = False
+            return "item"
+
+        def close(self):
+            closed.append(self.running)
+
+    stream = engine.CancellableIterator(Generator(), lambda: None)
+    first = threading.Thread(target=lambda: next(stream), daemon=True)
+    first.start()
+    assert inside_next.wait(1.0)
+    try:
+        with pytest.raises(ValueError):
+            next(stream)
+        stream.close()
+        assert closed == []
+    finally:
+        may_return.set()
+        first.join(1.0)
+    assert closed == [False]
+
+
+def test_close_racing_a_native_wait_inside_next_does_not_crash(tmp_path):
+    # A keyword C call releasing the GIL matches StreamChannel.wait_pop():
+    # CPython 3.12 can SIGSEGV if another thread closes its running generator.
+    script = tmp_path / "close_race.py"
+    script.write_text(
+        textwrap.dedent("""
+        import threading, time
+        from experimental.server.runtime import engine
+
+        def native_wait_loop(lock):
+            while True:
+                lock.acquire(timeout=0.0002)
+                yield None
+
+        failures = []
+        for _ in range(200):
+            lock = threading.Lock()
+            lock.acquire()
+            stream = engine.CancellableIterator(native_wait_loop(lock), lambda: None)
+            stop = threading.Event()
+
+            def drive():
+                try:
+                    while not stop.is_set():
+                        next(stream)
+                except StopIteration:
+                    pass
+                except BaseException as error:
+                    failures.append(repr(error))
+
+            worker = threading.Thread(target=drive)
+            worker.start()
+            deadline = time.monotonic() + 0.01
+            while time.monotonic() < deadline:
+                stream.close()
+            stop.set()
+            worker.join()
+        print("ok" if not failures else failures[0])
+        """))
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(_REPO_ROOT), env.get("PYTHONPATH", "")])
+    result = subprocess.run([sys.executable, str(script)],
+                            capture_output=True,
+                            text=True,
+                            timeout=120,
+                            env=env)
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert result.stdout.strip() == "ok"
 
 
 def test_close_waits_for_native_entry_and_releases_runtime_once():
