@@ -320,6 +320,9 @@ tests:
   # AWQ smoothing stays off an FP8 / NVFP4 lm_head
   - tests/python-unittests/test_quantize_lm_head_smoothing.py
 
+  # Built-in calibration dataset Hub ids
+  - tests/python-unittests/test_builtin_datasets.py
+
   # LayerNorm plugin tests
   - tests/python-unittests/test_layernorm_plugin.py
   - tests/python-unittests/test_layernorm_kernel_config.py
