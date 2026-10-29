@@ -393,6 +393,7 @@ class ApiConfig:
     max_queued_requests: int = DEFAULT_MAX_QUEUED_REQUESTS
     queue_timeout: float = 600.0
     allowed_local_media_path: str = ""
+    allow_remote_media: bool = False
     log_level: str = "info"
     #: A request whose priority is below this is refused with HTTP 400. At
     #: most 0, so a request without a priority (0) is always accepted.
@@ -494,6 +495,11 @@ def create_argument_parser(
     api.add_argument("--enable-auto-tool-choice",
                      action="store_true",
                      help="Allow the model to select tools automatically")
+    api.add_argument(
+        "--allow-remote-media",
+        action="store_true",
+        help="Fetch http(s) media URLs on the server (off by default)",
+    )
     api.add_argument(
         "--min-request-priority",
         type=int,
@@ -789,6 +795,7 @@ def parse_server_config(argv: Optional[Sequence[str]] = None,
         max_queued_requests=args.max_queued_requests,
         queue_timeout=args.queue_timeout,
         allowed_local_media_path=args.allowed_local_media_path,
+        allow_remote_media=args.allow_remote_media,
         log_level=args.log_level,
         min_request_priority=args.min_request_priority,
     )
