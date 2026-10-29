@@ -49,6 +49,7 @@ static inline cudaError_t cudaLibraryUnload(cudaLibrary_t lib)
 #include <mutex>
 #include <random>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace
@@ -88,23 +89,34 @@ struct DeviceBuffer
 // X(prefix, bM, bN, bK, stages, splitK) is expanded for module declaration,
 // loading, and runtime dispatch below.
 // ---------------------------------------------------------------------------
+// Multiples of 64 share the unsuffixed names; group 32 carries a `_g32` suffix.
+#define INT4_FP16_GEMM_VARIANTS_G(X, SUFFIX)                                                                           \
+    X(int4_fp16_gemm_16x128x64_s3_sk1##SUFFIX, 16, 128, 64, 3, 1)                                                      \
+    X(int4_fp16_gemm_16x128x64_s4_sk1##SUFFIX, 16, 128, 64, 4, 1)                                                      \
+    X(int4_fp16_gemm_16x128x64_s4_sk2##SUFFIX, 16, 128, 64, 4, 2)                                                      \
+    X(int4_fp16_gemm_16x128x64_s4_sk4##SUFFIX, 16, 128, 64, 4, 4)                                                      \
+    X(int4_fp16_gemm_32x128x64_s2_sk1##SUFFIX, 32, 128, 64, 2, 1)                                                      \
+    X(int4_fp16_gemm_32x128x64_s3_sk2##SUFFIX, 32, 128, 64, 3, 2)                                                      \
+    X(int4_fp16_gemm_32x128x64_s3_sk4##SUFFIX, 32, 128, 64, 3, 4)                                                      \
+    X(int4_fp16_gemm_32x128x64_s4_sk1##SUFFIX, 32, 128, 64, 4, 1)                                                      \
+    X(int4_fp16_gemm_64x128x64_s2_sk1##SUFFIX, 64, 128, 64, 2, 1)                                                      \
+    X(int4_fp16_gemm_64x128x64_s3_sk1##SUFFIX, 64, 128, 64, 3, 1)                                                      \
+    X(int4_fp16_gemm_64x128x64_s3_sk4##SUFFIX, 64, 128, 64, 3, 4)                                                      \
+    X(int4_fp16_gemm_64x128x64_s4_sk2##SUFFIX, 64, 128, 64, 4, 2)                                                      \
+    X(int4_fp16_gemm_64x128x64_s4_sk4##SUFFIX, 64, 128, 64, 4, 4)                                                      \
+    X(int4_fp16_gemm_128x128x64_s2_sk1##SUFFIX, 128, 128, 64, 2, 1)                                                    \
+    X(int4_fp16_gemm_128x128x64_s2_sk4##SUFFIX, 128, 128, 64, 2, 4)                                                    \
+    X(int4_fp16_gemm_128x128x64_s4_sk1##SUFFIX, 128, 128, 64, 4, 1)
+#ifdef CUTE_DSL_INT4_FP16_GEMM_G32_ENABLED
+#define INT4_FP16_GEMM_VARIANTS_G32(X) INT4_FP16_GEMM_VARIANTS_G(X, _g32)
+constexpr bool kHasGroup32 = true;
+#else
+#define INT4_FP16_GEMM_VARIANTS_G32(X)
+constexpr bool kHasGroup32 = false;
+#endif
 #define INT4_FP16_GEMM_VARIANTS(X)                                                                                     \
-    X(int4_fp16_gemm_16x128x64_s3_sk1, 16, 128, 64, 3, 1)                                                              \
-    X(int4_fp16_gemm_16x128x64_s4_sk1, 16, 128, 64, 4, 1)                                                              \
-    X(int4_fp16_gemm_16x128x64_s4_sk2, 16, 128, 64, 4, 2)                                                              \
-    X(int4_fp16_gemm_16x128x64_s4_sk4, 16, 128, 64, 4, 4)                                                              \
-    X(int4_fp16_gemm_32x128x64_s2_sk1, 32, 128, 64, 2, 1)                                                              \
-    X(int4_fp16_gemm_32x128x64_s3_sk2, 32, 128, 64, 3, 2)                                                              \
-    X(int4_fp16_gemm_32x128x64_s3_sk4, 32, 128, 64, 3, 4)                                                              \
-    X(int4_fp16_gemm_32x128x64_s4_sk1, 32, 128, 64, 4, 1)                                                              \
-    X(int4_fp16_gemm_64x128x64_s2_sk1, 64, 128, 64, 2, 1)                                                              \
-    X(int4_fp16_gemm_64x128x64_s3_sk1, 64, 128, 64, 3, 1)                                                              \
-    X(int4_fp16_gemm_64x128x64_s3_sk4, 64, 128, 64, 3, 4)                                                              \
-    X(int4_fp16_gemm_64x128x64_s4_sk2, 64, 128, 64, 4, 2)                                                              \
-    X(int4_fp16_gemm_64x128x64_s4_sk4, 64, 128, 64, 4, 4)                                                              \
-    X(int4_fp16_gemm_128x128x64_s2_sk1, 128, 128, 64, 2, 1)                                                            \
-    X(int4_fp16_gemm_128x128x64_s2_sk4, 128, 128, 64, 2, 4)                                                            \
-    X(int4_fp16_gemm_128x128x64_s4_sk1, 128, 128, 64, 4, 1)
+    INT4_FP16_GEMM_VARIANTS_G(X, )                                                                                     \
+    INT4_FP16_GEMM_VARIANTS_G32(X)
 
 // ---------------------------------------------------------------------------
 // Module storage + loading (all compiled gemm variants, loaded once).
@@ -168,6 +180,20 @@ bool loadModules()
         (t).dynamic_shapes[0] = (d0);                                                                                  \
     } while (0)
 
+// Variants generated with the group size baked in take no group-size argument.
+template <typename TFn, typename... TArgs>
+int32_t launchWrapper(TFn fn, int32_t groupSize, int32_t swizzle, cudaStream_t stream, TArgs... args)
+{
+    if constexpr (std::is_invocable_v<TFn, TArgs..., int32_t, int32_t, cudaStream_t>)
+    {
+        return fn(args..., groupSize, swizzle, stream);
+    }
+    else
+    {
+        return fn(args..., swizzle, stream);
+    }
+}
+
 // mWorkspace is the C placeholder (serial split-K reduces in place into C). The
 // repacked weight buffer is [qwRows, 128] (128 threads); qwRows depends on the
 // tile's bN/bK. Relies on locals: A, QW, scales, C, locks, M, N, K, qwRows,
@@ -187,7 +213,8 @@ bool loadModules()
         SET_2D_TENSOR(tW, C, M, N);                                                                                    \
         PREFIX##_Tensor_mLocks_t tL{};                                                                                 \
         SET_1D_TENSOR(tL, locks, nTiles);                                                                              \
-        ret = cute_dsl_##PREFIX##_wrapper(&g_##PREFIX, &tA, &tQW, &tS, &tC, &tW, &tL, groupSize, swizzle, stream);     \
+        ret = launchWrapper(                                                                                           \
+            cute_dsl_##PREFIX##_wrapper, groupSize, swizzle, stream, &g_##PREFIX, &tA, &tQW, &tS, &tC, &tW, &tL);      \
     } while (0)
 
 int launchVariant(int32_t tileBM, int32_t tileBN, int32_t tileBK, int32_t stages, int32_t splitK, void const* A,
@@ -205,7 +232,14 @@ int launchVariant(int32_t tileBM, int32_t tileBN, int32_t tileBK, int32_t stages
         LAUNCH_ONE(prefix);                                                                                            \
         return ret;                                                                                                    \
     }
-    INT4_FP16_GEMM_VARIANTS(DISPATCH_ONE)
+    if (groupSize == 32)
+    {
+        INT4_FP16_GEMM_VARIANTS_G32(DISPATCH_ONE)
+    }
+    else
+    {
+        INT4_FP16_GEMM_VARIANTS_G(DISPATCH_ONE, )
+    }
 #undef DISPATCH_ONE
     return -1; // no matching variant
 }
@@ -335,13 +369,21 @@ std::vector<Int4GemmTestConfig> buildConfigs()
     // Every compiled variant at a canonical shape: K=1024 -> ceil(K/64)=16 is
     // divisible by every split_k {1,2,4,8,16}; N=256 and M=128 work for all tiles.
     constexpr int32_t M = 128, N = 256, K = 1024;
-#define ADD_VARIANT(prefix, bM, bN, bK, st, sk) v.push_back(Int4GemmTestConfig{M, N, K, bM, bN, bK, st, sk, 128, 1});
-    INT4_FP16_GEMM_VARIANTS(ADD_VARIANT)
+    for (int32_t g : {128, 32})
+    {
+        if (g == 32 && !kHasGroup32)
+        {
+            continue;
+        }
+#define ADD_VARIANT(prefix, bM, bN, bK, st, sk) v.push_back(Int4GemmTestConfig{M, N, K, bM, bN, bK, st, sk, g, 1});
+        INT4_FP16_GEMM_VARIANTS_G(ADD_VARIANT, )
 #undef ADD_VARIANT
-    // Extra edge-case shapes on the 16x128x64 tile.
-    v.push_back(Int4GemmTestConfig{200, 160, 256, 16, 128, 64, 4, 1, 64, 1});  // G64 plus M/N residues
-    v.push_back(Int4GemmTestConfig{512, 256, 512, 16, 128, 64, 4, 1, 128, 4}); // grouped-M swizzle = 4
-    v.push_back(Int4GemmTestConfig{64, 128, 256, 16, 128, 64, 4, 2, 128, 1});  // small low-M split-K shape
+        // Extra edge-case shapes on the 16x128x64 tile.
+        v.push_back(Int4GemmTestConfig{200, 160, 256, 16, 128, 64, 4, 1, g, 1}); // M and N residues; N % 64 != 0
+        v.push_back(Int4GemmTestConfig{512, 256, 512, 16, 128, 64, 4, 1, g, 4}); // grouped-M swizzle = 4
+        v.push_back(Int4GemmTestConfig{64, 128, 256, 16, 128, 64, 4, 2, g, 1});  // small low-M split-K shape
+    }
+    v.push_back(Int4GemmTestConfig{200, 160, 256, 16, 128, 64, 4, 1, 64, 1}); // G64 plus M/N residues
     return v;
 }
 

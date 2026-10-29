@@ -19,8 +19,11 @@
 #include "common/cudaUtils.h"
 #include "cuteDslInt4Gemm.h"
 #include "cuteDslInt4Gemv.h"
+#include "int4GemvDispatchPolicy.h"
 
 #include <cassert>
+#include <cstdlib>
+#include <cstring>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <mutex>
@@ -60,6 +63,28 @@ inline int64_t leadingVolume(Dims const& dims)
 }
 
 #ifdef CUTE_DSL_INT4_FP16_GEMM_ENABLED
+// EDGELLM_INT4_M1_LARGE_GEMM=0 keeps every M = 1 launch on the GEMV, for A/B runs
+// against the same engine.
+bool m1LargeToGemmEnabled()
+{
+    static bool const sEnabled = [] {
+        char const* const value = std::getenv("EDGELLM_INT4_M1_LARGE_GEMM");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return sEnabled;
+}
+
+// EDGELLM_INT4_MULTIROW_GEMM=0 restores the GEMV for every M in [2, 4], for A/B
+// runs against the same engine.
+bool multiRowToGemmEnabled()
+{
+    static bool const sEnabled = [] {
+        char const* const value = std::getenv("EDGELLM_INT4_MULTIROW_GEMM");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return sEnabled;
+}
+
 inline int64_t computeMaxLockWorkspaceBytes(
     DynamicPluginTensorDesc const* inputs, int32_t nbInputs, int32_t N, int32_t K)
 {
@@ -266,7 +291,21 @@ bool Int4GroupwiseGemmPluginV2::supportsFormatCombination(int32_t pos, DynamicPl
             status &= tensorDesc.type == DataType::kHALF;
             status &= tensorDesc.format == PluginFormat::kLINEAR;
             status &= tensorDesc.dims.nbDims == 2;
-            status &= tensorDesc.dims.d[0] == mGemmK / mGroupSize;
+#ifdef CUTE_DSL_INT4_FP16_GEMM_ENABLED
+            if (!cuteDslInt4GroupSizeSupported(mGroupSize))
+            {
+                // TRT only reports "no supported format combination" at failure; name the cause once.
+                static std::once_flag sUnsupportedGroupSizeFlag;
+                std::call_once(sUnsupportedGroupSizeFlag, [this] {
+                    LOG_ERROR(
+                        "Int4GroupwiseGemmPluginV2: group size %d is not served by the loaded CuTe DSL "
+                        "artifact (multiples of 64, and 32 only when the artifact carries the _g32 variants)",
+                        mGroupSize);
+                });
+                status = false;
+            }
+#endif
+            status &= mGroupSize > 0 && tensorDesc.dims.d[0] == mGemmK / mGroupSize;
             status &= tensorDesc.dims.d[1] == mGemmN;
             break;
         }
@@ -374,23 +413,22 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
         // Fragment-layout contract for BOTH the GEMV and GEMM paths: input[1]
         // stores ceil(N/128) N tiles and K/64 K tiles. Both kernels predicate
         // the final N tile and require a complete K tile.
-        if (mGemmN <= 0 || mGemmK <= 0 || mGemmK % 64 != 0)
+        if (mGemmN <= 0 || mGemmK <= 0 || mGemmK % 64 != 0 || !cuteDslInt4GroupSizeSupported(mGroupSize))
         {
             return -1;
         }
-        if (mGroupSize < 64 || mGroupSize % 64 != 0 || mGemmK % mGroupSize != 0)
+        if (mGemmK % mGroupSize != 0)
         {
             return -1;
         }
 
-        // Decode regime: route small M to the CUDA-core GEMV. At small M the GEMM's
-        // tensor-core MMA underfills its M rows, so the GEMV is the better compute
-        // path. It reads the SAME fragment weight buffer (input[1]), so there is no
-        // extra weight and no repack -- one buffer serves prefill and decode.
-        // Threshold kGemvDispatchMaxM=4 (the tensor-core crossover); the kernel
-        // itself supports up to kGemvMaxM=8.
-        constexpr int32_t kGemvDispatchMaxM = 4;
-        if (M >= 1 && M <= kGemvDispatchMaxM && cuteDslInt4GemvSupported(M) && cuteDslInt4GemvLoadModules())
+        // Decode regime: int4RouteToGemv picks the CUDA-core GEMV or the GEMM for
+        // small M. The GEMV reads the SAME fragment weight buffer (input[1]), so there
+        // is no extra weight and no repack -- one buffer serves prefill and decode. A
+        // small M routed to the GEMM runs the tactic TensorRT autotuned at the
+        // profile's optimum M.
+        if (int4RouteToGemv(M, mGemmN, mGemmK, mGroupSize, m1LargeToGemmEnabled(), multiRowToGemmEnabled())
+            && cuteDslInt4GemvSupported(M) && cuteDslInt4GemvLoadModules(mGroupSize))
         {
             return cuteDslInt4GemvLaunch(
                 M, inputs[0], inputs[1], inputs[2], outputs[0], mGemmN, mGemmK, mGroupSize, stream);
@@ -398,7 +436,7 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
 #endif
 
 #ifdef CUTE_DSL_INT4_FP16_GEMM_ENABLED
-        if (!cuteDslInt4GemmLoadModules())
+        if (!cuteDslInt4GemmLoadModules(mGroupSize))
         {
             return -1;
         }

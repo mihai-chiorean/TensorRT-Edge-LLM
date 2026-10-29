@@ -48,6 +48,7 @@ static inline cudaError_t cudaLibraryUnload(cudaLibrary_t lib)
 #include <mutex>
 #include <random>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace
@@ -89,18 +90,29 @@ struct DeviceBuffer
 // The 8 compiled variants (one exported function per M). X(prefix, M) is expanded for
 // module declaration, loading, and runtime dispatch below.
 // ---------------------------------------------------------------------------
+// Multiples of 64 share the unsuffixed names; group 32 carries a `_g32` suffix.
+#define INT4_FP16_GEMV_VARIANTS_G(X, SUFFIX)                                                                           \
+    X(int4_fp16_gemv_m1##SUFFIX, 1)                                                                                    \
+    X(int4_fp16_gemv_m2##SUFFIX, 2)                                                                                    \
+    X(int4_fp16_gemv_m3##SUFFIX, 3)                                                                                    \
+    X(int4_fp16_gemv_m4##SUFFIX, 4)                                                                                    \
+    X(int4_fp16_gemv_m5##SUFFIX, 5)                                                                                    \
+    X(int4_fp16_gemv_m6##SUFFIX, 6)                                                                                    \
+    X(int4_fp16_gemv_m7##SUFFIX, 7)                                                                                    \
+    X(int4_fp16_gemv_m8##SUFFIX, 8)
+#ifdef CUTE_DSL_INT4_FP16_GEMM_G32_ENABLED
+#define INT4_FP16_GEMV_VARIANTS_G32(X) INT4_FP16_GEMV_VARIANTS_G(X, _g32)
+constexpr bool kHasGroup32 = true;
+#else
+#define INT4_FP16_GEMV_VARIANTS_G32(X)
+constexpr bool kHasGroup32 = false;
+#endif
 #define INT4_FP16_GEMV_VARIANTS(X)                                                                                     \
-    X(int4_fp16_gemv_m1, 1)                                                                                            \
-    X(int4_fp16_gemv_m2, 2)                                                                                            \
-    X(int4_fp16_gemv_m3, 3)                                                                                            \
-    X(int4_fp16_gemv_m4, 4)                                                                                            \
-    X(int4_fp16_gemv_m5, 5)                                                                                            \
-    X(int4_fp16_gemv_m6, 6)                                                                                            \
-    X(int4_fp16_gemv_m7, 7)                                                                                            \
-    X(int4_fp16_gemv_m8, 8)
+    INT4_FP16_GEMV_VARIANTS_G(X, )                                                                                     \
+    INT4_FP16_GEMV_VARIANTS_G32(X)
 
 // ---------------------------------------------------------------------------
-// Module storage + loading (all 8, loaded once).
+// Module storage + loading (both group sizes when built with g32, loaded once).
 // ---------------------------------------------------------------------------
 #define DECL_MODULE(prefix, M) prefix##_Kernel_Module_t g_##prefix{};
 INT4_FP16_GEMV_VARIANTS(DECL_MODULE)
@@ -148,7 +160,21 @@ bool loadModules()
         (t).dynamic_strides[0] = static_cast<int64_t>(d1);                                                             \
     } while (0)
 
-// Relies on locals: A, QW, scales, Out, M, N, K, qwRows, scaleRows, stream, ret.
+// Variants generated with the group size baked in take no group-size argument.
+template <typename TFn, typename... TArgs>
+int32_t launchWrapper(TFn fn, int32_t groupSize, cudaStream_t stream, TArgs... args)
+{
+    if constexpr (std::is_invocable_v<TFn, TArgs..., int32_t, cudaStream_t>)
+    {
+        return fn(args..., groupSize, stream);
+    }
+    else
+    {
+        return fn(args..., stream);
+    }
+}
+
+// Relies on locals: A, QW, scales, Out, M, N, K, qwRows, scaleRows, groupSize, stream, ret.
 #define LAUNCH_ONE(PREFIX)                                                                                             \
     do                                                                                                                 \
     {                                                                                                                  \
@@ -160,7 +186,7 @@ bool loadModules()
         SET_2D_TENSOR(tS, scales, scaleRows, N);                                                                       \
         PREFIX##_Tensor_mOut_t tOut{};                                                                                 \
         SET_2D_TENSOR(tOut, Out, M, N);                                                                                \
-        ret = cute_dsl_##PREFIX##_wrapper(&g_##PREFIX, &tA, &tQW, &tS, &tOut, groupSize, stream);                      \
+        ret = launchWrapper(cute_dsl_##PREFIX##_wrapper, groupSize, stream, &g_##PREFIX, &tA, &tQW, &tS, &tOut);       \
     } while (0)
 
 int launchVariant(int32_t M, void const* A, void const* QW, void const* scales, void* Out, int32_t N, int32_t K,
@@ -176,7 +202,14 @@ int launchVariant(int32_t M, void const* A, void const* QW, void const* scales, 
         LAUNCH_ONE(prefix);                                                                                            \
         return ret;                                                                                                    \
     }
-    INT4_FP16_GEMV_VARIANTS(DISPATCH_ONE)
+    if (groupSize == 32)
+    {
+        INT4_FP16_GEMV_VARIANTS_G32(DISPATCH_ONE)
+    }
+    else
+    {
+        INT4_FP16_GEMV_VARIANTS_G(DISPATCH_ONE, )
+    }
 #undef DISPATCH_ONE
     return -1; // no matching variant
 }
@@ -303,6 +336,10 @@ std::vector<Int4GemvTestConfig> buildConfigs()
         for (auto const& s : shapes)
         {
             v.push_back(Int4GemvTestConfig{M, s[0], s[1], s[2]});
+            if (kHasGroup32)
+            {
+                v.push_back(Int4GemvTestConfig{M, s[0], s[1], 32});
+            }
         }
     }
     return v;

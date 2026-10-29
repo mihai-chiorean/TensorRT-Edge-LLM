@@ -313,6 +313,7 @@ edgellm_add_unit_test(
   NAME
   unitTestPlugins
   DIRS
+  cpp/plugins/int4GroupwiseGemmPlugin
   cpp/plugins/nvfp4A16GemmPlugin
   cpp/plugins/nvfp4A16BlackwellMoePlugin
   cpp/plugins/allReducePlugin
