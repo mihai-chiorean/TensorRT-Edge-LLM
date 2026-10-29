@@ -311,6 +311,9 @@ def _model_identifiers(model_dir: str) -> List[str]:
                 collect(item)
 
     collect(config)
+    # Runtime configs written by the exporter name the family under "model".
+    if isinstance(config, dict) and isinstance(config.get("model"), str):
+        identifiers.append(config["model"].lower())
     return identifiers
 
 

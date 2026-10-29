@@ -90,8 +90,24 @@ runtime bundles. A launch reuses a bundle only when the base checkpoint,
 optional draft checkpoint, and build profile all match. A cache miss runs
 `trtedge build --components all` internally and publishes the
 completed bundle atomically. The builder's default policy externalizes the
-weight kinds supported by each component. Direct engine and ONNX paths are
-rejected so the server cannot lose the checkpoint-to-runtime association.
+weight kinds supported by each component. ONNX paths are rejected so the
+server cannot lose the checkpoint-to-runtime association.
+
+A directory of engines that were built outside the cache is served as-is: a
+builder bundle (`llm.engine` at the root), or the tree written by `llm_build`
+and `visual_build` (`llm/llm.engine` next to `visual/visual.engine`). The
+server resolves no checkpoint and builds nothing. A bundle whose runtime config
+lists checkpoint-backed weights loads them from the `checkpoint_dir` recorded
+in that config, so that directory must exist on the serving host. Pre-built
+speculative-decoding bundles are not served this way; pass the checkpoint
+instead:
+
+```bash
+tensorrt-edgellm-serve /opt/models/gemma-4-e4b-engines \
+  --max-input-len 8192 \
+  --max-kv-cache-capacity 16384 \
+  --enable-context-reuse
+```
 
 Compiled bundles use a 50 GiB least-recently-used cache by default. Set
 `--engine-cache-max-size-gb` to another positive limit. Use

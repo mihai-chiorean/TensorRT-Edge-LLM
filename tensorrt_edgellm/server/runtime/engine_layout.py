@@ -43,12 +43,20 @@ class BundleLayout:
 
     root: str
     engine_type: EngineType
+    #: Directory holding the LLM engine and its runtime config. Equal to
+    #: ``root`` for builder bundles; ``root/llm`` for an exported engine tree.
+    llm_dir: str = ""
     visual_dir: Optional[str] = None
     audio_dir: Optional[str] = None
     talker_dir: Optional[str] = None
     code_predictor_dir: Optional[str] = None
     code2wav_dir: Optional[str] = None
     audio_model_type: str = ""
+
+    @property
+    def engine_dir(self) -> str:
+        """Directory passed to the native runtime as the LLM engine dir."""
+        return self.llm_dir or self.root
 
     @property
     def media_dir(self) -> str:
@@ -118,13 +126,26 @@ def _model_type(component_dir: Optional[str]) -> str:
 
 
 def inspect_bundle(bundle_dir: str) -> BundleLayout:
-    """Inspect a bundle once and return its immutable component contract."""
+    """Inspect a bundle once and return its immutable component contract.
+
+    Two layouts are recognised: the builder bundle with ``llm.engine`` at the
+    root, and the ``llm_build``/``visual_build`` export tree with the LLM
+    engine under ``llm/`` next to ``visual/``.
+    """
     root = os.path.abspath(bundle_dir)
+    engine_type = detect_engine_type(root)
+    llm_dir = ""
+    if engine_type == EngineType.UNKNOWN:
+        nested = os.path.join(root, "llm")
+        engine_type = detect_engine_type(nested)
+        if engine_type != EngineType.UNKNOWN:
+            llm_dir = nested
     visual_dir = _component_dir(root, "visual", VISUAL_ENGINE_FILE)
     audio_dir = _component_dir(root, "audio", AUDIO_ENGINE_FILE)
     return BundleLayout(
         root=root,
-        engine_type=detect_engine_type(root),
+        engine_type=engine_type,
+        llm_dir=llm_dir,
         visual_dir=visual_dir,
         audio_dir=audio_dir,
         talker_dir=_component_dir(root, "talker", LLM_ENGINE_FILE),
