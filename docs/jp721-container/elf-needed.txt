@@ -1,0 +1,59 @@
+/out/builder/bin/llm_build
+  RUNPATH /usr/local/cuda/targets/sbsa-linux/lib
+  NEEDED  libcudart.so.13                  => /usr/local/cuda/targets/sbsa-linux/lib/libcudart.so.13  [cuda-cudart-13-2]
+  NEEDED  libnvonnxparser.so.10            => /lib/aarch64-linux-gnu/libnvonnxparser.so.10  [libnvonnxparsers10]
+  NEEDED  libnvinfer.so.10                 => /lib/aarch64-linux-gnu/libnvinfer.so.10  [libnvinfer10]
+  NEEDED  libstdc++.so.6                   => /lib/aarch64-linux-gnu/libstdc++.so.6  [libstdc++6]
+  NEEDED  libgcc_s.so.1                    => /lib/aarch64-linux-gnu/libgcc_s.so.1  [libgcc-s1]
+  NEEDED  libc.so.6                        => /lib/aarch64-linux-gnu/libc.so.6  [libc6]
+  NEEDED  ld-linux-aarch64.so.1            => /lib/aarch64-linux-gnu/ld-linux-aarch64.so.1  [libc6]
+
+/out/builder/bin/visual_build
+  RUNPATH /usr/local/cuda/targets/sbsa-linux/lib
+  NEEDED  libcudart.so.13                  => /usr/local/cuda/targets/sbsa-linux/lib/libcudart.so.13  [cuda-cudart-13-2]
+  NEEDED  libnvonnxparser.so.10            => /lib/aarch64-linux-gnu/libnvonnxparser.so.10  [libnvonnxparsers10]
+  NEEDED  libnvinfer.so.10                 => /lib/aarch64-linux-gnu/libnvinfer.so.10  [libnvinfer10]
+  NEEDED  libstdc++.so.6                   => /lib/aarch64-linux-gnu/libstdc++.so.6  [libstdc++6]
+  NEEDED  libm.so.6                        => /lib/aarch64-linux-gnu/libm.so.6  [libc6]
+  NEEDED  libgcc_s.so.1                    => /lib/aarch64-linux-gnu/libgcc_s.so.1  [libgcc-s1]
+  NEEDED  libc.so.6                        => /lib/aarch64-linux-gnu/libc.so.6  [libc6]
+  NEEDED  ld-linux-aarch64.so.1            => /lib/aarch64-linux-gnu/ld-linux-aarch64.so.1  [libc6]
+
+/out/builder/lib/libNvInfer_edgellm_plugin.so.1.0
+  SONAME  libNvInfer_edgellm_plugin.so.1
+  RUNPATH /usr/local/cuda/targets/sbsa-linux/lib
+  NEEDED  libcuda.so.1                     => not found in container
+  NEEDED  libcudart.so.13                  => /usr/local/cuda/targets/sbsa-linux/lib/libcudart.so.13  [cuda-cudart-13-2]
+  NEEDED  libnvinfer.so.10                 => /lib/aarch64-linux-gnu/libnvinfer.so.10  [libnvinfer10]
+  NEEDED  libnvrtc.so.13                   => /usr/local/cuda/targets/sbsa-linux/lib/libnvrtc.so.13  [cuda-nvrtc-13-2]
+  NEEDED  libstdc++.so.6                   => /lib/aarch64-linux-gnu/libstdc++.so.6  [libstdc++6]
+  NEEDED  libm.so.6                        => /lib/aarch64-linux-gnu/libm.so.6  [libc6]
+  NEEDED  libgcc_s.so.1                    => /lib/aarch64-linux-gnu/libgcc_s.so.1  [libgcc-s1]
+  NEEDED  libc.so.6                        => /lib/aarch64-linux-gnu/libc.so.6  [libc6]
+  NEEDED  ld-linux-aarch64.so.1            => /lib/aarch64-linux-gnu/ld-linux-aarch64.so.1  [libc6]
+
+/out/runtime/plugin/libNvInfer_edgellm_plugin.so
+  SONAME  libNvInfer_edgellm_plugin.so.1
+  RUNPATH /usr/local/cuda/targets/sbsa-linux/lib
+  NEEDED  libcuda.so.1                     => not found in container
+  NEEDED  libcudart.so.13                  => /usr/local/cuda/targets/sbsa-linux/lib/libcudart.so.13  [cuda-cudart-13-2]
+  NEEDED  libnvinfer.so.10                 => /lib/aarch64-linux-gnu/libnvinfer.so.10  [libnvinfer10]
+  NEEDED  libnvrtc.so.13                   => /usr/local/cuda/targets/sbsa-linux/lib/libnvrtc.so.13  [cuda-nvrtc-13-2]
+  NEEDED  libstdc++.so.6                   => /lib/aarch64-linux-gnu/libstdc++.so.6  [libstdc++6]
+  NEEDED  libm.so.6                        => /lib/aarch64-linux-gnu/libm.so.6  [libc6]
+  NEEDED  libgcc_s.so.1                    => /lib/aarch64-linux-gnu/libgcc_s.so.1  [libgcc-s1]
+  NEEDED  libc.so.6                        => /lib/aarch64-linux-gnu/libc.so.6  [libc6]
+  NEEDED  ld-linux-aarch64.so.1            => /lib/aarch64-linux-gnu/ld-linux-aarch64.so.1  [libc6]
+
+/out/runtime/pybind/_edgellm_runtime.cpython-312-aarch64-linux-gnu.so
+  RUNPATH /usr/local/cuda/targets/sbsa-linux/lib
+  NEEDED  libnvinfer.so.10                 => /lib/aarch64-linux-gnu/libnvinfer.so.10  [libnvinfer10]
+  NEEDED  libnvonnxparser.so.10            => /lib/aarch64-linux-gnu/libnvonnxparser.so.10  [libnvonnxparsers10]
+  NEEDED  libcuda.so.1                     => not found in container
+  NEEDED  libcudart.so.13                  => /usr/local/cuda/targets/sbsa-linux/lib/libcudart.so.13  [cuda-cudart-13-2]
+  NEEDED  libstdc++.so.6                   => /lib/aarch64-linux-gnu/libstdc++.so.6  [libstdc++6]
+  NEEDED  libm.so.6                        => /lib/aarch64-linux-gnu/libm.so.6  [libc6]
+  NEEDED  libgcc_s.so.1                    => /lib/aarch64-linux-gnu/libgcc_s.so.1  [libgcc-s1]
+  NEEDED  libc.so.6                        => /lib/aarch64-linux-gnu/libc.so.6  [libc6]
+  NEEDED  ld-linux-aarch64.so.1            => /lib/aarch64-linux-gnu/ld-linux-aarch64.so.1  [libc6]
+
