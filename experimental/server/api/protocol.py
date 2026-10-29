@@ -31,7 +31,9 @@ _UNSUPPORTED_SAMPLING_DEFAULTS = {
 
 
 class OpenAIBaseModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # OpenAI-compatible clients send vendor fields (llama.cpp's
+    # timings_per_token, vLLM extras) that this server does not use.
+    model_config = ConfigDict(extra="ignore")
 
 
 class StreamOptions(OpenAIBaseModel):
