@@ -303,6 +303,10 @@ tests:
   - tests/python-unittests/test_nemotron_h_trt_native_routing.py
   - tests/python-unittests/test_trt_native_moe_w4a4.py
 
+  # Dynamic LoRA insertion and adapter processing contracts (CPU only)
+  - tests/python-unittests/test_lora_gemm_insertion.py
+  - tests/python-unittests/test_lora_adapter_processing.py
+
   # Token-major and legacy QKV concat plugin contracts
   - tests/python-unittests/test_qkv_concat_plugin.py
 
