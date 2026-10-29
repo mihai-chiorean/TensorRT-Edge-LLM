@@ -48,6 +48,7 @@ from typing import (TYPE_CHECKING, Any, Callable, Dict, Iterator, List,
                     Mapping, Optional, Sequence, Tuple, Union)
 
 from ..config import DEFAULT_MAX_QUEUED_REQUESTS, ContextCacheConfig
+from ..parsing.reasoning import REASONING_PARSERS, prompt_reasoning_state
 from ..parsing.terminal_tokens import (ended_on_stop, strip_terminal_tokens,
                                        terminal_special_tokens)
 from ..parsing.tool_calling import (ToolConfig, inject_tool_requirement,
@@ -1581,11 +1582,12 @@ class LLM:
         *,
         tool_parser: str = "auto",
         reasoning_parser: str = "none",
+        reasoning_open: Optional[bool] = None,
         skip_special_tokens: bool = True,
     ) -> CompletionOutput:
-        if (tool_config.parse_output and not skip_special_tokens
-                and ended_on_stop(finish_reason)):
-            # The stop token that ended generation is still at the end.
+        if not skip_special_tokens and ended_on_stop(finish_reason):
+            # The stop token that ended generation is still at the end, and
+            # must go before a reasoning span that never closed is split off.
             text = strip_terminal_tokens(
                 text, terminal_special_tokens(self._model_dir))
         parsed = parse_assistant_output(
@@ -1594,6 +1596,7 @@ class LLM:
             self._model_dir,
             tool_parser=tool_parser,
             reasoning_parser=reasoning_parser,
+            reasoning_open=reasoning_open,
         )
         tool_calls = [call.to_openai() for call in parsed.tool_calls]
         return CompletionOutput(
@@ -1613,6 +1616,7 @@ class LLM:
         *,
         tool_parser: str = "auto",
         reasoning_parser: str = "none",
+        reasoning_open: Optional[bool] = None,
         on_handle=None,
     ) -> CompletionOutput:
         response = self._handle_request(request, on_handle=on_handle)
@@ -1631,6 +1635,7 @@ class LLM:
             tool_config,
             tool_parser=tool_parser,
             reasoning_parser=reasoning_parser,
+            reasoning_open=reasoning_open,
             skip_special_tokens=params.skip_special_tokens,
         )
         if params.num_logprobs > 0 and response.logprobs:
@@ -1785,6 +1790,12 @@ class LLM:
             List of ``CompletionOutput`` objects, one per prompt.
         """
         params = sampling_params or SamplingParams()
+        reasoning = REASONING_PARSERS.resolve(
+            reasoning_parser,
+            self._model_dir) if reasoning_parser != "none" else None
+        if (reasoning is not None and reasoning.needs_special_tokens
+                and params.skip_special_tokens):
+            params = replace(params, skip_special_tokens=False)
 
         if isinstance(prompts, str):
             prompts = [prompts]
@@ -1816,10 +1827,24 @@ class LLM:
                     tool_config,
                     tool_parser=tool_parser,
                     reasoning_parser=reasoning_parser,
+                    reasoning_open=self._prompt_reasoning_state(
+                        reasoning_parser, messages, params),
                 )
             outputs.append(output)
 
         return outputs
+
+    def _prompt_reasoning_state(self, reasoning_parser: str,
+                                messages: List[Dict[str, Any]],
+                                params: SamplingParams) -> Optional[bool]:
+        if reasoning_parser == "none":
+            return None
+        return prompt_reasoning_state(REASONING_PARSERS.resolve(
+            reasoning_parser, self._model_dir),
+                                      messages,
+                                      enable_thinking=params.enable_thinking,
+                                      templated=True,
+                                      add_generation_prompt=True)
 
     def chat(
         self,

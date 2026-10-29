@@ -2858,3 +2858,399 @@ def test_media_policy_refuses_surrounding_whitespace(tmp_path, monkeypatch,
     messages = [{"role": "user", "content": [item]}]
     with pytest.raises(PermissionError, match="whitespace"):
         enforce_local_media_policy(messages, str(tmp_path), allow_remote=False)
+
+
+_GEMMA_THOUGHT = "<|channel>thought\nCheck the weather.<channel|>"
+_GEMMA_CALL = '<|tool_call>call:weather{location:<|"|>Paris<|"|>}<tool_call|>'
+
+
+def _gemma_thinking_client(tmp_path):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    from experimental.server.parsing.terminal_tokens import \
+        terminal_special_tokens
+
+    llm = _FakeLLM(tmp_path)
+    model_dir = tmp_path / "gemma-4-e4b"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model": "gemma4_text"}',
+                                           encoding="utf-8")
+    (model_dir / "tokenizer_config.json").write_text(
+        '{"eos_token": "<eos>", "eot_token": "<turn|>"}', encoding="utf-8")
+    terminal_special_tokens.cache_clear()
+    llm.model_dir = str(model_dir)
+    config = ApiConfig(enable_auto_tool_choice=True)
+    return TestClient(_create_app(llm, config)), llm
+
+
+def _gemma_complete_with(llm, text, finish_reason="stop"):
+    """Run the real output parsing on fixed native text."""
+    from experimental.server.runtime.engine import LLM
+
+    parser = LLM.__new__(LLM)
+    parser._model_dir = llm.model_dir
+
+    def complete(_request, params, tool_config, **kwargs):
+        llm.last_sampling_params = params
+        return parser._parse_generation_output(
+            text, [1, 2],
+            7,
+            finish_reason,
+            tool_config,
+            tool_parser=kwargs.get("tool_parser", "auto"),
+            reasoning_parser=kwargs.get("reasoning_parser", "none"),
+            reasoning_open=kwargs.get("reasoning_open"),
+            skip_special_tokens=params.skip_special_tokens)
+
+    llm._complete_prepared_request = complete
+
+
+def _gemma_stream_with(llm, pieces, finish_reason="stop"):
+
+    def stream(_messages, _params, **_kwargs):
+        for i, piece in enumerate(pieces):
+            yield StreamDelta(text=piece, token_ids=[i], prompt_tokens=7)
+        yield StreamDelta(text="", finished=True, finish_reason=finish_reason)
+
+    llm.generate_stream = stream
+
+
+def _thinking_body(stream=False, tools=False, messages=None):
+    body = {
+        "messages": messages or [{
+            "role": "user",
+            "content": "Weather?"
+        }],
+        "chat_template_kwargs": {
+            "enable_thinking": True
+        },
+        "stream": stream,
+    }
+    if tools:
+        body["tools"] = [_gemma_tool()]
+    return body
+
+
+def _stream_parts(response):
+    payloads = _sse_payloads(response)
+    deltas = [p["choices"][0]["delta"] for p in payloads if p.get("choices")]
+    reasoning = "".join(d.get("reasoning_content") or "" for d in deltas)
+    content = "".join(d.get("content") or "" for d in deltas)
+    calls = [d["tool_calls"] for d in deltas if d.get("tool_calls")]
+    finish = [
+        p["choices"][0]["finish_reason"] for p in payloads
+        if p.get("choices") and p["choices"][0].get("finish_reason")
+    ]
+    errors = [p for p in payloads if "error" in p]
+    return reasoning, content, calls, finish, errors
+
+
+@pytest.mark.parametrize("tools", [False, True])
+def test_gemma_thinking_returns_reasoning_content(tmp_path, tools):
+    client, llm = _gemma_thinking_client(tmp_path)
+    _gemma_complete_with(llm, _GEMMA_THOUGHT + "It is sunny.<turn|>")
+    response = client.post("/v1/chat/completions",
+                           json=_thinking_body(tools=tools))
+    assert response.status_code == 200, response.text
+    message = response.json()["choices"][0]["message"]
+    assert llm.last_sampling_params.skip_special_tokens is False
+    assert message["reasoning_content"] == "Check the weather."
+    assert message["content"] == "It is sunny."
+
+
+def test_gemma_thinking_off_leaves_reasoning_empty(tmp_path):
+    client, llm = _gemma_thinking_client(tmp_path)
+    _gemma_complete_with(llm, "It is sunny.")
+    body = _thinking_body()
+    body.pop("chat_template_kwargs")
+    response = client.post("/v1/chat/completions", json=body)
+    message = response.json()["choices"][0]["message"]
+    assert message.get("reasoning_content") is None
+    assert message["content"] == "It is sunny."
+
+
+def test_gemma_thinking_then_tool_call(tmp_path):
+    client, llm = _gemma_thinking_client(tmp_path)
+    _gemma_complete_with(llm, _GEMMA_THOUGHT + _GEMMA_CALL + "<turn|>")
+    response = client.post("/v1/chat/completions",
+                           json=_thinking_body(tools=True))
+    assert response.status_code == 200, response.text
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["reasoning_content"] == "Check the weather."
+    assert not choice["message"].get("content")
+    call = choice["message"]["tool_calls"][0]["function"]
+    assert call["name"] == "weather"
+    assert json.loads(call["arguments"]) == {"location": "Paris"}
+
+
+@pytest.mark.parametrize("finish_reason,text", [
+    ("length", "<|channel>thought\nStill thinking"),
+    ("stop", "<|channel>thought\nStill thinking<eos>"),
+])
+def test_gemma_unterminated_thought_is_reasoning_only(tmp_path, finish_reason,
+                                                      text):
+    client, llm = _gemma_thinking_client(tmp_path)
+    _gemma_complete_with(llm, text, finish_reason)
+    response = client.post("/v1/chat/completions",
+                           json=_thinking_body(tools=True))
+    assert response.status_code == 200, response.text
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == finish_reason
+    assert choice["message"]["reasoning_content"] == "Still thinking"
+    assert not choice["message"].get("content")
+
+
+_SPLIT_THOUGHT = [
+    "<|chan", "nel>tho", "ught\nCheck the", " weather.<chan", "nel|>It is",
+    " sunny.<tu", "rn|>"
+]
+
+
+def test_gemma_thinking_stream_splits_markers_across_chunks(tmp_path):
+    client, llm = _gemma_thinking_client(tmp_path)
+    _gemma_stream_with(llm, _SPLIT_THOUGHT)
+    response = client.post("/v1/chat/completions",
+                           json=_thinking_body(stream=True))
+    assert response.status_code == 200, response.text
+    reasoning, content, calls, finish, errors = _stream_parts(response)
+    assert (reasoning, content) == ("Check the weather.", "It is sunny.")
+    assert calls == [] and errors == [] and finish == ["stop"]
+    assert "<|channel>" not in response.text and "<turn|>" not in response.text
+
+
+@pytest.mark.parametrize("call_pieces", [
+    [
+        "<|tool_", "call>call:weather{location:<|\"|>Par", "is<|\"|>}<tool_",
+        "call|><tu", "rn|>"
+    ],
+    ["call:weath", "er{location:<|\"|>Paris<|\"|>}"],
+])
+def test_gemma_thinking_stream_then_tool_call(tmp_path, call_pieces):
+    client, llm = _gemma_thinking_client(tmp_path)
+    _gemma_stream_with(llm, _SPLIT_THOUGHT[:4] + ["nel|>"] + call_pieces)
+    response = client.post("/v1/chat/completions",
+                           json=_thinking_body(stream=True, tools=True))
+    assert response.status_code == 200, response.text
+    reasoning, content, calls, finish, errors = _stream_parts(response)
+    assert reasoning == "Check the weather."
+    assert content == "" and errors == []
+    assert calls[0][0]["function"]["name"] == "weather"
+    assert json.loads(calls[1][0]["function"]["arguments"]) == {
+        "location": "Paris"
+    }
+    assert finish == ["tool_calls"]
+
+
+def test_gemma_thinking_stream_unterminated_at_max_tokens(tmp_path):
+    client, llm = _gemma_thinking_client(tmp_path)
+    _gemma_stream_with(llm, ["<|channel>thought\nStill", " thinking<chan"],
+                       finish_reason="length")
+    response = client.post("/v1/chat/completions",
+                           json=_thinking_body(stream=True, tools=True))
+    reasoning, content, calls, finish, errors = _stream_parts(response)
+    assert reasoning == "Still thinking<chan"
+    assert content == "" and calls == [] and errors == []
+    assert finish == ["length"]
+
+
+_AFTER_TOOL = [{
+    "role": "user",
+    "content": "Weather?"
+}, {
+    "role":
+    "assistant",
+    "tool_calls": [{
+        "id": "call_1",
+        "type": "function",
+        "function": {
+            "name": "weather",
+            "arguments": {
+                "location": "Paris"
+            }
+        },
+    }],
+}, {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "content": "sunny"
+}]
+
+
+@pytest.mark.parametrize("tools", [False, True])
+def test_gemma_thinking_stream_after_tool_response_starts_in_thought(
+        tmp_path, tools):
+    # The template's generation prompt ends with "<|channel>thought\n" here.
+    client, llm = _gemma_thinking_client(tmp_path)
+    _gemma_stream_with(llm, ["Paris is", " sunny.<chan", "nel|>It is sunny."])
+    response = client.post("/v1/chat/completions",
+                           json=_thinking_body(stream=True,
+                                               tools=tools,
+                                               messages=_AFTER_TOOL))
+    assert response.status_code == 200, response.text
+    reasoning, content, _, _, errors = _stream_parts(response)
+    assert (reasoning, content) == ("Paris is sunny.", "It is sunny.")
+    assert errors == []
+
+
+def test_gemma_thinking_after_tool_response_non_streaming(tmp_path):
+    client, llm = _gemma_thinking_client(tmp_path)
+    _gemma_complete_with(llm, "Paris is sunny.<channel|>It is sunny.<turn|>")
+    response = client.post("/v1/chat/completions",
+                           json=_thinking_body(tools=True,
+                                               messages=_AFTER_TOOL))
+    message = response.json()["choices"][0]["message"]
+    assert message["reasoning_content"] == "Paris is sunny."
+    assert message["content"] == "It is sunny."
+
+
+def test_gemma_anthropic_thinking_stream_then_tool_use(tmp_path):
+    client, llm = _gemma_thinking_client(tmp_path)
+    _gemma_stream_with(llm, _SPLIT_THOUGHT[:4] + ["nel|>", _GEMMA_CALL])
+    response = client.post("/v1/messages",
+                           json={
+                               "model":
+                               "fake-model",
+                               "max_tokens":
+                               64,
+                               "stream":
+                               True,
+                               "thinking": {
+                                   "type": "enabled",
+                                   "budget_tokens": 1024
+                               },
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Weather?"
+                               }],
+                               "tools": [{
+                                   "name": "weather",
+                                   "input_schema": {
+                                       "type": "object",
+                                       "properties": {
+                                           "location": {
+                                               "type": "string"
+                                           }
+                                       },
+                                   },
+                               }],
+                           })
+    assert response.status_code == 200, response.text
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines() if line.startswith("data: {")
+    ]
+    starts = [
+        e["content_block"]["type"] for e in events
+        if e.get("type") == "content_block_start"
+    ]
+    thinking = "".join(e["delta"].get("thinking", "") for e in events
+                       if e.get("type") == "content_block_delta")
+    assert starts == ["thinking", "tool_use"]
+    assert thinking == "Check the weather."
+    assert "<|channel>" not in response.text
+
+
+@pytest.mark.parametrize("text", [
+    "Paris is sunny, so",
+    "Maybe " + _GEMMA_CALL,
+])
+def test_gemma_truncated_thought_after_tool_response_stays_reasoning(
+        tmp_path, text):
+    client, llm = _gemma_thinking_client(tmp_path)
+    _gemma_complete_with(llm, text, finish_reason="length")
+    response = client.post("/v1/chat/completions",
+                           json=_thinking_body(tools=True,
+                                               messages=_AFTER_TOOL))
+    assert response.status_code == 200, response.text
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "length"
+    assert choice["message"]["reasoning_content"] == text
+    assert not choice["message"].get("content")
+    assert not choice["message"].get("tool_calls")
+
+
+def test_gemma_closing_marker_inside_a_tool_argument_is_literal(tmp_path):
+    client, llm = _gemma_thinking_client(tmp_path)
+    _gemma_complete_with(
+        llm, '<|tool_call>call:weather{location:<|"|>a<channel|>b<|"|>}'
+        "<tool_call|>")
+    response = client.post("/v1/chat/completions",
+                           json=_thinking_body(tools=True))
+    assert response.status_code == 200, response.text
+    message = response.json()["choices"][0]["message"]
+    assert not message.get("reasoning_content")
+    call = message["tool_calls"][0]["function"]
+    assert json.loads(call["arguments"]) == {"location": "a<channel|>b"}
+
+
+def test_gemma_anthropic_truncated_thought_after_tool_result(tmp_path):
+    client, llm = _gemma_thinking_client(tmp_path)
+    _gemma_complete_with(llm, "Still considering", finish_reason="length")
+    response = client.post("/v1/messages",
+                           json={
+                               "model":
+                               "fake-model",
+                               "max_tokens":
+                               16,
+                               "thinking": {
+                                   "type": "enabled",
+                                   "budget_tokens": 1024
+                               },
+                               "tools": [{
+                                   "name": "weather",
+                                   "input_schema": {
+                                       "type": "object"
+                                   },
+                               }],
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Weather?"
+                               }, {
+                                   "role":
+                                   "assistant",
+                                   "content": [{
+                                       "type": "tool_use",
+                                       "id": "call_1",
+                                       "name": "weather",
+                                       "input": {
+                                           "location": "Paris"
+                                       },
+                                   }],
+                               }, {
+                                   "role":
+                                   "user",
+                                   "content": [{
+                                       "type": "tool_result",
+                                       "tool_use_id": "call_1",
+                                       "content": "sunny",
+                                   }],
+                               }],
+                           })
+    assert response.status_code == 200, response.text
+    blocks = response.json()["content"]
+    assert [b["type"] for b in blocks] == ["thinking"]
+    assert blocks[0]["thinking"] == "Still considering"
+
+
+def test_gemma_raw_prompt_that_opens_a_thought(tmp_path):
+    client, llm = _gemma_thinking_client(tmp_path)
+    _gemma_stream_with(llm, ["Maybe ", _GEMMA_CALL], finish_reason="length")
+    body = _thinking_body(stream=True,
+                          tools=True,
+                          messages=[{
+                              "role":
+                              "user",
+                              "content":
+                              "<|turn>user\nWeather?<turn|>\n"
+                              "<|turn>model\n<|channel>thought\n"
+                          }])
+    body["apply_chat_template"] = False
+    response = client.post("/v1/chat/completions", json=body)
+    assert response.status_code == 200, response.text
+    reasoning, content, calls, finish, errors = _stream_parts(response)
+    assert reasoning == "Maybe " + _GEMMA_CALL
+    assert content == "" and calls == [] and errors == []
+    assert finish == ["length"]

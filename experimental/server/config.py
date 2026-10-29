@@ -352,7 +352,7 @@ def create_argument_parser(
               "x-api-key. Unset disables authentication"))
     api.add_argument("--reasoning-parser",
                      choices=("auto", "none", "qwen3", "deepseek_r1",
-                              "muse_glimmer", "nemotron"),
+                              "muse_glimmer", "nemotron", "gemma4"),
                      default="auto",
                      help="Parser for reasoning output (default: %(default)s)")
     api.add_argument(
