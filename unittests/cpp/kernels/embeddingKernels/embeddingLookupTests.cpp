@@ -634,7 +634,7 @@ TEST_F(EmbeddingLookupTest, SidecarLoaderRejectsUnsupportedDtypeAndStrayScales)
     int32Table.emplace_back(
         rt::Tensor({kVocabSize, kHiddenSize}, rt::DeviceType::kCPU, trt_edgellm::DataType::kINT32, "embedding"));
     auto message = loadRejection(std::move(int32Table), stream, path);
-    expectContains(message, "Embedding tensor must be FP16, FP8, or INT8, got dtype 3");
+    expectContains(message, "Embedding tensor must be FP16, FP8, INT8, or packed INT4, got dtype 3");
     expectContains(message, path.string());
 
     std::vector<rt::Tensor> fp16WithScales;
@@ -2082,4 +2082,111 @@ TEST_F(EmbeddingLookupTest, MultimodalRowsPast32BitElementOffsetsAreGathered)
     EXPECT_EQ(bits(result.data() + kHidden), bits(pattern(-5.0F).data()));
     EXPECT_EQ(bits(result.data() + 2 * kHidden), bits(pattern(3.0F).data()));
     EXPECT_EQ(bits(result.data() + 3 * kHidden), bits(table.data() + kHidden));
+}
+
+namespace
+{
+
+// Packs symmetric INT4 values (value + 8 nibbles, even column low) and returns the FP16 reference dequantization.
+struct Int4Fixture
+{
+    std::vector<uint8_t> packed;
+    std::vector<half> scales;
+    std::vector<half> reference;
+};
+
+Int4Fixture makeInt4Table(int32_t vocabSize, int64_t hiddenSize)
+{
+    constexpr int64_t kGroup = 32;
+    Int4Fixture fixture;
+    fixture.packed.resize(static_cast<size_t>(vocabSize) * hiddenSize / 2);
+    fixture.scales.resize(static_cast<size_t>(vocabSize) * hiddenSize / kGroup);
+    fixture.reference.resize(static_cast<size_t>(vocabSize) * hiddenSize);
+    for (int32_t row = 0; row < vocabSize; ++row)
+    {
+        for (int64_t group = 0; group < hiddenSize / kGroup; ++group)
+        {
+            float const scale = 0.005F * static_cast<float>(row + 1) * static_cast<float>(group + 1);
+            half const scaleHalf = __float2half(scale);
+            fixture.scales[row * (hiddenSize / kGroup) + group] = scaleHalf;
+            for (int64_t col = group * kGroup; col < (group + 1) * kGroup; ++col)
+            {
+                int32_t const value = static_cast<int32_t>((row * 7 + col * 3) % 15) - 7;
+                size_t const byteIdx = static_cast<size_t>(row) * hiddenSize / 2 + col / 2;
+                uint8_t const nibble = static_cast<uint8_t>(value + 8);
+                fixture.packed[byteIdx] |= static_cast<uint8_t>(col % 2 == 0 ? nibble : nibble << 4);
+                fixture.reference[row * hiddenSize + col]
+                    = __float2half(static_cast<float>(value) * __half2float(scaleHalf));
+            }
+        }
+    }
+    return fixture;
+}
+
+} // namespace
+
+TEST_F(EmbeddingLookupTest, Int4PackedLookupMatchesReference)
+{
+    constexpr int64_t kBatchSize = 2;
+    constexpr int64_t kSeqLen = 5;
+    constexpr int32_t kVocabSize = 9;
+    constexpr int64_t kHiddenSize = 96;
+    constexpr int32_t kImageTokenId = 4;
+    auto const fixture = makeInt4Table(kVocabSize, kHiddenSize);
+    std::vector<int32_t> const inputIds{0, 8, kImageTokenId, -1, 3, kVocabSize, 5, 7, 1, 2};
+    std::vector<int32_t> const multimodalIndices(kBatchSize * kSeqLen, 0);
+    std::vector<half> imageEmbeds(kHiddenSize);
+    for (int64_t idx = 0; idx < kHiddenSize; ++idx)
+    {
+        imageEmbeds[idx] = __float2half(2.0F + static_cast<float>(idx));
+    }
+
+    rt::Tensor inputIdsDevice({kBatchSize, kSeqLen}, rt::DeviceType::kGPU, trt_edgellm::DataType::kINT32);
+    rt::Tensor tableDevice({kVocabSize, kHiddenSize / 2}, rt::DeviceType::kGPU, trt_edgellm::DataType::kUINT8);
+    rt::Tensor scalesDevice({kVocabSize, kHiddenSize / 32}, rt::DeviceType::kGPU, trt_edgellm::DataType::kHALF);
+    rt::Tensor indicesDevice({kBatchSize, kSeqLen}, rt::DeviceType::kGPU, trt_edgellm::DataType::kINT32);
+    rt::Tensor imageDevice({1, kHiddenSize}, rt::DeviceType::kGPU, trt_edgellm::DataType::kHALF);
+    rt::Tensor outputDevice({kBatchSize, kSeqLen, kHiddenSize}, rt::DeviceType::kGPU, trt_edgellm::DataType::kHALF);
+    copyHostToDevice(inputIdsDevice, inputIds);
+    copyHostToDevice(tableDevice, fixture.packed);
+    copyHostToDevice(scalesDevice, fixture.scales);
+    copyHostToDevice(indicesDevice, multimodalIndices);
+    copyHostToDevice(imageDevice, imageEmbeds);
+
+    kernel::embeddingLookup(inputIdsDevice, tableDevice, rt::OptionalInputTensor{scalesDevice}, outputDevice, stream,
+        rt::OptionalInputTensor{indicesDevice}, kImageTokenId, rt::OptionalInputTensor{imageDevice});
+    auto const output = copyDeviceToHost<half>(outputDevice);
+
+    for (int64_t pos = 0; pos < kBatchSize * kSeqLen; ++pos)
+    {
+        int32_t const tokenId = inputIds[pos];
+        for (int64_t col = 0; col < kHiddenSize; ++col)
+        {
+            half expected = __float2half(0.0F);
+            if (tokenId == kImageTokenId)
+            {
+                expected = imageEmbeds[col];
+            }
+            else if (tokenId >= 0 && tokenId < kVocabSize)
+            {
+                expected = fixture.reference[tokenId * kHiddenSize + col];
+            }
+            ASSERT_EQ(__half2float(output[pos * kHiddenSize + col]), __half2float(expected))
+                << "pos " << pos << " col " << col;
+        }
+    }
+}
+
+TEST_F(EmbeddingLookupTest, Int4LookupRejectsMalformedScales)
+{
+    rt::Tensor inputIds({1, 1}, rt::DeviceType::kGPU, trt_edgellm::DataType::kINT32);
+    rt::Tensor table({4, 32}, rt::DeviceType::kGPU, trt_edgellm::DataType::kUINT8);
+    rt::Tensor output({1, 1, 64}, rt::DeviceType::kGPU, trt_edgellm::DataType::kHALF);
+    rt::Tensor fp32Scales({4, 2}, rt::DeviceType::kGPU, trt_edgellm::DataType::kFLOAT);
+    rt::Tensor wrongColumns({4, 3}, rt::DeviceType::kGPU, trt_edgellm::DataType::kHALF);
+    EXPECT_THROW(kernel::embeddingLookup(inputIds, table, std::nullopt, output, stream), std::runtime_error);
+    EXPECT_THROW(kernel::embeddingLookup(inputIds, table, rt::OptionalInputTensor{fp32Scales}, output, stream),
+        std::runtime_error);
+    EXPECT_THROW(kernel::embeddingLookup(inputIds, table, rt::OptionalInputTensor{wrongColumns}, output, stream),
+        std::runtime_error);
 }

@@ -50,6 +50,38 @@ For a `[262144, 2560]` token-embedding table:
 
 The safetensors header adds a small amount beyond the tensor payloads.
 
+## Packed INT4 Sidecar
+
+`--int4-embedding` writes `embedding.safetensors` as packed symmetric INT4:
+every 32 contiguous columns of a row share one FP16 scale, values are rounded
+to `[-7, 7]` against that scale and stored as `value + 8` nibbles, two columns
+per byte (even column in the low nibble). The runtime detects the format by the
+UINT8 table dtype without an embedding descriptor and dequantizes the gathered
+rows as `fp16((nibble - 8) * scale)`; placeholder and out-of-vocabulary
+positions behave as for INT8. The option is mutually exclusive with
+`--int8-embedding` and `--fp8-embedding` and needs a hidden size divisible by
+32.
+
+| Tensor | dtype | Shape | Metadata format |
+|---|---|---|---|
+| `embedding` | UINT8 | `[vocab, hidden / 2]` | `int4_symmetric_group32_packed` |
+| `embedding_scale` | FP16 | `[vocab, hidden / 32]` | |
+
+For a `[262144, 2560]` table the payload is 377,487,360 bytes (calculated:
+4.5 bits per element). Both INT8 and INT4 round the embeddings that feed the
+model, INT4 far more coarsely; validate the task accuracy for each model and
+format.
+
+`--int4-embedding-scale q4_0_grid` uses codes in `[-8, 7]` and a signed FP16
+step per group instead of the default `amax / 7` and `[-7, 7]`. Q4_0 maps the
+largest-magnitude value of a group to code -8, so its step is negative when that
+value is positive. Each group therefore tries `max(max / 7, -min / 8)` and
+`-max(max / 8, -min / 7)` and keeps the one with the smaller reconstruction
+error. Checkpoints trained for Q4_0 (for example Gemma 4 QAT Q4_0 releases)
+store their token table on that grid, so this rule reproduces it up to FP16
+rounding of the scale. The sidecar format and the runtime decode are the same
+for both rules.
+
 ## Limitations
 
 - The experimental direct checkpoint builder has no INT8 embedding option; it

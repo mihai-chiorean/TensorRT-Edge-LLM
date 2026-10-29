@@ -1335,7 +1335,9 @@ def write_runtime_artifacts(model: "CausalLM",
                             config_filename: str = "config.json",
                             write_shared_artifacts: bool = True,
                             *,
-                            int8_embedding: bool = False) -> None:
+                            int8_embedding: bool = False,
+                            int4_embedding: bool = False,
+                            int4_embedding_scale: str = "absmax") -> None:
     """Write runtime config and the shared model-input artifacts.
 
     ``config_filename`` selects the filename for the runtime config. Use
@@ -1346,13 +1348,14 @@ def write_runtime_artifacts(model: "CausalLM",
     sidecar files are emitted. TP ranks share those artifacts, so rank 0 can
     write them once while every rank still writes the shared runtime config.
     """
-    if fp8_embedding and int8_embedding:
+    if sum((fp8_embedding, int8_embedding, int4_embedding)) > 1:
         raise ValueError(
-            "FP8 and INT8 embedding sidecars are mutually exclusive")
+            "FP8, INT8 and INT4 embedding sidecars are mutually exclusive")
     model_type = str(getattr(getattr(model, "config", None), "model_type", ""))
-    if int8_embedding and model_type.startswith("qwen3_omni"):
+    if (int8_embedding
+            or int4_embedding) and model_type.startswith("qwen3_omni"):
         raise ValueError(
-            "INT8 embedding sidecars are not supported by Qwen3-Omni talker runtimes"
+            "Quantized embedding sidecars are not supported by Qwen3-Omni talker runtimes"
         )
 
     import torch
@@ -1472,6 +1475,10 @@ def write_runtime_artifacts(model: "CausalLM",
                     raise ValueError(
                         "--int8-embedding cannot requantize a ModelOpt embedding"
                     )
+                if int4_embedding:
+                    raise ValueError(
+                        "--int4-embedding cannot requantize a ModelOpt embedding"
+                    )
                 if not model_dir or not write_modelopt_embedding(
                         model_dir, embed, _runtime_embedding_scale(model),
                         embedding_path):
@@ -1511,6 +1518,20 @@ def write_runtime_artifacts(model: "CausalLM",
                         metadata=embedding_quantization.int8_sidecar_metadata(
                             "embedding"))
                     logger.info("Wrote INT8 embedding.safetensors (%s)",
+                                list(weight.shape))
+                elif int4_embedding:
+                    from . import embedding_quantization
+                    embedding_int4, scales = embedding_quantization.quantize_embedding_to_int4(
+                        weight, scale_mode=int4_embedding_scale)
+                    save_file(
+                        {
+                            "embedding": embedding_int4,
+                            "embedding_scale": scales
+                        },
+                        embedding_path,
+                        metadata=embedding_quantization.int4_sidecar_metadata(
+                            "embedding"))
+                    logger.info("Wrote INT4 embedding.safetensors (%s)",
                                 list(weight.shape))
                 else:
                     save_file({"embedding": weight}, embedding_path)

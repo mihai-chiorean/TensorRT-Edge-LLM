@@ -999,11 +999,35 @@ EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cud
         result.table = std::move(*embeddingPtr);
         result.tableScalingFactor = std::move(*scalesPtr);
     }
+    else if (dtype == trt_edgellm::DataType::kUINT8)
+    {
+        // Packed INT4: two columns per byte, one FP16 scale per kInt4EmbeddingGroupSize columns.
+        int64_t const columns = 2 * hiddenSize;
+        ELLM_CHECK(scalesPtr != nullptr,
+            format::fmtstr("INT4 embedding requires 'embedding_scale' tensor: %s", embeddingPath.string().c_str()));
+        ELLM_CHECK(scalesPtr->getDataType() == trt_edgellm::DataType::kHALF,
+            format::fmtstr(
+                "INT4 embedding_scale must have FP16 dtype, got %d", static_cast<int>(scalesPtr->getDataType())));
+        ELLM_CHECK(scalesPtr->getShape().getNumDims() == 2,
+            format::fmtstr("INT4 embedding_scale must be 2D, got %d dimensions", scalesPtr->getShape().getNumDims()));
+        ELLM_CHECK(columns % kInt4EmbeddingGroupSize == 0,
+            format::fmtstr("INT4 embedding width %ld must be a multiple of %ld", columns, kInt4EmbeddingGroupSize));
+        ELLM_CHECK(scalesPtr->getShape()[0] == vocabSize
+                && scalesPtr->getShape()[1] == columns / kInt4EmbeddingGroupSize,
+            format::fmtstr("INT4 embedding_scale must be [%ld, %ld], got [%ld, %ld]", vocabSize,
+                columns / kInt4EmbeddingGroupSize, scalesPtr->getShape()[0], scalesPtr->getShape()[1]));
+
+        LOG_INFO("Loaded INT4 embedding: [%ld, %ld] packed as [%ld, %ld], scales: [%ld, %ld]", vocabSize, columns,
+            vocabSize, hiddenSize, scalesPtr->getShape()[0], scalesPtr->getShape()[1]);
+
+        result.table = std::move(*embeddingPtr);
+        result.tableScalingFactor = std::move(*scalesPtr);
+    }
     else
     {
         ELLM_CHECK(dtype == trt_edgellm::DataType::kHALF,
-            format::fmtstr("Embedding tensor must be FP16, FP8, or INT8, got dtype %d: %s", static_cast<int>(dtype),
-                embeddingPath.string().c_str()));
+            format::fmtstr("Embedding tensor must be FP16, FP8, INT8, or packed INT4, got dtype %d: %s",
+                static_cast<int>(dtype), embeddingPath.string().c_str()));
         ELLM_CHECK(scalesPtr == nullptr,
             format::fmtstr(
                 "FP16 embedding must not have an 'embedding_scale' tensor: %s", embeddingPath.string().c_str()));

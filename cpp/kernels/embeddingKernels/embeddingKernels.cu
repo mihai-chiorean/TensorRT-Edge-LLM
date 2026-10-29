@@ -36,6 +36,9 @@ namespace kernel
 namespace
 {
 
+//! Columns per FP16 scale in the packed INT4 table formats.
+constexpr int64_t kInt4GroupSize = 32;
+
 //! \brief FP16 embedding loader for template-based kernel
 struct Fp16EmbeddingLoader
 {
@@ -65,6 +68,30 @@ struct Int8EmbeddingLoader
         for (uint32_t i = 0; i < vecSize; ++i)
         {
             out[i] = __float2half(static_cast<float>(values[i]) * scale);
+        }
+    }
+};
+
+//! \brief Packed INT4 embedding loader: two columns per byte (even column in the low nibble, stored as value + 8),
+//! one FP16 scale per kInt4GroupSize columns.
+struct Int4EmbeddingLoader
+{
+    static constexpr uint32_t vecSize = DVec<half>::vec_size;
+    uint8_t const* table{nullptr};
+    half const* scales{nullptr};
+    int64_t nGroups{0};
+
+    __device__ __forceinline__ void load(int32_t tokenId, int64_t hiddenSize, uint32_t offset, DVec<half>& out) const
+    {
+        // One 4-byte load per 8 outputs; hiddenSize % 8 == 0 keeps every row offset 4-byte aligned.
+        uint32_t const packed
+            = *reinterpret_cast<uint32_t const*>(table + (static_cast<int64_t>(tokenId) * hiddenSize + offset) / 2);
+        float const scale = __half2float(scales[static_cast<int64_t>(tokenId) * nGroups + offset / kInt4GroupSize]);
+#pragma unroll
+        for (uint32_t i = 0; i < vecSize; ++i)
+        {
+            int32_t const value = static_cast<int32_t>((packed >> (4 * i)) & 0xFU) - 8;
+            out[i] = __float2half(static_cast<float>(value) * scale);
         }
     }
 };
@@ -631,7 +658,10 @@ static void embeddingLookupImpl(rt::Tensor const& inputIds, rt::Tensor const& em
 
     auto const& logicalShape = descriptor == nullptr ? embeddingShape : descriptor->logicalShape;
     int32_t const vocabSize = static_cast<int32_t>(logicalShape[0]);
-    int64_t const hiddenSize = logicalShape[1];
+    // Without a descriptor an unsigned byte table is the packed INT4 format, two columns per byte.
+    bool const isInt4Embedding
+        = descriptor == nullptr && embeddingTable.getDataType() == trt_edgellm::DataType::kUINT8;
+    int64_t const hiddenSize = isInt4Embedding ? 2 * logicalShape[1] : logicalShape[1];
     check::check(
         logicalShape[0] == embeddingShape[0], "embedding descriptor logical and packed vocab dimensions must match");
 
@@ -720,6 +750,10 @@ static void embeddingLookupImpl(rt::Tensor const& inputIds, rt::Tensor const& em
     {
         format = EmbeddingTableFormat::kINT8;
     }
+    else if (isInt4Embedding)
+    {
+        format = EmbeddingTableFormat::kINT4;
+    }
 
     if (format == EmbeddingTableFormat::kNVFP4)
     {
@@ -761,6 +795,25 @@ static void embeddingLookupImpl(rt::Tensor const& inputIds, rt::Tensor const& em
         check::check(
             false, "NVFP4 embedding lookup is unavailable: build does not support FP8 block scales (SUPPORTS_FP8=0)");
 #endif
+    }
+    else if (format == EmbeddingTableFormat::kINT4)
+    {
+        check::check(isInt4Embedding, "packed INT4 embedding tables are selected by UINT8 storage without a descriptor");
+        check::check(scales.has_value(), "scales must be provided for INT4 embedding table");
+        auto const& scalesTensor = scales.value().get();
+        auto const scaleShape = scalesTensor.getShape();
+        check::check(hiddenSize % kInt4GroupSize == 0,
+            format::fmtstr("INT4 hiddenSize must be a multiple of %d", static_cast<int>(kInt4GroupSize)));
+        check::check(scaleShape.getNumDims() == 2, "INT4 scales must be 2D tensor [vocabSize, hiddenSize / 32]");
+        check::check(scaleShape[0] == vocabSize, "INT4 scale rows must match embeddingTable rows");
+        check::check(scaleShape[1] == hiddenSize / kInt4GroupSize, "INT4 scale columns must equal hiddenSize / 32");
+        check::check(scalesTensor.getDataType() == trt_edgellm::DataType::kHALF, "INT4 scales must be FP16");
+
+        Int4EmbeddingLoader loader{
+            embeddingTable.dataPointer<uint8_t>(), scalesTensor.dataPointer<half>(), hiddenSize / kInt4GroupSize};
+        launchEmbeddingLookupKernel(inputIdsPtr, loader, multimodalIndicesPtr, imageTokenIdValue, imageEmbedsPtr,
+            imageTokenLen, audioTokenIdValue, audioEmbedsPtr, audioTokenLen, outputPtr, batchSize, seqLen, vocabSize,
+            hiddenSize, stream);
     }
     else if (format == EmbeddingTableFormat::kINT8)
     {

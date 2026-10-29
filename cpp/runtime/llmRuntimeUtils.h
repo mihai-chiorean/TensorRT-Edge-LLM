@@ -510,7 +510,10 @@ inline constexpr char const* kFp8EmbeddingScaleTensorName = "embedding_scale";
 inline constexpr char const* kNvfp4EmbeddingBlockScaleTensorName = "embedding_block_scale";
 inline constexpr char const* kNvfp4EmbeddingMultiplierScaleTensorName = "embedding_multiplier_scale";
 
-/*! \brief Embedding data - supports FP16, FP8, INT8, and packed NVFP4 formats
+//! Columns per FP16 scale in the packed INT4 embedding sidecar (two columns per stored byte).
+inline constexpr int64_t kInt4EmbeddingGroupSize = 32;
+
+/*! \brief Embedding data - supports FP16, FP8, INT8, packed INT4, and packed NVFP4 formats
  *
  *  The table datatype determines the FP16/FP8/INT8 formats. NVFP4 uses the descriptor:
  *  - FP16: table is FP16, tableScalingFactor is empty
