@@ -49,7 +49,10 @@ from typing import (TYPE_CHECKING, Any, Callable, Dict, Iterator, List,
 from ..config import (DEFAULT_MAX_QUEUED_REQUESTS, IFB_SCHEDULING_DEFAULTS,
                       ContextCacheConfig, PleRuntimeConfig, ServerConfigError,
                       validate_ifb_scheduling_options)
-from ..parsing.tool_calling import (ToolConfig, parse_assistant_output,
+from ..parsing.terminal_tokens import (ended_on_stop, strip_terminal_tokens,
+                                       terminal_special_tokens)
+from ..parsing.tool_calling import (ToolConfig, inject_tool_requirement,
+                                    parse_assistant_output,
                                     validate_tool_request)
 from .engine_layout import BundleLayout, EngineType, inspect_bundle
 
@@ -1431,6 +1434,8 @@ class LLM:
             and self.has_draft_model and apply_chat_template
             and add_generation_prompt)
         replay_tail_length = -1 if derive_replay_tail else 0
+        if apply_chat_template:
+            messages = inject_tool_requirement(messages, tool_config)
         cpp_messages, image_buffers = self._prepare_messages_for_runtime(
             messages)
 
@@ -1518,7 +1523,13 @@ class LLM:
         *,
         tool_parser: str = "auto",
         reasoning_parser: str = "none",
+        skip_special_tokens: bool = True,
     ) -> CompletionOutput:
+        if (tool_config.parse_output and not skip_special_tokens
+                and ended_on_stop(finish_reason)):
+            # The stop token that ended generation is still at the end.
+            text = strip_terminal_tokens(
+                text, terminal_special_tokens(self._model_dir))
         parsed = parse_assistant_output(
             text,
             tool_config,
@@ -1562,6 +1573,7 @@ class LLM:
             tool_config,
             tool_parser=tool_parser,
             reasoning_parser=reasoning_parser,
+            skip_special_tokens=params.skip_special_tokens,
         )
         if params.num_logprobs > 0 and response.logprobs:
             output.logprobs = _convert_logprobs(response.logprobs[0])
