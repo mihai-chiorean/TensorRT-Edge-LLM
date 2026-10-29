@@ -223,6 +223,9 @@ tests:
   # Dense NVFP4 TP2 export contract shared by Qwen and other dense models
   - tests/python-unittests/test_quantize_activations.py::test_tp2_dense_nvfp4_token_matrix_exports_rank2_gemm
 
+  # Built-in calibration dataset Hub ids
+  - tests/python-unittests/test_builtin_datasets.py
+
   # LayerNorm plugin tests
   - tests/python-unittests/test_layernorm_plugin.py
   - tests/python-unittests/test_layernorm_kernel_config.py
