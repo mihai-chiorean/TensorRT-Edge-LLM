@@ -337,6 +337,40 @@ TEST(KvCacheManagerPagedPoolTest, InvalidKVSharingDonorsAreRejected)
     EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 }
 
+TEST(KvCacheManagerPagedPoolTest, KVSharingRequiresMatchingCachePolicy)
+{
+    cudaStream_t stream{nullptr};
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    int32_t const window = 129;
+    rt::KVLayerConfig const full{/*numKVHeads=*/1, /*headDim=*/8};
+    rt::KVLayerConfig const swa{/*numKVHeads=*/1, /*headDim=*/8, /*kvCacheCapacity=*/window};
+    rt::KVCacheManager::Config config{/*numAttentionLayers=*/4, /*maxBatchSize=*/2, /*maxSequenceLength=*/8192,
+        {full, swa, swa, full}, DataType::kHALF};
+    config.numSwaPages = 64;
+
+    config.kvSharingDonors = {-1, -1, 1, 0};
+    {
+        rt::KVCacheManager mgr(config, stream);
+        EXPECT_EQ(mgr.kPoolPtr(2), mgr.kPoolPtr(1));
+        EXPECT_EQ(mgr.numPages(2), mgr.numPages(1));
+        EXPECT_EQ(mgr.kPoolPtr(3), mgr.kPoolPtr(0));
+        EXPECT_EQ(mgr.numPages(3), mgr.numPages(0));
+    }
+    config.kvSharingDonors = {-1, -1, 0, -1};
+    EXPECT_THROW(rt::KVCacheManager mgr(config, stream), std::exception) << "bounded-SWA recipient, full donor";
+    config.kvSharingDonors = {-1, -1, -1, 1};
+    EXPECT_THROW(rt::KVCacheManager mgr(config, stream), std::exception) << "full recipient, bounded-SWA donor";
+
+    config.useBoundedSwaKVCache = false;
+    config.kvSharingDonors = {-1, -1, 0, 1};
+    {
+        rt::KVCacheManager mgr(config, stream);
+        EXPECT_EQ(mgr.kPoolPtr(2), mgr.kPoolPtr(0));
+        EXPECT_EQ(mgr.kPoolPtr(3), mgr.kPoolPtr(1));
+    }
+    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
 TEST(KvCacheManagerPagedPoolTest, FullAndSwaLayersExposeSeparatePhysicalCounts)
 {
     cudaStream_t stream{nullptr};

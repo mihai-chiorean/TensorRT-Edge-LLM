@@ -144,6 +144,10 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
             || static_cast<int32_t>(mConfig.kvSharingDonors.size()) == mConfig.numAttentionLayers,
         "KVCacheManager: kvSharingDonors must be empty or have one entry per attention layer.");
     size_t sharedBytesSkipped = 0;
+    auto const usesReducedPool = [this](KVLayerConfig const& layer) {
+        return mConfig.useBoundedSwaKVCache
+            && isReducedKvCacheCapacity(layer.kvCacheCapacity, mConfig.maxSequenceLength);
+    };
     for (int32_t i = 0; i < mConfig.numAttentionLayers; ++i)
     {
         KVLayerConfig const& lc = mConfig.layerConfigs[i];
@@ -158,14 +162,17 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
             KVLayerConfig const& dc = mConfig.layerConfigs[donor];
             check::check(dc.numKVHeads == lc.numKVHeads && dc.headDim == lc.headDim,
                 "KVCacheManager: KV-sharing recipient and donor head shapes must match.");
+            // A bounded-SWA layer addresses its pool through the sparse SWA page table, a full layer through
+            // the base one, so a recipient can only alias a donor that uses the same pool kind.
+            check::check(usesReducedPool(dc) == usesReducedPool(lc),
+                "KVCacheManager: KV-sharing recipient and donor must use the same cache policy (full or bounded SWA).");
             mLayerNumPages.push_back(mLayerNumPages[donor]);
             mLayerCapPadded.push_back(mLayerCapPadded[donor]);
             sharedBytesSkipped += computeLayerBytes(mLayerNumPages[donor], lc, elemSize);
             mLayerCaches.emplace_back();
             continue;
         }
-        bool const isReduced
-            = mConfig.useBoundedSwaKVCache && isReducedKvCacheCapacity(lc.kvCacheCapacity, mConfig.maxSequenceLength);
+        bool const isReduced = usesReducedPool(lc);
         int32_t const layerNumPages = isReduced ? mConfig.numSwaPages : mNumPages;
         int32_t const layerCapPadded = isReduced ? *boundedCapPadded : mCapPadded;
         mLayerNumPages.push_back(layerNumPages);
