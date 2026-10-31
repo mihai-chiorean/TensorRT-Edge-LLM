@@ -238,6 +238,105 @@ TEST(KvCacheManagerPagedPoolTest, NumPagesOverrideBelowMinimumActivePagesRejecte
     EXPECT_THROW(rt::KVCacheManager mgr(config, stream), std::exception);
 }
 
+TEST(KvCacheManagerPagedPoolTest, KVSharingRecipientsAliasDonorPools)
+{
+    cudaStream_t stream{nullptr};
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    {
+        auto config = makeHeteroConfig(2, 200, 4, 64, 2, 128, DataType::kHALF);
+        config.numAttentionLayers = 4;
+        config.layerConfigs.resize(4);
+        config.layerConfigs[2] = config.layerConfigs[0];
+        config.layerConfigs[3] = config.layerConfigs[1];
+        config.kvSharingDonors = {-1, -1, 0, 1};
+        rt::KVCacheManager mgr(config, stream);
+        rt::KVCacheManager const& constMgr = mgr;
+
+        for (int32_t donor = 0; donor < 2; ++donor)
+        {
+            int32_t const recipient = donor + 2;
+            SCOPED_TRACE(recipient);
+            EXPECT_FALSE(mgr.isKVSharingRecipient(donor));
+            EXPECT_EQ(mgr.storageLayer(donor), donor);
+            EXPECT_TRUE(mgr.isKVSharingRecipient(recipient));
+            EXPECT_EQ(mgr.storageLayer(recipient), donor);
+            EXPECT_NE(mgr.kPoolPtr(donor), nullptr);
+            EXPECT_EQ(mgr.getCombinedKVCache(recipient).rawPointer(), mgr.getCombinedKVCache(donor).rawPointer());
+            EXPECT_EQ(
+                constMgr.getCombinedKVCache(recipient).rawPointer(), constMgr.getCombinedKVCache(donor).rawPointer());
+            EXPECT_EQ(mgr.kPoolPtr(recipient), mgr.kPoolPtr(donor));
+            EXPECT_EQ(mgr.vPoolPtr(recipient), mgr.vPoolPtr(donor));
+            auto const [kView, vView] = mgr.getSeparateKVCache(recipient);
+            EXPECT_EQ(kView.rawPointer(), mgr.kPoolPtr(donor));
+            EXPECT_EQ(vView.rawPointer(), mgr.vPoolPtr(donor));
+            EXPECT_EQ(mgr.numPages(recipient), mgr.numPages(donor));
+            EXPECT_EQ(mgr.maxCapPadded(recipient), mgr.maxCapPadded(donor));
+            EXPECT_EQ(mgr.maxCapPadded(recipient), padToPage(config.maxSequenceLength));
+        }
+        EXPECT_NE(mgr.getCombinedKVCache(0).rawPointer(), mgr.getCombinedKVCache(1).rawPointer());
+        EXPECT_NE(mgr.kPoolPtr(0), mgr.kPoolPtr(1));
+        EXPECT_NE(mgr.vPoolPtr(0), mgr.vPoolPtr(1));
+    }
+    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
+TEST(KvCacheManagerPagedPoolTest, EmptyKVSharingDonorsKeepIndependentPools)
+{
+    cudaStream_t stream{nullptr};
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    {
+        auto config = makeHeteroConfig(2, 200, 4, 64, 4, 64, DataType::kHALF);
+        config.numAttentionLayers = 4;
+        config.layerConfigs.resize(4, config.layerConfigs[0]);
+        EXPECT_TRUE(config.kvSharingDonors.empty());
+        rt::KVCacheManager mgr(config, stream);
+
+        for (int32_t i = 0; i < mgr.numLayers(); ++i)
+        {
+            SCOPED_TRACE(i);
+            EXPECT_FALSE(mgr.isKVSharingRecipient(i));
+            EXPECT_EQ(mgr.storageLayer(i), i);
+            EXPECT_NE(mgr.kPoolPtr(i), nullptr);
+            EXPECT_NE(mgr.kPoolPtr(i), mgr.vPoolPtr(i));
+            for (int32_t j = 0; j < i; ++j)
+            {
+                EXPECT_NE(mgr.getCombinedKVCache(i).rawPointer(), mgr.getCombinedKVCache(j).rawPointer());
+                EXPECT_NE(mgr.kPoolPtr(i), mgr.kPoolPtr(j));
+                EXPECT_NE(mgr.vPoolPtr(i), mgr.vPoolPtr(j));
+                EXPECT_NE(mgr.kPoolPtr(i), mgr.vPoolPtr(j));
+                EXPECT_NE(mgr.vPoolPtr(i), mgr.kPoolPtr(j));
+            }
+        }
+    }
+    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
+TEST(KvCacheManagerPagedPoolTest, InvalidKVSharingDonorsAreRejected)
+{
+    cudaStream_t stream{nullptr};
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    auto config = makeHeteroConfig(2, 200, 4, 64, 4, 64, DataType::kHALF);
+    config.numAttentionLayers = 4;
+    config.layerConfigs.resize(4, config.layerConfigs[0]);
+
+    config.kvSharingDonors = {-1, -1, 0};
+    EXPECT_THROW(rt::KVCacheManager mgr(config, stream), std::exception) << "wrong donor count";
+    config.kvSharingDonors = {-1, -1, 2, 1};
+    EXPECT_THROW(rt::KVCacheManager mgr(config, stream), std::exception) << "self donor";
+    config.kvSharingDonors = {-1, -1, 3, 1};
+    EXPECT_THROW(rt::KVCacheManager mgr(config, stream), std::exception) << "forward donor";
+    config.kvSharingDonors = {-1, 0, 1, -1};
+    EXPECT_THROW(rt::KVCacheManager mgr(config, stream), std::exception) << "donor is a recipient";
+
+    config.kvSharingDonors = {-1, -1, 0, 1};
+    config.layerConfigs[2].numKVHeads = 2;
+    EXPECT_THROW(rt::KVCacheManager mgr(config, stream), std::exception) << "mismatched head count";
+    config.layerConfigs[2] = config.layerConfigs[0];
+    config.layerConfigs[2].headDim = 128;
+    EXPECT_THROW(rt::KVCacheManager mgr(config, stream), std::exception) << "mismatched head dimension";
+    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
 TEST(KvCacheManagerPagedPoolTest, FullAndSwaLayersExposeSeparatePhysicalCounts)
 {
     cudaStream_t stream{nullptr};
