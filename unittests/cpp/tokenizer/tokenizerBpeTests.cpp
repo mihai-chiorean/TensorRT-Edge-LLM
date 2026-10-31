@@ -104,6 +104,11 @@ BpeModel makeVocabRankModel(std::mt19937& rng)
 //! Reference: repeatedly merge the lowest-priority adjacent pair, leftmost on ties.
 std::vector<tokenizer::Rank> referenceEncode(BpeModel const& model, bool useMergePriorities, std::string const& text)
 {
+    // A piece that is itself a vocabulary entry encodes to that id without merging, as in TokenEncoder.
+    if (auto const it = model.vocab.find(text); it != model.vocab.end())
+    {
+        return {it->second};
+    }
     std::map<std::pair<std::string, std::string>, size_t> priorities;
     for (size_t i = 0; i < model.merges.size(); ++i)
     {
@@ -192,6 +197,11 @@ void expectMatchesReference(bool useMergePriorities, std::string const& name)
             }
             ASSERT_EQ(tok.encode(text, false), referenceEncode(model, useMergePriorities, text))
                 << "model " << modelIdx << " text " << text.substr(0, 80);
+        }
+        for (auto const& entry : model.vocab)
+        {
+            ASSERT_EQ(tok.encode(entry.first, false), referenceEncode(model, useMergePriorities, entry.first))
+                << "model " << modelIdx << " vocabulary entry " << entry.first;
         }
     }
 }
