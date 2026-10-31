@@ -41,6 +41,8 @@ struct ContextCacheMetrics
     uint64_t mediaAwareSequences{};
     //! Sequences whose final executable lookup policy was bypass, including forced-cold retries.
     uint64_t lookupBypassSequences{};
+    //! Speculative media sequences whose lookup and publication stop at the first media block.
+    uint64_t specMediaPrefixSequences{};
     uint64_t forcedColdSequences{};
     uint64_t standardPlans{};
     uint64_t noReusablePrefixPlans{};

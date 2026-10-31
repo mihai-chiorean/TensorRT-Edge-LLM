@@ -599,6 +599,71 @@ protected:
             ContextCacheCoordinatorStatus::kOk);
     }
 
+    ContextCacheCoordinator::AdmissionResult beginSequences(
+        std::vector<ContextCacheSequenceAdmission> sequences, bool speculativeRequest = true)
+    {
+        ContextCacheBatchAdmission admission;
+        admission.speculativeRequest = speculativeRequest;
+        admission.sequences = std::move(sequences);
+        DecodingKvHeadroom const headroom = speculativeRequest ? DecodingKvHeadroom{5, 0} : DecodingKvHeadroom{1, 0};
+        ContextCacheCoordinator::BeginRequestResult result = mCoordinator->beginRequest(admission, headroom, mStream);
+        EXPECT_EQ(result.status, ContextCacheCoordinatorStatus::kOk);
+        EXPECT_TRUE(result.admission.has_value());
+        return std::move(*result.admission);
+    }
+
+    ContextCacheCoordinator::AdmissionResult beginMedia(
+        std::vector<int32_t> tokens, std::vector<Hash128> mediaHash, bool speculativeRequest = true)
+    {
+        std::vector<ContextCacheSequenceAdmission> sequences;
+        sequences.push_back(
+            ContextCacheSequenceAdmission{std::move(tokens), {}, std::move(mediaHash), ResidentRef{0, 1}});
+        return beginSequences(std::move(sequences), speculativeRequest);
+    }
+
+    void publishVanillaPrefill(ContextCacheCoordinator::AdmissionResult& admission, int32_t inputLength)
+    {
+        ASSERT_EQ(mCoordinator->preparePrefill(admission.request), ContextCacheCoordinatorStatus::kOk);
+        ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+        int32_t lookahead = 9001;
+        std::vector<ContextCacheSequenceAdvance> advances{ContextCacheSequenceAdvance{&lookahead, 1, inputLength}};
+        ASSERT_EQ(
+            mCoordinator->finalizePrefillPublication(admission.request, advances), ContextCacheCoordinatorStatus::kOk);
+    }
+
+    void verifyStep(ContextCacheCoordinator::AdmissionResult& admission, std::vector<int32_t> const& accepted,
+        int32_t committedLength)
+    {
+        ASSERT_EQ(mCoordinator->prepareDecodeStep(admission.request, DecodingKvHeadroom{5, 0}),
+            ContextCacheCoordinatorStatus::kOk);
+        ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+        std::vector<ContextCacheSequenceAdvance> advances{
+            ContextCacheSequenceAdvance{accepted.data(), static_cast<int32_t>(accepted.size()), committedLength}};
+        ASSERT_EQ(
+            mCoordinator->completeDecodeStep(admission.request, advances, {}), ContextCacheCoordinatorStatus::kOk);
+    }
+
+    static std::vector<Hash128> mediaRun(int32_t length, int32_t first, int32_t count)
+    {
+        std::vector<Hash128> hashes(static_cast<size_t>(length));
+        for (int32_t position = first; position < first + count; ++position)
+        {
+            hashes[static_cast<size_t>(position)] = Hash128{0xA0D10U, 0x5EEDU};
+        }
+        return hashes;
+    }
+
+    std::vector<size_t> recordPageCounts() const
+    {
+        std::vector<size_t> counts;
+        for (RecordId const id : mCoordinator->manager().records().lruToMru())
+        {
+            counts.push_back(mCoordinator->manager().records().get(id).basePagePath.size());
+        }
+        std::sort(counts.begin(), counts.end());
+        return counts;
+    }
+
     cudaStream_t mStream{};
     DeploymentConfig mDeployment;
     std::unique_ptr<HybridCacheManager> mBaseCache;
@@ -715,6 +780,114 @@ TEST_F(ContextCacheGemma4MtpCoordinatorTests, BaseOnlyRecordSupportsPartialAndEx
     EXPECT_EQ(partialHit.prefillStarts, std::vector<int32_t>{kInputLength});
     EXPECT_EQ(mCoordinator->finish(partialHit.request), ContextCacheCoordinatorStatus::kOk);
     EXPECT_GE(mCoordinator->metrics().reusedTokens, static_cast<uint64_t>(3 * kTOKENS_PER_PAGE));
+}
+
+TEST_F(ContextCacheGemma4MtpCoordinatorTests, MediaRequestReusesTextPrefixBeforeFirstMedia)
+{
+    constexpr int32_t kInputLength{2 * kTOKENS_PER_PAGE + 40};
+    auto producer = begin(makeTokens(kInputLength));
+    publishPrefill(producer, kInputLength);
+    ASSERT_EQ(mCoordinator->finish(producer.request), ContextCacheCoordinatorStatus::kOk);
+
+    ContextCacheMetrics const before = mCoordinator->metrics();
+    auto consumer = beginMedia(makeTokens(kInputLength), mediaRun(kInputLength, 2 * kTOKENS_PER_PAGE + 2, 25));
+    EXPECT_EQ(consumer.prefillStarts, std::vector<int32_t>{2 * kTOKENS_PER_PAGE});
+    ContextCacheMetrics const after = mCoordinator->metrics();
+    EXPECT_EQ(after.lookupBypassSequences, before.lookupBypassSequences);
+    EXPECT_EQ(after.specMediaPrefixSequences, before.specMediaPrefixSequences + 1U);
+    EXPECT_EQ(after.reusedTokens, before.reusedTokens + static_cast<uint64_t>(2 * kTOKENS_PER_PAGE));
+    EXPECT_EQ(mCoordinator->finish(consumer.request), ContextCacheCoordinatorStatus::kOk);
+}
+
+TEST_F(ContextCacheGemma4MtpCoordinatorTests, MediaRequestLookupStopsAtTheFirstMediaBlock)
+{
+    // A vanilla request in the same deployment publishes media-keyed blocks; a speculative request with the same
+    // media must still stop at the page that holds its first media position.
+    constexpr int32_t kInputLength{3 * kTOKENS_PER_PAGE + 5};
+    std::vector<Hash128> const media = mediaRun(kInputLength, kTOKENS_PER_PAGE + 3, 75);
+    auto producer = beginMedia(makeTokens(kInputLength), media, /*speculativeRequest=*/false);
+    publishVanillaPrefill(producer, kInputLength);
+    ASSERT_EQ(mCoordinator->finish(producer.request), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(recordPageCounts(), std::vector<size_t>{3});
+
+    auto consumer = beginMedia(makeTokens(kInputLength), media);
+    EXPECT_EQ(consumer.prefillStarts, std::vector<int32_t>{kTOKENS_PER_PAGE});
+    EXPECT_EQ(mCoordinator->finish(consumer.request), ContextCacheCoordinatorStatus::kOk);
+}
+
+TEST_F(ContextCacheGemma4MtpCoordinatorTests, MediaRequestPublishesOnlyTextBlocksThroughAHeldVerifyStep)
+{
+    constexpr int32_t kInputLength{3 * kTOKENS_PER_PAGE + 5};
+    std::vector<Hash128> const media = mediaRun(kInputLength, 2 * kTOKENS_PER_PAGE + 3, 75);
+    auto producer = beginMedia(makeTokens(kInputLength), media);
+    EXPECT_EQ(producer.prefillStarts, std::vector<int32_t>{0});
+    publishPrefill(producer, kInputLength);
+    verifyStep(producer, {41, 42}, kInputLength + 2);
+    ASSERT_EQ(mCoordinator->prepareDecodeStep(producer.request, DecodingKvHeadroom{5, 0}),
+        ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    std::vector<ContextCacheSequenceAdvance> held{
+        ContextCacheSequenceAdvance{nullptr, 0, ContextCacheSequenceAdvance::kHoldCommittedStateLength}};
+    ASSERT_EQ(mCoordinator->completeDecodeStep(producer.request, held, {0}), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(mCoordinator->finish(producer.request), ContextCacheCoordinatorStatus::kOk);
+    EXPECT_EQ(recordPageCounts(), std::vector<size_t>{2});
+
+    auto sameMedia = beginMedia(makeTokens(kInputLength), media);
+    EXPECT_EQ(sameMedia.prefillStarts, std::vector<int32_t>{2 * kTOKENS_PER_PAGE});
+    EXPECT_EQ(mCoordinator->finish(sameMedia.request), ContextCacheCoordinatorStatus::kOk);
+
+    auto textFollowUp = begin(makeTokens(kInputLength));
+    EXPECT_EQ(textFollowUp.prefillStarts, std::vector<int32_t>{2 * kTOKENS_PER_PAGE});
+    EXPECT_EQ(mCoordinator->finish(textFollowUp.request), ContextCacheCoordinatorStatus::kOk);
+}
+
+TEST_F(ContextCacheGemma4MtpCoordinatorTests, MediaInTheFirstBlockNeitherReusesNorPublishes)
+{
+    constexpr int32_t kInputLength{2 * kTOKENS_PER_PAGE + 5};
+    auto producer = begin(makeTokens(kInputLength));
+    publishPrefill(producer, kInputLength);
+    ASSERT_EQ(mCoordinator->finish(producer.request), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(recordPageCounts(), std::vector<size_t>{2});
+
+    auto request = beginMedia(makeTokens(kInputLength), mediaRun(kInputLength, 3, 75));
+    EXPECT_EQ(request.prefillStarts, std::vector<int32_t>{0});
+    publishPrefill(request, kInputLength);
+    verifyStep(request, {41, 42}, kInputLength + 2);
+    ASSERT_EQ(mCoordinator->finish(request.request), ContextCacheCoordinatorStatus::kOk);
+    EXPECT_EQ(recordPageCounts(), std::vector<size_t>{2});
+}
+
+TEST_F(ContextCacheGemma4MtpCoordinatorTests, MediaInOneBatchSlotCapsOnlyThatSlot)
+{
+    constexpr int32_t kInputLength{3 * kTOKENS_PER_PAGE - 3};
+    auto producer = begin(makeTokens(kInputLength));
+    publishPrefill(producer, kInputLength);
+    ASSERT_EQ(mCoordinator->finish(producer.request), ContextCacheCoordinatorStatus::kOk);
+
+    std::vector<ContextCacheSequenceAdmission> sequences;
+    sequences.push_back(ContextCacheSequenceAdmission{makeTokens(kInputLength), {}, {}, ResidentRef{0, 1}});
+    sequences.push_back(ContextCacheSequenceAdmission{
+        makeTokens(kInputLength), {}, mediaRun(kInputLength, kTOKENS_PER_PAGE + 5, 25), ResidentRef{1, 1}});
+    auto batch = beginSequences(std::move(sequences));
+    EXPECT_EQ(batch.prefillStarts, (std::vector<int32_t>{2 * kTOKENS_PER_PAGE, kTOKENS_PER_PAGE}));
+
+    // The text slot still publishes its generated tokens; the media slot never publishes past its first media page.
+    ASSERT_EQ(mCoordinator->preparePrefill(batch.request), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    std::vector<int32_t> lookahead{9001, 9002};
+    std::vector<ContextCacheSequenceAdvance> prefill{ContextCacheSequenceAdvance{&lookahead[0], 1, kInputLength},
+        ContextCacheSequenceAdvance{&lookahead[1], 1, kInputLength}};
+    ASSERT_EQ(mCoordinator->finalizePrefillPublication(batch.request, prefill), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(
+        mCoordinator->prepareDecodeStep(batch.request, DecodingKvHeadroom{5, 0}), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    std::vector<int32_t> const generated{51, 52, 53, 54};
+    int32_t const decodedLength = kInputLength + static_cast<int32_t>(generated.size());
+    std::vector<ContextCacheSequenceAdvance> decode{ContextCacheSequenceAdvance{generated.data(), 4, decodedLength},
+        ContextCacheSequenceAdvance{generated.data(), 4, decodedLength}};
+    ASSERT_EQ(mCoordinator->completeDecodeStep(batch.request, decode, {0, 1}), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(mCoordinator->finish(batch.request), ContextCacheCoordinatorStatus::kOk);
+    EXPECT_EQ(recordPageCounts(), (std::vector<size_t>{1, 2, 3}));
 }
 
 } // namespace

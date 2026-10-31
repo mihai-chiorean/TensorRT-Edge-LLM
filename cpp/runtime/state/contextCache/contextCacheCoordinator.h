@@ -323,6 +323,10 @@ private:
     //! terminalizes the ordered draft init. Hybrid+MTP publishes via the hybrid snapshot endpoint path, no frozen
     //! phase.
     bool usesFrozenSpecPublication(RequestHandle::Impl const& request) const noexcept;
+    //! A shared-KV draft (Gemma4 MTP) reads only target KV and re-embeds no prompt media, so a speculative media
+    //! request may reuse and publish the text blocks before its first media position. Paged-draft (EAGLE, MTP) and
+    //! hybrid speculative media requests stay on the bypass path.
+    bool supportsSpecMediaPrefixReuse() const noexcept;
     bool deploymentHasAttention() const noexcept;
     ContextCacheCoordinatorStatus synchronizeRequest(RequestHandle& request);
     void abandon(std::unique_ptr<RequestHandle::Impl> request) noexcept;

@@ -50,6 +50,19 @@ bool shouldLogDegradation(uint64_t count) noexcept
     return count != 0U && (count & (count - 1U)) == 0U;
 }
 
+//! Length of the full blocks that end at or before the first media position; unbounded when text-only.
+int32_t textPrefixBeforeFirstMedia(std::vector<Hash128> const& perPositionMediaHash)
+{
+    auto const firstMedia = std::find_if(perPositionMediaHash.begin(), perPositionMediaHash.end(),
+        [](Hash128 const& hash) { return hash != Hash128{}; });
+    if (firstMedia == perPositionMediaHash.end())
+    {
+        return std::numeric_limits<int32_t>::max();
+    }
+    int32_t const firstMediaPosition = static_cast<int32_t>(firstMedia - perPositionMediaHash.begin());
+    return (firstMediaPosition / kTOKENS_PER_PAGE) * kTOKENS_PER_PAGE;
+}
+
 void requireKvPageCoverage(ReusePlan& plan, int32_t basePages, int32_t draftPages)
 {
     ELLM_CHECK(basePages >= 0 && draftPages >= 0, "Context cache KV-page coverage must be non-negative");
@@ -294,6 +307,8 @@ struct ContextCacheCoordinator::RequestHandle::Impl
         BlockKeyExtras keyExtras;
         std::vector<Hash128> perPositionMediaHash;
         int32_t reuseTokenLength{};
+        //! Speculative media requests publish only the text blocks before their first media position.
+        int32_t publishLimitTokens{std::numeric_limits<int32_t>::max()};
         ContextCacheLookupPolicy lookupPolicy{ContextCacheLookupPolicy::kUseCache};
         ContextCacheCommitPolicy commitPolicy{ContextCacheCommitPolicy::kIncludingGeneratedTokens};
         int32_t replayTailLength{};
@@ -988,8 +1003,16 @@ ContextCacheCoordinator::AcquireSequenceResult ContextCacheCoordinator::acquireS
     auto const planningStart = std::chrono::steady_clock::now();
     Hash128 const* mediaHashPtr
         = admission.perPositionMediaHash.empty() ? nullptr : admission.perPositionMediaHash.data();
-    std::vector<BlockHash> const hashes = hashRequestFullBlocks(
+    std::vector<BlockHash> hashes = hashRequestFullBlocks(
         admission.tokenIds.data(), admission.tokenIds.size(), admission.keyExtras, mediaHashPtr);
+    if (speculativeRequest && mediaHashPtr != nullptr)
+    {
+        ELLM_CHECK(supportsSpecMediaPrefixReuse() || lookupPolicy == ContextCacheLookupPolicy::kBypass,
+            "Speculative media reuse requires a shared-KV speculative deployment");
+        size_t const textBlocks
+            = static_cast<size_t>(textPrefixBeforeFirstMedia(admission.perPositionMediaHash) / kTOKENS_PER_PAGE);
+        hashes.resize(std::min(hashes.size(), textBlocks));
+    }
     std::vector<HybridCheckpointCandidate> hybridCandidates;
     if (usesCheckpointReuse() && lookupPolicy == ContextCacheLookupPolicy::kUseCache)
     {
@@ -1126,7 +1149,7 @@ ContextCacheCoordinator::BeginRequestResult ContextCacheCoordinator::beginReques
     bool const containsMedia = std::any_of(admission.sequences.begin(), admission.sequences.end(),
         [](ContextCacheSequenceAdmission const& sequence) { return !sequence.perPositionMediaHash.empty(); });
     bool const forceBatchBypass = admission.lookupPolicy == ContextCacheLookupPolicy::kBypass
-        || (admission.speculativeRequest && containsMedia);
+        || (admission.speculativeRequest && containsMedia && !supportsSpecMediaPrefixReuse());
     if (mPoisoned)
     {
         return BeginRequestResult{ContextCacheCoordinatorStatus::kPoisoned, std::nullopt};
@@ -1185,6 +1208,10 @@ ContextCacheCoordinator::BeginRequestResult ContextCacheCoordinator::beginReques
         sequence.keyExtras = sequenceAdmission.keyExtras;
         sequence.perPositionMediaHash = sequenceAdmission.perPositionMediaHash;
         sequence.reuseTokenLength = acquired.plan.reuseTokenLength;
+        if (admission.speculativeRequest)
+        {
+            sequence.publishLimitTokens = textPrefixBeforeFirstMedia(sequenceAdmission.perPositionMediaHash);
+        }
         sequence.lookupPolicy = lookupPolicy;
         sequence.commitPolicy = admission.commitPolicy;
         sequence.replayTailLength = admission.replayTailLength;
@@ -1197,6 +1224,8 @@ ContextCacheCoordinator::BeginRequestResult ContextCacheCoordinator::beginReques
             acquired.plan.reuseTokenLength / kTOKENS_PER_PAGE);
         ++mMetrics.admittedSequences;
         mMetrics.mediaAwareSequences += static_cast<uint64_t>(!sequenceAdmission.perPositionMediaHash.empty());
+        mMetrics.specMediaPrefixSequences += static_cast<uint64_t>(admission.speculativeRequest
+            && !sequenceAdmission.perPositionMediaHash.empty() && lookupPolicy == ContextCacheLookupPolicy::kUseCache);
         mMetrics.matchedTokens += static_cast<uint64_t>(acquired.plan.matchedTokenLength);
         mMetrics.reusedTokens += static_cast<uint64_t>(acquired.plan.reuseTokenLength);
         mMetrics.hitSequences += static_cast<uint64_t>(acquired.plan.matchedTokenLength > 0);
@@ -1665,7 +1694,8 @@ void ContextCacheCoordinator::publishSpecEndpoint(
         return;
     }
 
-    int32_t const publishBlocks = commonStateLength / kTOKENS_PER_PAGE;
+    int32_t const publishableLength = std::min(commonStateLength, sequence.publishLimitTokens);
+    int32_t const publishBlocks = publishableLength / kTOKENS_PER_PAGE;
     if (publishBlocks <= sequence.publishedFullBlockCount)
     {
         return;
@@ -1675,7 +1705,7 @@ void ContextCacheCoordinator::publishSpecEndpoint(
         = sequence.perPositionMediaHash.empty() ? nullptr : sequence.perPositionMediaHash.data();
     std::vector<BlockHash> hashes
         = hashRequestFullBlocks(sequence.tokenIds.data(), tokenCount, sequence.keyExtras, specMediaPtr);
-    PublishResult const result = mManager.publish(sequence.lease, PublishRequest{std::move(hashes), commonStateLength});
+    PublishResult const result = mManager.publish(sequence.lease, PublishRequest{std::move(hashes), publishableLength});
     recordPublication(result.status);
     sequence.publishedFullBlockCount = result.publishedBaseFullBlockCount;
     ++mMetrics.specPairPublications;
@@ -2301,6 +2331,11 @@ bool ContextCacheCoordinator::runsPairedDraftWorkingSet(RequestHandle::Impl cons
 bool ContextCacheCoordinator::usesFrozenSpecPublication(RequestHandle::Impl const& request) const noexcept
 {
     return isSpecRequest(request) && !usesCheckpointReuse();
+}
+
+bool ContextCacheCoordinator::supportsSpecMediaPrefixReuse() const noexcept
+{
+    return isSpecDeployment() && !ownsPagedSpecState() && !isHybridDeployment();
 }
 
 bool ContextCacheCoordinator::deploymentHasAttention() const noexcept

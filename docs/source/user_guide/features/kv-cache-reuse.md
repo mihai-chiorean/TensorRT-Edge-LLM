@@ -29,7 +29,8 @@ match.
 | MTP with a hybrid attention/recurrent base | Supported | The attention-only draft owns independent KV. Reuse requires a text-only batch of one, endpoint-only capture, `prefill_state_only` publication, and both snapshot pools. The successor boundary is reconstructed when a checkpoint is restored. |
 | Standard MTP with an attention-only base | Rejected | Only hybrid MTP and the separate Gemma4 MTP contract are supported. |
 | Pure-recurrent speculative decoding, or hybrid EAGLE3/DFlash/JetSpec/DSpark | Rejected | The only supported recurrent speculative deployment is hybrid MTP. |
-| Speculative request containing image or audio input | Bypassed | The request runs cold on coordinator-managed pages and neither looks up nor publishes reusable state. |
+| Gemma4 MTP request containing image or audio input | Supported for the text prefix | Lookup and publication cover only the full pages that end before the first media position; the media and everything after it are prefilled. |
+| Other speculative request containing image or audio input | Bypassed | The request runs cold on coordinator-managed pages and neither looks up nor publishes reusable state. |
 | Speech generation or thinker-hidden-state output | Bypassed | The request runs without lookup or publication. |
 | Vision-bidirectional attention or block diffusion | Rejected | The runtime cannot initialize generalized context reuse for these deployments. |
 | Action runner | Rejected | The runtime cannot initialize an action runner and generalized context reuse together. |
@@ -43,8 +44,9 @@ contracts through the same native runtime.
 For vanilla media requests, decoded image bytes or PCM audio samples and their
 placeholder positions are part of the cache identity. Audio without decoded
 PCM uses its mel-spectrogram path. Changing media content or order invalidates
-the affected prefix. Speculative media requests follow the bypass behavior in
-the matrix.
+the affected prefix. Speculative media requests follow the matrix: Gemma4 MTP
+reuses the text prefix before the first media position, and the other
+speculative methods bypass the cache.
 
 ### Cache Domain
 
