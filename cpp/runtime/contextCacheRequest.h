@@ -33,6 +33,23 @@ struct DecodingInferenceContext;
 struct LLMGenerationRequest;
 class Tensor;
 
+namespace imageUtils
+{
+class ImageData;
+} // namespace imageUtils
+
+namespace audioUtils
+{
+struct AudioData;
+} // namespace audioUtils
+
+//! Per-position media identity of a prompt for context-cache keys: positions inside an image or
+//! audio placeholder run carry the hash of their media item, all others are zero. Empty when the
+//! prompt has no media. mediaTokenIds is {imageTokenId[, audioTokenId]}.
+std::vector<Hash128> buildPerPositionMediaHash(std::vector<int32_t> const& tokenIds,
+    std::vector<int32_t> const& mediaTokenIds, std::vector<imageUtils::ImageData> const& imageBuffers,
+    std::vector<audioUtils::AudioData> const& audioBuffers, cudaStream_t stream);
+
 //! Owns one admitted runtime request and binds it to the context-cache coordinator lifecycle.
 class ContextCacheRequest final
 {

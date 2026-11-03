@@ -60,6 +60,8 @@ bool isMediaToken(int32_t tokenId, std::vector<int32_t> const& mediaTokenIds)
     return std::find(mediaTokenIds.begin(), mediaTokenIds.end(), tokenId) != mediaTokenIds.end();
 }
 
+} // namespace
+
 std::vector<Hash128> buildPerPositionMediaHash(std::vector<int32_t> const& tokenIds,
     std::vector<int32_t> const& mediaTokenIds, std::vector<imageUtils::ImageData> const& imageBuffers,
     std::vector<audioUtils::AudioData> const& audioBuffers, cudaStream_t stream)
@@ -97,6 +99,37 @@ std::vector<Hash128> buildPerPositionMediaHash(std::vector<int32_t> const& token
 
     int32_t const imageTokenId = (!mediaTokenIds.empty()) ? mediaTokenIds[0] : -1;
     int32_t const audioTokenId = (mediaTokenIds.size() > 1) ? mediaTokenIds[1] : -1;
+
+    // A video expands to one image-token run per temporal group (with text such as timestamps in
+    // between), so a request with a video has more image runs than image buffers. Runs map to
+    // buffers one to one up to the first video. How many runs each video takes is model specific,
+    // so every later image run is keyed by the combined identity of all buffers from the first
+    // video on: exact for one trailing video, and never shared across different media.
+    size_t imageRuns = 0;
+    for (size_t i = 0; i < tokenIds.size(); ++i)
+    {
+        imageRuns += (tokenIds[i] == imageTokenId && (i == 0 || tokenIds[i - 1] != imageTokenId)) ? 1 : 0;
+    }
+    if (imageRuns > imageHashes.size())
+    {
+        auto const firstVideo = std::find_if(
+            imageBuffers.begin(), imageBuffers.end(), [](imageUtils::ImageData const& image) { return image.isVideo; });
+        if (firstVideo != imageBuffers.end())
+        {
+            size_t const firstVideoIdx = static_cast<size_t>(firstVideo - imageBuffers.begin());
+            Hash128 tailHash = imageHashes[firstVideoIdx];
+            if (imageHashes.size() - firstVideoIdx > 1)
+            {
+                // The tag keeps a combined identity out of the domain of single-item pixel hashes.
+                std::string tailBytes{"edgellm.media-run-tail.v1"};
+                tailBytes.append(reinterpret_cast<char const*>(imageHashes.data() + firstVideoIdx),
+                    (imageHashes.size() - firstVideoIdx) * sizeof(Hash128));
+                tailHash = hashOpaqueIdentity(tailBytes);
+            }
+            imageHashes.resize(firstVideoIdx);
+            imageHashes.resize(imageRuns, tailHash);
+        }
+    }
 
     std::vector<Hash128> perPositionHash(tokenIds.size(), Hash128{});
     size_t imageIdx = 0;
@@ -168,6 +201,9 @@ std::vector<Hash128> buildPerPositionMediaHash(std::vector<int32_t> const& token
     }
     return perPositionHash;
 }
+
+namespace
+{
 
 ContextCacheSequenceAdmission makeContextCacheSequenceAdmission(std::vector<int32_t> const& tokenIds,
     std::string const& loraWeightsName, std::vector<int32_t> const& mediaTokenIds,
