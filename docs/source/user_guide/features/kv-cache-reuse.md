@@ -45,7 +45,10 @@ contracts through the same native runtime.
 For media requests, decoded image bytes or PCM audio samples and their
 placeholder positions are part of the cache identity. Audio without decoded
 PCM uses its mel-spectrogram path. Changing media content or order invalidates
-the affected prefix. When a cached prefix contains media tokens, the runtime
+the affected prefix. A video that expands into several placeholder runs (Qwen3-VL and
+Qwen3.5 emit one per temporal group) keys every image position of its request on all
+of that request's images together; a request joining a running in-flight batch with
+such a video is rejected. When a cached prefix contains media tokens, the runtime
 offsets suffix embedding indices to account for media tokens already served
 from cache.
 

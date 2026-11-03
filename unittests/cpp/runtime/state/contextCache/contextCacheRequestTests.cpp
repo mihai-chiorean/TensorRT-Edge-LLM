@@ -39,6 +39,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -79,6 +80,31 @@ LLMGenerationRequest makeImageRequest(rt::DeviceType device)
 
     LLMGenerationRequest::Request sequence;
     sequence.imageBuffers.emplace_back(std::move(pixels));
+    LLMGenerationRequest request;
+    request.requests.push_back(std::move(sequence));
+    return request;
+}
+
+//! A two-group video between a full text page and a text tail: each temporal group is its own placeholder run.
+std::vector<int32_t> makeVideoTokens()
+{
+    std::vector<int32_t> tokens = makeTokens(kTOKENS_PER_PAGE);
+    for (int32_t group = 0; group < 2; ++group)
+    {
+        tokens.push_back(7000 + group);
+        tokens.insert(tokens.end(), 4, kIMAGE_TOKEN_ID);
+    }
+    std::vector<int32_t> const tail = makeTokens(kTOKENS_PER_PAGE);
+    tokens.insert(tokens.end(), tail.begin(), tail.end());
+    return tokens;
+}
+
+LLMGenerationRequest makeVideoRequest()
+{
+    imageUtils::ImageData video(Tensor({2, kIMAGE_EXTENT, kIMAGE_EXTENT, 3}, rt::DeviceType::kCPU, DataType::kUINT8));
+    video.isVideo = true;
+    LLMGenerationRequest::Request sequence;
+    sequence.imageBuffers.push_back(std::move(video));
     LLMGenerationRequest request;
     request.requests.push_back(std::move(sequence));
     return request;
@@ -462,6 +488,62 @@ TEST_F(ContextCacheRequestTests, TextOnlyRequestOnAMediaModelStillUsesTheCache)
     ASSERT_TRUE(admitted.has_value());
     EXPECT_EQ(mCoordinator->metrics().lookupBypassSequences, 0U);
     ASSERT_TRUE(admitted->finish());
+}
+
+//! A video with more placeholder runs than images keys every image position on the whole request's
+//! images: the same video reuses past the media, a different one stops before it.
+TEST_F(ContextCacheRequestTests, VideoGroupsKeyOnTheWholeVideo)
+{
+    auto beginVideo = [&](DecodingInferenceContext& context, uint64_t identity) {
+        context.imageContentDigests = {{Hash128{identity, 1}}};
+        return ContextCacheRequest::begin(
+            *mCoordinator, makeVideoRequest(), context, false, DecodingKvHeadroom{1, 0}, {kIMAGE_TOKEN_ID});
+    };
+
+    DecodingInferenceContext producerContext = makeContext({makeVideoTokens()}, mStream);
+    std::optional<ContextCacheRequest> producer = beginVideo(producerContext, 7);
+    ASSERT_TRUE(producer.has_value());
+    EXPECT_EQ(mCoordinator->metrics().mediaAwareSequences, 1U);
+    EXPECT_EQ(mCoordinator->metrics().lookupBypassSequences, 0U);
+    completeRuntimePrefill(*producer, producerContext);
+    ASSERT_TRUE(producer->finish());
+
+    DecodingInferenceContext sameContext = makeContext({makeVideoTokens()}, mStream);
+    std::optional<ContextCacheRequest> same = beginVideo(sameContext, 7);
+    ASSERT_TRUE(same.has_value());
+    EXPECT_EQ(same->prefillStarts(), std::vector<int32_t>{2 * kTOKENS_PER_PAGE});
+    ASSERT_TRUE(same->finish());
+
+    DecodingInferenceContext otherContext = makeContext({makeVideoTokens()}, mStream);
+    std::optional<ContextCacheRequest> other = beginVideo(otherContext, 8);
+    ASSERT_TRUE(other.has_value());
+    EXPECT_EQ(other->prefillStarts(), std::vector<int32_t>{kTOKENS_PER_PAGE});
+    ASSERT_TRUE(other->finish());
+}
+
+TEST_F(ContextCacheRequestTests, SeatedAdmissionRejectsMultiRunVideo)
+{
+    DecodingInferenceContext founderContext = makeContext({makeTokens(kTOKENS_PER_PAGE)}, mStream);
+    std::optional<ContextCacheRequest> founder = begin(founderContext);
+    ASSERT_TRUE(founder.has_value());
+    completeRuntimePrefill(*founder, founderContext);
+
+    // A seated prefill indexes media embeddings from its first placeholder, so a video with more runs than images
+    // must not be keyed on the combined identity there.
+    int32_t prefillStart = -1;
+    std::string error;
+    try
+    {
+        founder->admitSequence(makeVideoTokens(), std::string{}, DecodingKvHeadroom{1, 0}, prefillStart,
+            ResidentRef{1, 1}, mStream, ContextCacheLookupPolicy::kUseCache,
+            ContextCacheCommitPolicy::kIncludingGeneratedTokens, {kIMAGE_TOKEN_ID}, {Hash128{7, 1}});
+    }
+    catch (std::exception const& e)
+    {
+        error = e.what();
+    }
+    EXPECT_NE(error.find("exceeds provided image count"), std::string::npos) << error;
+    ASSERT_TRUE(founder->finish());
 }
 
 //! A digest table that covers only some of a sequence's images covers none of them: the whole request
