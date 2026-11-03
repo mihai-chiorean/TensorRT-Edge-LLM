@@ -24,9 +24,11 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
+#include <string>
 #include <vector>
 
 #include "common/cudaUtils.h"
+#include "kernels/gdnKernels/gdnPrefillChunked.h"
 #include "kernels/gdnKernels/gdnPrefillSequential.h"
 #include "testUtils.h"
 #ifdef CUTE_DSL_GDN_ENABLED
@@ -268,11 +270,14 @@ std::vector<T> download(void const* p, size_t count)
     return h;
 }
 
-void checkAgainstReference(Case const& c, uint32_t seed)
+using Launcher = cudaError_t (*)(kernel::GdnPrefillSequentialParams const&, cudaStream_t);
+
+void checkAgainstReference(Case const& c, uint32_t seed, Launcher launch = kernel::launchGdnPrefillSequential,
+    float stateRtol = 1e-3F, float stateAtol = 1e-4F)
 {
     HostData const d = makeInputs(c, seed);
     DeviceBuffers buf(c, d);
-    ASSERT_EQ(kernel::launchGdnPrefillSequential(buf.params(c), nullptr), cudaSuccess);
+    ASSERT_EQ(launch(buf.params(c), nullptr), cudaSuccess);
     CUDA_CHECK(cudaDeviceSynchronize());
     auto const o = download<__half>(buf.o, d.v.size());
     auto const h0 = download<float>(buf.h0, d.h0.size());
@@ -287,9 +292,14 @@ void checkAgainstReference(Case const& c, uint32_t seed)
     }
     for (size_t i = 0; i < h0Ref.size(); ++i)
     {
-        ASSERT_TRUE(isclose(h0[i], h0Ref[i], 1e-3F, 1e-4F))
+        ASSERT_TRUE(isclose(h0[i], h0Ref[i], stateRtol, stateAtol))
             << "h0[" << i << "] = " << h0[i] << ", reference " << h0Ref[i];
     }
+}
+
+bool chunkedSupported(Case const& c)
+{
+    return kernel::gdnPrefillChunkedSupported(c.h, c.hv, kDim, kDim, getSMVersion());
 }
 
 } // namespace
@@ -311,6 +321,114 @@ TEST(GdnPrefillSequential, MatchesReference)
 TEST(GdnPrefillSequential, MatchesReferenceWithPaddingAndStateIndices)
 {
     checkAgainstReference(Case{3, 40, 2, 4, 5, {40, 17, 0}, {4, 0, 2}}, 11U);
+}
+
+// The chunked form rounds its MMA operands to FP16, so it is held to a reference tolerance only.
+TEST(GdnPrefillChunked, MatchesReference)
+{
+    std::vector<Case> const cases{
+        Case{1, 1032, 16, 32, 1, {1032}, {}},
+        Case{1, 32, 2, 4, 1, {32}, {}},
+        Case{1, 33, 2, 4, 1, {33}, {}},
+        Case{3, 70, 2, 4, 5, {70, 33, 0}, {4, 0, 2}},
+        Case{2, 5, 8, 8, 2, {5, 1}, {1, 0}},
+    };
+    for (Case const& c : cases)
+    {
+        if (!chunkedSupported(c))
+        {
+            GTEST_SKIP() << "the chunked GDN prefill needs SM80+ and its shared-memory footprint";
+        }
+        SCOPED_TRACE("n=" + std::to_string(c.n) + " seqLen=" + std::to_string(c.seqLen));
+        checkAgainstReference(c, 77U + static_cast<uint32_t>(c.seqLen), kernel::launchGdnPrefillChunked, 5e-3F, 5e-4F);
+    }
+}
+
+// Values beyond the FP16 range in U and in the state must not saturate the MMA operands.
+TEST(GdnPrefillChunked, LargeMagnitudesStayFinite)
+{
+    Case const c{1, 64, 1, 1, 1, {40}, {}};
+    if (!chunkedSupported(c))
+    {
+        GTEST_SKIP() << "the chunked GDN prefill needs SM80+ and its shared-memory footprint";
+    }
+    HostData d = makeInputs(c, 3U);
+    for (auto& x : d.q)
+        x = __float2half_rn(1.0F);
+    for (auto& x : d.k)
+        x = __float2half_rn(1.0F);
+    for (auto& x : d.v)
+        x = __float2half_rn(10000.0F);
+    for (auto& x : d.a)
+        x = __float2half_rn(0.0F);
+    for (auto& x : d.b)
+        x = __float2half_rn(10.0F);
+    d.dtBias[0] = __float2half_rn(0.0F);
+    d.logA[0] = 0.0F;
+    for (auto& x : d.h0)
+        x = -20000.0F;
+    DeviceBuffers buf(c, d);
+    ASSERT_EQ(kernel::launchGdnPrefillChunked(buf.params(c), nullptr), cudaSuccess);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    auto const o = download<__half>(buf.o, d.v.size());
+    auto const h0 = download<float>(buf.h0, d.h0.size());
+    std::vector<float> h0Ref(d.h0);
+    std::vector<float> oRef;
+    reference(c, d, h0Ref, oRef);
+    for (size_t i = 0; i < oRef.size(); ++i)
+    {
+        ASSERT_TRUE(isclose(__half2float(o[i]), oRef[i], 1e-2F, 1e-2F))
+            << "o[" << i << "] = " << __half2float(o[i]) << ", reference " << oRef[i];
+    }
+    for (size_t i = 0; i < h0Ref.size(); ++i)
+    {
+        ASSERT_TRUE(isclose(h0[i], h0Ref[i], 1e-2F, 1e-2F))
+            << "h0[" << i << "] = " << h0[i] << ", reference " << h0Ref[i];
+    }
+}
+
+// A state entry far outside the FP16 range only needs the FP32 restore of its shift.
+TEST(GdnPrefillChunked, HugeStateEntryStaysExact)
+{
+    Case const c{1, 32, 1, 1, 1, {32}, {}};
+    if (!chunkedSupported(c))
+    {
+        GTEST_SKIP() << "the chunked GDN prefill needs SM80+ and its shared-memory footprint";
+    }
+    HostData d = makeInputs(c, 4U);
+    for (size_t t = 0; t < 32; ++t)
+    {
+        for (int32_t i = 0; i < kDim; ++i)
+        {
+            d.q[t * kDim + i] = __float2half_rn(i == 0 ? 1.0F : 0.0F);
+            d.k[t * kDim + i] = __float2half_rn(i == 0 ? 1.0F : 0.0F);
+            d.v[t * kDim + i] = __float2half_rn(0.0F);
+        }
+        d.a[t] = __float2half_rn(0.0F);
+        d.b[t] = __float2half_rn(0.0F);
+    }
+    d.dtBias[0] = __float2half_rn(0.0F);
+    d.logA[0] = 0.0F;
+    std::fill(d.h0.begin(), d.h0.end(), 0.0F);
+    d.h0[127 * kDim] = 2147483648.0F;
+    DeviceBuffers buf(c, d);
+    ASSERT_EQ(kernel::launchGdnPrefillChunked(buf.params(c), nullptr), cudaSuccess);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    auto const o = download<__half>(buf.o, d.v.size());
+    auto const h0 = download<float>(buf.h0, d.h0.size());
+    std::vector<float> h0Ref(d.h0);
+    std::vector<float> oRef;
+    reference(c, d, h0Ref, oRef);
+    for (size_t i = 0; i < oRef.size(); ++i)
+    {
+        ASSERT_TRUE(isclose(__half2float(o[i]), oRef[i], 1e-2F, 1e-3F))
+            << "o[" << i << "] = " << __half2float(o[i]) << ", reference " << oRef[i];
+    }
+    for (size_t i = 0; i < h0Ref.size(); ++i)
+    {
+        ASSERT_TRUE(isclose(h0[i], h0Ref[i], 1e-3F, 1e-3F))
+            << "h0[" << i << "] = " << h0[i] << ", reference " << h0Ref[i];
+    }
 }
 
 #ifdef CUTE_DSL_GDN_ENABLED
@@ -385,7 +503,10 @@ TEST(GdnPrefillSequential, Bench)
     CuteDslGDNRunner runner;
     GDNParams const dslParams = buf.cuteDslParams(c);
     float const dslMs = timeIt([&] { runner.run(dslParams, nullptr); });
-    std::printf("GDN prefill n=1 T=1032 h=16 hv=32: sequential %.3f ms, CuTe DSL %.3f ms\n", oursMs, dslMs);
+    float const chunkedMs
+        = chunkedSupported(c) ? timeIt([&] { kernel::launchGdnPrefillChunked(buf.params(c), nullptr); }) : -1.0F;
+    std::printf("GDN prefill n=1 T=1032 h=16 hv=32: chunked %.3f ms, sequential %.3f ms, CuTe DSL %.3f ms\n", chunkedMs,
+        oursMs, dslMs);
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
 }
