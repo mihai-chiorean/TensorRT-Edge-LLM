@@ -27,6 +27,7 @@
 #endif
 #ifdef CUTE_DSL_GDN_ENABLED
 #include "kernels/gdnKernels/gdnKernelUtils.cuh"
+#include "kernels/gdnKernels/gdnPrefillChunked.h"
 #include "kernels/gdnKernels/gdnPrefillSequential.h"
 #endif
 
@@ -99,6 +100,18 @@ bool cudaSequentialPrefillEnabled()
         return value == nullptr || std::strcmp(value, "1") != 0;
     }();
     return enabled;
+}
+
+//! Chunks of at least one full kChunk-token block go to the tensor-core chunked prefill;
+//! EDGELLM_GDN_PREFILL_SEQUENTIAL=1 keeps the bit-exact sequential kernel for every length.
+bool chunkedPrefillEnabled(int32_t seqLen, int32_t h, int32_t hv, int32_t kDim, int32_t vDim, int32_t smVersion)
+{
+    constexpr int32_t kMinChunkedSeqLen{32};
+    static bool const allowed = []() {
+        char const* const value = std::getenv("EDGELLM_GDN_PREFILL_SEQUENTIAL");
+        return value == nullptr || std::strcmp(value, "1") != 0;
+    }();
+    return allowed && seqLen >= kMinChunkedSeqLen && kernel::gdnPrefillChunkedSupported(h, hv, kDim, vDim, smVersion);
 }
 #endif
 
@@ -740,10 +753,13 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
         sequential.hv = hv;
         sequential.kDim = k_dim;
         sequential.vDim = v_dim;
-        cudaError_t const err = kernel::launchGdnPrefillSequential(sequential, stream);
+        bool const chunked = chunkedPrefillEnabled(seq_len, h, hv, k_dim, v_dim, mSMVersion);
+        cudaError_t const err = chunked ? kernel::launchGdnPrefillChunked(sequential, stream)
+                                        : kernel::launchGdnPrefillSequential(sequential, stream);
         if (err != cudaSuccess)
         {
-            LOG_ERROR("gated_delta_net: sequential prefill launch failed: %s", cudaGetErrorString(err));
+            LOG_ERROR("gated_delta_net: %s prefill launch failed: %s", chunked ? "chunked" : "sequential",
+                cudaGetErrorString(err));
             return -1;
         }
         return 0;
