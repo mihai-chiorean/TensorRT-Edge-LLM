@@ -1458,8 +1458,14 @@ _QWEN3_5_MTP_CONFIG_MODEL_TYPES = frozenset({
 })
 
 
-def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
-    """Derive the currently supported MTP draft config from a base config."""
+def make_mtp_draft_config(base_config: ModelConfig,
+                          inherit_base_lm_head: bool = False) -> ModelConfig:
+    """Derive the currently supported MTP draft config from a base config.
+
+    ``inherit_base_lm_head`` marks an unquantized draft that borrows the base
+    checkpoint's own ``lm_head.*`` tensors; the draft head then takes the
+    precision the base resolves for ``lm_head``.
+    """
     _validate_mtp_constraints(
         model_type=base_config.model_type,
         mtp_num_hidden_layers=base_config.mtp_num_hidden_layers,
@@ -1538,7 +1544,9 @@ def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
                               layer_group_sizes=draft_group_sizes,
                               is_mixed_precision=False)
     else:
-        # MTP draft lm_head is borrowed from the base model and may itself be quantized.
+        # MTP draft lm_head is borrowed from the base model and may itself be quantized,
+        # by an explicit override or, for the base checkpoint's own head, by its dominant
+        # quant type.
         lm_head_overrides = {
             k: v
             for k, v in base_config.quant.layer_overrides.items()
@@ -1549,8 +1557,15 @@ def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
             for k, v in base_config.quant.layer_group_sizes.items()
             if k == "lm_head" or k.startswith("lm_head.")
         }
-        draft_quant = QuantConfig(layer_overrides=lm_head_overrides,
-                                  layer_group_sizes=lm_head_group_sizes)
+        base_lm_head_type = module_quant_type("lm_head", base_config)
+        if inherit_base_lm_head and base_lm_head_type != QUANT_FP16:
+            lm_head_overrides.setdefault("lm_head", base_lm_head_type)
+            lm_head_group_sizes.setdefault(
+                "lm_head", module_quant_group_size("lm_head", base_config))
+        draft_quant = QuantConfig(
+            layer_overrides=lm_head_overrides,
+            layer_group_sizes=lm_head_group_sizes,
+            gptq_zero_point_offset=base_config.quant.gptq_zero_point_offset)
 
     return replace(
         base_config,

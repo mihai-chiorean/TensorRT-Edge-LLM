@@ -516,7 +516,18 @@ class AutoModel:
                     f"Nemotron-H checkpoints; got {config.model_type!r}.")
             draft_model_type = config.model_type
             tie_word_embeddings = config.tie_word_embeddings
-            config = make_mtp_draft_config(config)
+            from .checkpoint.loader import iter_checkpoint_keys
+            checkpoint_keys = list(iter_checkpoint_keys(model_dir))
+            # Only borrow the base model's lm_head when the checkpoint ships no
+            # dedicated ``mtp.lm_head.*`` tensors; prefer its own ``lm_head.*``
+            # over a tied embedding.
+            share_base_lm_head = not any(
+                key.startswith("mtp.lm_head.") for key in checkpoint_keys)
+            base_has_lm_head = any(
+                key.startswith("lm_head.") for key in checkpoint_keys)
+            config = make_mtp_draft_config(
+                config,
+                inherit_base_lm_head=share_base_lm_head and base_has_lm_head)
             if is_nemotron_h_mtp:
                 from .models.nemotron_h import NemotronHMtpDraftModel
                 model_class = NemotronHMtpDraftModel
@@ -531,17 +542,12 @@ class AutoModel:
                 from .models.qwen3_5 import Qwen3_5MtpDraftModel
                 model_class = Qwen3_5MtpDraftModel
             if key_remap is None:
-                # Only borrow the base model's lm_head when the checkpoint
-                # ships no dedicated ``mtp.lm_head.*`` tensors.
-                from .checkpoint.loader import iter_checkpoint_keys
-                share_base_lm_head = not any(
-                    key.startswith("mtp.lm_head.")
-                    for key in iter_checkpoint_keys(model_dir))
 
                 def key_remap(key):
                     return _mtp_key_remap(
                         key,
-                        tie_word_embeddings=tie_word_embeddings,
+                        tie_word_embeddings=tie_word_embeddings
+                        and not base_has_lm_head,
                         share_base_lm_head=share_base_lm_head)
 
         elif variant == "dflash_draft":
