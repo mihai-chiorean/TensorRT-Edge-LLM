@@ -91,6 +91,11 @@ private:
     bool runBaseModelVerification(DecodingInferenceContext& context);
     bool runDraftModelAcceptToken(DecodingInferenceContext& context);
 
+    //! Copies device token ids into pinned host storage for host-mapped tables; returns nullptr otherwise.
+    int32_t const* tokenIdsForHostTables(Tensor const& deviceIds, Tensor& hostIds, cudaStream_t stream);
+    //! Token-embedding lookup into inputsEmbeds; hostIds is required for a host-mapped table.
+    void embedTokens(Tensor const& tokenIds, int32_t const* hostIds, cudaStream_t stream);
+
     DecodingRuntimeContext& mRuntime;
     HybridCacheManager& mDraftCacheManager;
 
@@ -115,6 +120,9 @@ private:
     Tensor mAcceptLength;
     Tensor mHostAcceptLengths;
     Tensor mHostAcceptedTokenIds;
+    Tensor mHostDraftProposalTokenIds;
+    Tensor mHostVerifyTokenIds;
+    Tensor mHostDraftAcceptTokenIds;
 
     //! Tree drafting (draftingTopK > 1): the chain drafter keeps one full logits row
     //! per proposal depth and the greedy tree builder grows a prefix-closed,

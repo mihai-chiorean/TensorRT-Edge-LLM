@@ -113,8 +113,11 @@ The staging buffers keep a pinned and a device copy of the rows: the token
 table stages the engine's maximum number of physical tokens, and the PLE table
 `maxBatchSize` rows times its sequence length (the maximum input length, or the
 verify-tree width when that is larger). The mode needs the safetensors sidecars
-(not checkpoint-backed tables), single-rank execution, and vanilla or Gemma 4
-MTP decoding. The Gemma 4 MTP decoder samples its draft tokens on the device, so
+(not checkpoint-backed tables), single-rank execution, and vanilla, MTP or
+Gemma 4 MTP decoding. Standard MTP copies device token ids into pinned host
+buffers before draft proposal, base verification, and draft accept lookups;
+each copy waits for the stream. Draft prefill reuses ids already packed on the
+host. The Gemma 4 MTP decoder samples its draft tokens on the device, so
 with host-mapped tables it copies those ids back to the host before each lookup:
 once per assistant step that feeds a token to the next step, and once for the
 verify tokens. Each copy waits for the stream, so a round of draft depth K

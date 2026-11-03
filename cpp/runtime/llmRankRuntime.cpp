@@ -359,7 +359,7 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
             || supportsHostMappedEmbeddingTables(
                 mDeployment.specConfig.has_value() ? mDeployment.base.specDecodeType : SpecDecodeMode::kNONE,
                 mDeployment.base.isDiffusionBackbone),
-        "Host-mapped embedding tables support vanilla and Gemma 4 MTP decoding only");
+        "Host-mapped embedding tables support vanilla, MTP and Gemma 4 MTP decoding only");
     mCheckpointDir = std::move(artifacts.checkpointDir);
     mDraftCheckpointDir = std::move(artifacts.draftCheckpointDir);
     ExternalWeightManager preparedWeights = std::move(artifacts.weights);
@@ -456,7 +456,11 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     // 9. Preprocessors.
     // -----------------------------------------------------------------------
     mStepPreparer = std::make_unique<StepPreparer>(mDeployment.base);
-    mEmbeddingPre = std::make_unique<EmbeddingPreprocessor>(mEmbedding, mDeployment.base);
+    // The MTP draft embeds its prefill and proposals through this preprocessor too.
+    int32_t const hostStagingRows = mDeployment.draft.has_value()
+        ? std::max(mDeployment.base.maxPhysicalTokens, mDeployment.draft->maxPhysicalTokens)
+        : mDeployment.base.maxPhysicalTokens;
+    mEmbeddingPre = std::make_unique<EmbeddingPreprocessor>(mEmbedding, mDeployment.base, hostStagingRows);
     if (!mDeployment.base.isDiffusionBackbone && mDeployment.base.numDeepstackFeatures > 0)
     {
         mDeepstack = std::make_unique<DeepstackBinding>(mPipelineIO->deepstackEmbeds, mSharedResources->zeroBuffer);

@@ -43,7 +43,9 @@ public:
     //! Construct with the embedding table data and engine configuration.
     //!
     //! Both references must outlive the preprocessor.
-    EmbeddingPreprocessor(EmbeddingData const& embedding, LLMEngineConfig const& config);
+    //! hostStagingRows sizes the host-mapped row staging; 0 uses config.maxPhysicalTokens. A speculative draft that
+    //! shares this preprocessor can embed more rows per call than the base engine accepts.
+    EmbeddingPreprocessor(EmbeddingData const& embedding, LLMEngineConfig const& config, int32_t hostStagingRows = 0);
 
     //! Embed token IDs into dense vectors, optionally inserting multimodal embeddings.
     //!

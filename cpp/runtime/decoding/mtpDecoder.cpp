@@ -129,6 +129,17 @@ MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, std::filesystem::path co
     mHostAcceptedTokenIds = Tensor({maxRuntimeBatchSize, effectiveMaxAcceptDepth}, DeviceType::kCPU,
         nvinfer1::DataType::kINT32, "SpecDecode::hostAcceptedIds");
 
+    if (mRuntime.preprocess.embedding.isHostResident())
+    {
+        int32_t const paddedDraftProposalSize = draftingConfig.draftingStep * effectiveDraftTopK;
+        mHostDraftProposalTokenIds = Tensor({maxRuntimeBatchSize, paddedDraftProposalSize}, DeviceType::kCPU,
+            nvinfer1::DataType::kINT32, "SpecDecode::hostDraftProposalTokenIds");
+        mHostVerifyTokenIds = Tensor({maxRuntimeBatchSize, draftingConfig.verifySize}, DeviceType::kCPU,
+            nvinfer1::DataType::kINT32, "SpecDecode::hostVerifyTokenIds");
+        mHostDraftAcceptTokenIds = Tensor({maxRuntimeBatchSize, effectiveMaxAcceptDepth}, DeviceType::kCPU,
+            nvinfer1::DataType::kINT32, "SpecDecode::hostDraftAcceptTokenIds");
+    }
+
     if (mUseTree)
     {
         int32_t const verifySize = draftingConfig.verifySize;
@@ -288,6 +299,25 @@ bool MTPDecoder::decodeStep(DecodingInferenceContext& context)
     return true;
 }
 
+int32_t const* MTPDecoder::tokenIdsForHostTables(Tensor const& deviceIds, Tensor& hostIds, cudaStream_t stream)
+{
+    return hostIds.isEmpty()
+        ? nullptr
+        : decoder_utils::copyTokenIdsToHost(deviceIds, deviceIds.getShape().volume(), hostIds, stream);
+}
+
+void MTPDecoder::embedTokens(Tensor const& tokenIds, int32_t const* hostIds, cudaStream_t stream)
+{
+    if (mRuntime.preprocess.embedding.isHostResident())
+    {
+        mRuntime.preprocess.embeddingPreprocessor.embed(
+            tokenIds, hostIds, std::nullopt, std::nullopt, mRuntime.base.pipelineIO, stream);
+        return;
+    }
+    kernel::embeddingLookup(tokenIds, mRuntime.preprocess.embedding.table,
+        mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, stream);
+}
+
 bool MTPDecoder::runDraftModelPrefill(DecodingInferenceContext& context)
 {
     mRuntime.base.pipelineIO.waitForStepHostStaging();
@@ -341,8 +371,8 @@ bool MTPDecoder::runDraftModelPrefill(DecodingInferenceContext& context)
     // Unified embedding lookup (text, or vision by inserting image embeddings at the image
     // placeholder positions). Reuses the shared EmbeddingPreprocessor, which generates the
     // multimodal indices on-device and shares this decoder's embedding table.
-    mRuntime.preprocess.embeddingPreprocessor.embed(mRuntime.preprocess.idsInput, nullptr, context.visualEmbeddings,
-        std::nullopt, mRuntime.base.pipelineIO, context.stream);
+    mRuntime.preprocess.embeddingPreprocessor.embed(mRuntime.preprocess.idsInput, hostPackedTokenIdsData,
+        context.visualEmbeddings, std::nullopt, mRuntime.base.pipelineIO, context.stream);
     if (mRuntime.preprocess.gemma4Ple)
     {
         mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, nullptr, context.stream);
@@ -527,8 +557,9 @@ bool MTPDecoder::constructDraftProposal(DecodingInferenceContext& context)
         check::check(
             mRuntime.base.pipelineIO.inputsEmbeds.reshape({activeBatchSize, paddedDraftProposalSize, draftHiddenSize}),
             "Tensor reshape failed");
-        kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
-            mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
+        int32_t const* const hostProposalIds
+            = tokenIdsForHostTables(mRuntime.preprocess.idsInput, mHostDraftProposalTokenIds, context.stream);
+        embedTokens(mRuntime.preprocess.idsInput, hostProposalIds, context.stream);
 
         {
             Tensor const& draftKVCacheLengths = mDraftCacheManager.getKVCacheLengths();
@@ -721,8 +752,9 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape({activeBatchSize,
                      mRuntime.deployment.specConfig->verifySize, mRuntime.deployment.base.hiddenSize}),
         "Tensor reshape failed");
-    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
-        mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
+    int32_t const* const hostVerifyIds
+        = tokenIdsForHostTables(mRuntime.preprocess.idsInput, mHostVerifyTokenIds, context.stream);
+    embedTokens(mRuntime.preprocess.idsInput, hostVerifyIds, context.stream);
     if (mRuntime.preprocess.gemma4Ple)
     {
         mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, nullptr, context.stream);
@@ -973,8 +1005,9 @@ bool MTPDecoder::runDraftModelAcceptToken(DecodingInferenceContext& context)
 
     check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape({activeBatchSize, inputIdsLength, draftHiddenSize}),
         "Tensor reshape failed");
-    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
-        mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
+    int32_t const* const hostAcceptIds
+        = tokenIdsForHostTables(mRuntime.preprocess.idsInput, mHostDraftAcceptTokenIds, context.stream);
+    embedTokens(mRuntime.preprocess.idsInput, hostAcceptIds, context.stream);
     if (mRuntime.preprocess.gemma4Ple)
     {
         mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, nullptr, context.stream);

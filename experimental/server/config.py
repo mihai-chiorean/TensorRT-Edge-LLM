@@ -488,8 +488,8 @@ def create_argument_parser(
         help="Keep the INT8 token-embedding and PLE sidecar tables mapped in "
         "host memory instead of uploading them to the GPU. Needs a "
         "pre-built engine tree exported with --int8-embedding. Speculative "
-        "decoding supports it only for Gemma 4 MTP; Qwen3-Omni audio output "
-        "does not support it.",
+        "decoding supports it only for MTP and Gemma 4 MTP; Qwen3-Omni audio "
+        "output does not support it.",
     )
     model.add_argument(
         "--host-ple-table",
@@ -497,7 +497,7 @@ def create_argument_parser(
         help="Keep only the INT8 PLE sidecar table mapped in host memory; the "
         "token-embedding table is uploaded to the GPU. Needs the "
         "ple_embedding.safetensors sidecar; speculative decoding supports "
-        "it only for Gemma 4 MTP. Mutually exclusive with "
+        "it only for MTP and Gemma 4 MTP. Mutually exclusive with "
         "--host-embedding-tables.",
     )
     model.add_argument(

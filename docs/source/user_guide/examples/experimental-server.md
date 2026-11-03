@@ -117,7 +117,7 @@ tensorrt-edgellm-serve /opt/models/gemma-4-e4b-mtp-engines \
 
 `--host-embedding-tables` keeps the INT8 token-embedding and PLE sidecars of an
 `--int8-embedding` export mapped in host memory; with speculative decoding it
-is supported for Gemma 4 MTP only. `--host-ple-table` keeps only the PLE
+is supported for MTP and Gemma 4 MTP only. `--host-ple-table` keeps only the PLE
 sidecar in host memory and uploads the token-embedding table.
 
 Compiled bundles use a 50 GiB least-recently-used cache by default. Set

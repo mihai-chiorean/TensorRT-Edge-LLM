@@ -29,7 +29,8 @@ namespace trt_edgellm
 namespace rt
 {
 
-EmbeddingPreprocessor::EmbeddingPreprocessor(EmbeddingData const& embedding, LLMEngineConfig const& config)
+EmbeddingPreprocessor::EmbeddingPreprocessor(
+    EmbeddingData const& embedding, LLMEngineConfig const& config, int32_t hostStagingRows)
     : mEmbedding(embedding)
     , mConfig(config)
     , mOwnedIndices(Coords{config.maxPhysicalTokens}, DeviceType::kGPU, nvinfer1::DataType::kINT32,
@@ -37,8 +38,8 @@ EmbeddingPreprocessor::EmbeddingPreprocessor(EmbeddingData const& embedding, LLM
 {
     if (mEmbedding.isHostResident())
     {
-        mStaging = std::make_unique<RowStaging>(
-            *mEmbedding.hostTable, config.maxPhysicalTokens, "EmbeddingPreprocessor::staging");
+        mStaging = std::make_unique<RowStaging>(*mEmbedding.hostTable,
+            hostStagingRows > 0 ? hostStagingRows : config.maxPhysicalTokens, "EmbeddingPreprocessor::staging");
     }
 }
 

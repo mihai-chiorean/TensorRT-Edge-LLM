@@ -1028,14 +1028,15 @@ def test_host_embedding_tables_rejected_for_other_speculative_decoders(
     captured = {}
     llm = _host_tables_llm(monkeypatch, EngineType.SPEC_DECODE, captured,
                            tmp_path)
-    with pytest.raises(ValueError, match="only for Gemma 4 MTP"):
+    with pytest.raises(ValueError, match="only for MTP and Gemma 4 MTP"):
         llm._load_runtime()
     assert "kwargs" not in captured
 
 
-def test_host_embedding_tables_reach_the_gemma4_mtp_runtime(
-        monkeypatch, tmp_path):
-    _write_spec_engine_dir(tmp_path, "gemma4_mtp")
+@pytest.mark.parametrize("method", ["mtp", "gemma4_mtp"])
+def test_host_embedding_tables_reach_the_mtp_runtime(monkeypatch, tmp_path,
+                                                     method):
+    _write_spec_engine_dir(tmp_path, method)
     captured = {}
     llm = _host_tables_llm(monkeypatch, EngineType.SPEC_DECODE, captured,
                            tmp_path)

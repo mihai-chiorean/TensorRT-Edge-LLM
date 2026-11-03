@@ -2557,16 +2557,16 @@ class TTS:
 
 
 def _check_speculative_host_tables(layout, engine_dir: str, flag: str) -> None:
-    """The native runtime host-maps tables only for vanilla or Gemma 4 MTP
-    decoding (``supportsHostMappedEmbeddingTables``)."""
+    """The native runtime host-maps tables only for vanilla, MTP or Gemma 4
+    MTP decoding (``supportsHostMappedEmbeddingTables``)."""
     if layout.engine_type != EngineType.SPEC_DECODE:
         return
     method = _read_json(os.path.join(engine_dir, SPEC_BASE_CONFIG_FILE)).get(
         "spec_decode_type", "")
-    if method != "gemma4_mtp":
+    if method not in ("mtp", "gemma4_mtp"):
         raise ValueError(
-            f"{flag} supports speculative decoding only for Gemma 4 MTP "
-            f"bundles, not {method!r}")
+            f"{flag} supports speculative decoding only for MTP and Gemma 4 "
+            f"MTP bundles, not {method!r}")
 
 
 def _check_host_embedding_tables(layout, engine_dir: str) -> None:
