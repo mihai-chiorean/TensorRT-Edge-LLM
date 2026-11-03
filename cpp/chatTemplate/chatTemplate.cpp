@@ -784,18 +784,37 @@ public:
                 }
                 else
                 {
+                    std::string prefix;
                     try
                     {
-                        auto const prefix = render({messages->front()}, false);
-                        if (formattedRequest.formattedCompleteRequest.rfind(prefix, 0) == 0)
-                        {
-                            formattedRequest.formattedSystemPrompt = prefix;
-                        }
+                        prefix = render({messages->front()}, false);
                     }
                     catch (std::exception const&)
                     {
-                        // Some provider templates require a user turn. In that case,
-                        // skip system-only KV reuse instead of inventing a prefix.
+                        // Templates that require a user turn (Qwen3.5 raises without one) still emit a
+                        // fixed preamble before it: keep what two different one-word user turns share.
+                        auto withUser = [&](char const* text) {
+                            rt::Message user;
+                            user.role = "user";
+                            user.contents.push_back({"text", text});
+                            return render({messages->front(), user}, false);
+                        };
+                        try
+                        {
+                            std::string const first = withUser("A");
+                            std::string const second = withUser("B");
+                            auto const mismatch
+                                = std::mismatch(first.begin(), first.end(), second.begin(), second.end());
+                            prefix.assign(first.begin(), mismatch.first);
+                        }
+                        catch (std::exception const&)
+                        {
+                            prefix.clear();
+                        }
+                    }
+                    if (!prefix.empty() && formattedRequest.formattedCompleteRequest.rfind(prefix, 0) == 0)
+                    {
+                        formattedRequest.formattedSystemPrompt = prefix;
                     }
                 }
             }

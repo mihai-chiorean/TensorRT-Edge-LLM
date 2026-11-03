@@ -650,6 +650,27 @@ TEST(ChatTemplateTest, AppliesQwen3AsrNativeContract)
     EXPECT_EQ(formatted.formattedSystemPrompt, "<|im_start|>system\nTranscribe English.<|im_end|>\n<|im_start|>user\n");
 }
 
+TEST(ChatTemplateTest, SystemPromptPrefixWhenTemplateRequiresUserTurn)
+{
+    TemporaryTemplate model{{"chat_template.jinja",
+        R"JINJA({%- if messages | length < 2 -%}{{- raise_exception('No user query found in messages.') -}}{%- endif -%}
+{%- for message in messages -%}<|im_start|>{{ message.role }}
+{{ message.content }}<|im_end|>
+{% endfor -%}
+{%- if add_generation_prompt -%}<|im_start|>assistant
+{% endif -%})JINJA"}};
+    rt::LLMGenerationRequest::Request request;
+    request.messages = {rt::Message{"system", {{"text", "Rules."}}}, rt::Message{"user", {{"text", "Describe it."}}}};
+
+    chat_template::ChatTemplate renderer;
+    ASSERT_TRUE(renderer.load(model.path));
+    rt::LLMGenerationRequest::FormattedRequest formatted;
+    ASSERT_TRUE(renderer.apply(request, formatted, {}));
+    EXPECT_EQ(formatted.formattedCompleteRequest,
+        "<|im_start|>system\nRules.<|im_end|>\n<|im_start|>user\nDescribe it.<|im_end|>\n<|im_start|>assistant\n");
+    EXPECT_EQ(formatted.formattedSystemPrompt, "<|im_start|>system\nRules.<|im_end|>\n<|im_start|>user\n");
+}
+
 TEST(ChatTemplateTest, AppliesMultiturnReasoningToolAndMediaContract)
 {
     TemporaryTemplate model{{"chat_template.jinja",
