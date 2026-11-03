@@ -137,6 +137,18 @@ TEST(MambaCausalConv1d, Width4)
     runCausalConv1dTest(2, 31, 256, 4);
 }
 
+// Qwen3.5 GDN conv geometry: the sequence is split into chunks across CTAs.
+TEST(MambaCausalConv1d, LongSequenceWideDim)
+{
+    runCausalConv1dTest(1, 1032, 8192, 4);
+}
+
+TEST(MambaCausalConv1dPadding, LongSequenceMixedContextLengths)
+{
+    std::vector<int32_t> cl = {300, 123};
+    runCausalConv1dTest(2, 300, 8192, 4, &cl);
+}
+
 #if defined(CUTE_DSL_CAUSAL_CONV1D_ENABLED)
 
 void runCausalConv1dPackedReference(std::vector<int32_t> const& cuSeqLens, std::vector<int32_t> const& stateIndices,
