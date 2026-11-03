@@ -1784,6 +1784,10 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::finalizeSequenceAdmission
             && (isSpecRequest(impl) || commonLength == advance.committedStateLength),
         "Context cache sequence-admission common state is outside the committed prompt");
     sequence.tokenIds.push_back(*advance.acceptedTokenIds);
+    if (!sequence.perPositionMediaHash.empty())
+    {
+        sequence.perPositionMediaHash.resize(sequence.tokenIds.size(), Hash128{});
+    }
     sequence.committedStateLength = advance.committedStateLength;
     sequence.commonStateLength = commonLength;
     sequence.admissionState = RequestHandle::Impl::AdmissionState::kSettled;
@@ -1974,6 +1978,10 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::applyAdvances(
         {
             sequence.tokenIds.insert(sequence.tokenIds.end(), delta.acceptedTokenIds,
                 delta.acceptedTokenIds + static_cast<std::ptrdiff_t>(delta.acceptedTokenCount));
+            if (!sequence.perPositionMediaHash.empty())
+            {
+                sequence.perPositionMediaHash.resize(sequence.tokenIds.size(), Hash128{});
+            }
         }
         sequence.committedStateLength = delta.committedStateLength;
     }
