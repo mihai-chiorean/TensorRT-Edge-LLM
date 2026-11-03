@@ -80,6 +80,19 @@ void logHybridSnapshotPressureSkip(ContextCacheManager const& manager, uint64_t 
         describeSnapshotPool(pools, ResourceType::kPartialKvSnapshot).c_str(), manager.records().size());
 }
 
+//! Length of the full blocks that end at or before the first media position; unbounded when text-only.
+int32_t textPrefixBeforeFirstMedia(std::vector<Hash128> const& perPositionMediaHash)
+{
+    auto const firstMedia = std::find_if(perPositionMediaHash.begin(), perPositionMediaHash.end(),
+        [](Hash128 const& hash) { return hash != Hash128{}; });
+    if (firstMedia == perPositionMediaHash.end())
+    {
+        return std::numeric_limits<int32_t>::max();
+    }
+    int32_t const firstMediaPosition = static_cast<int32_t>(firstMedia - perPositionMediaHash.begin());
+    return (firstMediaPosition / kTOKENS_PER_PAGE) * kTOKENS_PER_PAGE;
+}
+
 void requireKvPageCoverage(ReusePlan& plan, int32_t basePages, int32_t draftPages)
 {
     ELLM_CHECK(basePages >= 0 && draftPages >= 0, "Context cache KV-page coverage must be non-negative");
@@ -2340,6 +2353,58 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::publishHybridSpecEndpoint
         "Hybrid+spec endpoint publication requires a Hybrid+spec deployment with snapshot storage");
     return checkedImpl(request).publicationPolicy->publishMtpBoundary(
         request, slot, residentStateLength, baseHiddenStates, boundaryHiddenRow);
+}
+
+int32_t ContextCacheCoordinator::hybridMediaPrefixBoundary(RequestHandle& request, int32_t slot)
+{
+    RequestHandle::Impl& impl = checkedImpl(request);
+    ELLM_CHECK(slot >= 0 && slot < static_cast<int32_t>(impl.sequences.size()),
+        "Hybrid media-prefix slot is outside the active batch");
+    auto const& sequence = impl.sequences[static_cast<size_t>(slot)];
+    if (!usesCheckpointReuse() || isSpecRequest(impl) || sequence.lookupPolicy == ContextCacheLookupPolicy::kBypass
+        || sequence.perPositionMediaHash.empty())
+    {
+        return 0;
+    }
+    int32_t const boundary = textPrefixBeforeFirstMedia(sequence.perPositionMediaHash);
+    if (boundary <= sequence.reuseTokenLength || boundary <= sequence.publishedExactLength
+        || static_cast<size_t>(boundary) >= sequence.tokenIds.size())
+    {
+        return 0;
+    }
+    return boundary;
+}
+
+ContextCacheCoordinatorStatus ContextCacheCoordinator::publishHybridMediaPrefix(
+    RequestHandle& request, int32_t slot, int32_t boundaryLength)
+{
+    RequestHandle::Impl& impl = checkedImpl(request);
+    ELLM_CHECK(impl.executing(), "Hybrid media-prefix publication requires an executing prefill");
+    ELLM_CHECK(boundaryLength > 0 && boundaryLength == hybridMediaPrefixBoundary(request, slot),
+        "Hybrid media-prefix publication must use the boundary the coordinator reported");
+    auto& sequence = impl.sequences[static_cast<size_t>(slot)];
+    ELLM_CHECK(
+        boundaryLength >= sequence.committedStateLength, "Hybrid media-prefix boundary precedes the committed state");
+    sequence.committedStateLength = boundaryLength;
+    // The restored snapshot was consumed by the text chunk; unpinning it lets this capture take its slot.
+    mManager.releaseRestoredHybridSnapshots(sequence.lease);
+    reserveHybridCapture(impl, slot, boundaryLength, PublicationPoint::kPrefillEnd);
+    if (!sequence.stagedHybridPublication.has_value())
+    {
+        return ContextCacheCoordinatorStatus::kOk;
+    }
+    enqueueHybridCaptures(impl);
+    ++mMetrics.hybridCaptureSynchronizations;
+    ContextCacheCoordinatorStatus const syncStatus = synchronizeRequest(request);
+    if (syncStatus != ContextCacheCoordinatorStatus::kOk)
+    {
+        return syncStatus;
+    }
+    publishReadyHybridEndpoints(impl);
+    ++mMetrics.hybridMediaPrefixPublications;
+    // The remaining prefill chunk is enqueued next and its prefill-end capture expects pending work.
+    impl.markDeviceWorkEnqueued();
+    return ContextCacheCoordinatorStatus::kOk;
 }
 
 ContextCacheCoordinatorStatus ContextCacheCoordinator::restoreHybridSpecBoundaryHidden(

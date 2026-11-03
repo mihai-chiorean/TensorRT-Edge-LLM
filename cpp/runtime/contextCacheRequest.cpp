@@ -448,6 +448,17 @@ bool ContextCacheRequest::restoreHybridSpecBoundaryHidden(
         mCoordinator.restoreHybridSpecBoundaryHidden(mRequest, slot, baseHiddenStates, destinationRow),
         "Hybrid+spec boundary-hidden restore");
 }
+int32_t ContextCacheRequest::hybridMediaPrefixBoundary(int32_t slot)
+{
+    return mCoordinator.hybridMediaPrefixBoundary(mRequest, slot);
+}
+
+bool ContextCacheRequest::publishHybridMediaPrefix(int32_t slot, int32_t boundaryLength)
+{
+    return contextCacheOperationSucceeded(
+        mCoordinator.publishHybridMediaPrefix(mRequest, slot, boundaryLength), "hybrid media-prefix publication");
+}
+
 bool ContextCacheRequest::preparePrefill()
 {
     return contextCacheOperationSucceeded(mCoordinator.preparePrefill(mRequest), "prefill preparation");

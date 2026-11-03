@@ -536,6 +536,7 @@ void addJsonContextCacheSummary(nlohmann::json& summary, rt::ContextCacheMetrics
     summary["context_cache"] = {{"admitted_sequences", cacheMetrics.admittedSequences},
         {"hit_sequences", cacheMetrics.hitSequences}, {"media_aware_sequences", cacheMetrics.mediaAwareSequences},
         {"lookup_bypass_sequences", cacheMetrics.lookupBypassSequences},
+        {"hybrid_media_prefix_publications", cacheMetrics.hybridMediaPrefixPublications},
         {"forced_cold_sequences", cacheMetrics.forcedColdSequences}, {"matched_tokens", cacheMetrics.matchedTokens},
         {"reused_tokens", cacheMetrics.reusedTokens},
         {"plans",

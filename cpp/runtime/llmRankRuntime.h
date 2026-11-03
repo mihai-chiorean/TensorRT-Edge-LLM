@@ -960,6 +960,12 @@ private:
     //! Tokens of @p inputIds after its last media placeholder: where a Hybrid+spec media prompt's checkpoint stops.
     int32_t mediaReplayTailLength(std::vector<int32_t> const& inputIds) const;
 
+    //! Vanilla hybrid media prefill in two chunks: [prefill start, boundaryLength) without sampling, the checkpoint
+    //! publication at boundaryLength, then the media and the rest of the prompt with sampling. The boundary is the
+    //! coordinator's hybridMediaPrefixBoundary, so the first chunk holds no media token.
+    bool runHybridMediaPrefixPrefill(
+        DecodingInferenceContext& context, ManagedKVCacheRequest& managedKVCacheRequest, int32_t boundaryLength);
+
     //! Validate request shape/runtime compatibility.
     bool validateRequestConfig(LLMGenerationRequest const& request);
 
