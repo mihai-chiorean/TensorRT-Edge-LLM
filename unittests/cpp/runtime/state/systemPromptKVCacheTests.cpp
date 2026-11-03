@@ -125,3 +125,17 @@ TEST(SystemPromptKVCacheTests, ReuseRequiresAnExactSizeSafeTokenPrefix)
     cache.tokenizedPrompt.clear();
     EXPECT_FALSE(hasReusableSystemPromptPrefix(cache, {1}));
 }
+
+TEST(SystemPromptKVCacheTests, ReplayStartIsTheReuseBoundary)
+{
+    auto const inputIds = makeInputIds(20);
+    for (size_t const cachedLength : {1U, 2U, 8U, 19U})
+    {
+        auto const result = computeSystemPromptReuse(makeCache(cachedLength, 1), inputIds);
+        size_t const replayStart = systemPromptReplayStart(cachedLength);
+        EXPECT_EQ(static_cast<size_t>(result.reuseKVCacheLength), replayStart);
+        ASSERT_FALSE(result.tokenIds.empty());
+        EXPECT_EQ(result.tokenIds.front(), inputIds[replayStart]);
+    }
+    EXPECT_EQ(systemPromptReplayStart(0), 0U);
+}

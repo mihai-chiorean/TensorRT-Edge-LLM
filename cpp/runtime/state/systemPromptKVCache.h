@@ -66,6 +66,16 @@ inline bool hasReusableSystemPromptPrefix(SystemPromptKVCache const& cache, std:
         && std::equal(cache.tokenizedPrompt.begin(), cache.tokenizedPrompt.end(), inputIds.begin());
 }
 
+/*! \brief Number of cached system-prompt tokens a reuse restores; prefill resumes at this position.
+ *
+ * Recurrent and convolution state cannot be rewound, so hybrid models must capture it after exactly this
+ * many tokens.
+ */
+inline size_t systemPromptReplayStart(size_t cachedLength)
+{
+    return cachedLength == 0 ? 0 : cachedLength - 1;
+}
+
 /*! \brief Compute how many tokens of `cache` can be reused for a request with input tokens `inputIds`.
  *
  * The cached token length is taken from `cache.tokenizedPrompt`, i.e. the tokenized prompt that was
@@ -86,7 +96,7 @@ inline SystemPromptReuseResult computeSystemPromptReuse(
     size_t const cachedLength = cache.tokenizedPrompt.size();
     check::check(cachedLength > 0 && cachedLength < inputIds.size(),
         "The reuse length shall be larger than 0 and not exceed the input length.");
-    size_t const effectiveReuseLength = cachedLength - 1;
+    size_t const effectiveReuseLength = systemPromptReplayStart(cachedLength);
 
     SystemPromptReuseResult result;
     result.reuseKVCacheLength = math::cast<int32_t>(effectiveReuseLength);

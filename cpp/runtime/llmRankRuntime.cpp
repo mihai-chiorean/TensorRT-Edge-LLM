@@ -3919,14 +3919,47 @@ bool LLMRankRuntime::genAndSaveSystemPromptKVCache(DecodingInferenceContext& con
     }
 
     // Temporary single-batch context to reuse the existing prefill functions.
+    auto initTempContext = [&](DecodingInferenceContext& tempContext, std::vector<int32_t> const& tokens) {
+        tempContext.initialize(
+            1, 1, context.visualEmbeddings, context.deepstackFeatures, loraWeightsName, context.stream);
+        tempContext.initializeRaggedScratch(RaggedEngineContract{TokenLayoutBackend::kEntryPaddedCompatibility,
+            mDeployment.base.maxNumSequences, mDeployment.base.maxQueryLength, mDeployment.base.maxPhysicalTokens,
+            mDeployment.base.recurrentPoolRows, /* mixedStepSupported = */ false});
+        tempContext.systemPrompts[0] = prompt;
+        tempContext.rawBatchedInputIds.push_back(tokens);
+        tempContext.tokenIds[0] = tokens;
+    };
+
+    auto& cacheMgrBase = *mSharedResources->cacheManagers[0];
+    constexpr int32_t CACHE_BATCH_IDX{0};
+    bool const hasLinearAttn = mDeployment.base.numLinearAttnLayers > 0;
+
+    // Reuse replays the cached tokens from systemPromptReplayStart(); attention KV at those positions is
+    // overwritten, but recurrent state would advance twice, so it is captured at the replay start instead.
+    std::vector<rt::Tensor> recurrentStateContents;
+    std::vector<rt::Tensor> convStateContents;
+    if (hasLinearAttn)
+    {
+        size_t const replayStart = systemPromptReplayStart(tokenizedPrompt.size());
+        if (replayStart == 0)
+        {
+            LOG_DEBUG("System prompt is a single token; skip saving system prompt KVCache.");
+            return true;
+        }
+        DecodingInferenceContext boundaryContext;
+        initTempContext(
+            boundaryContext, std::vector<int32_t>(tokenizedPrompt.begin(), tokenizedPrompt.begin() + replayStart));
+        if (!setUpForPrefillExecution(boundaryContext, cacheStrategy) || !runBaseModelPrefill(boundaryContext))
+        {
+            LOG_ERROR("Failed to prefill the recurrent-state boundary for system prompt KVCache generation.");
+            return false;
+        }
+        recurrentStateContents = cacheMgrBase.captureRecurrentStates(CACHE_BATCH_IDX, context.stream);
+        convStateContents = cacheMgrBase.captureConvStates(CACHE_BATCH_IDX, context.stream);
+    }
+
     DecodingInferenceContext tempContext;
-    tempContext.initialize(1, 1, context.visualEmbeddings, context.deepstackFeatures, loraWeightsName, context.stream);
-    tempContext.initializeRaggedScratch(RaggedEngineContract{TokenLayoutBackend::kEntryPaddedCompatibility,
-        mDeployment.base.maxNumSequences, mDeployment.base.maxQueryLength, mDeployment.base.maxPhysicalTokens,
-        mDeployment.base.recurrentPoolRows, /* mixedStepSupported = */ false});
-    tempContext.systemPrompts[0] = prompt;
-    tempContext.rawBatchedInputIds.push_back(tokenizedPrompt);
-    tempContext.tokenIds[0] = tokenizedPrompt;
+    initTempContext(tempContext, tokenizedPrompt);
 
     if (!setUpForPrefillExecution(tempContext, cacheStrategy))
     {
@@ -3955,21 +3988,12 @@ bool LLMRankRuntime::genAndSaveSystemPromptKVCache(DecodingInferenceContext& con
     }
     CUDA_CHECK(cudaStreamSynchronize(context.stream));
 
-    // Capture base KV cache content from the new-stack shared KV cache.
-    auto& cacheMgrBase = *mSharedResources->cacheManagers[0];
-    constexpr int32_t CACHE_BATCH_IDX{0};
-
     SystemPromptKVCache savedKVCacheBase;
     savedKVCacheBase.systemPrompt = prompt;
     savedKVCacheBase.tokenizedPrompt = tokenizedPrompt;
     savedKVCacheBase.kvCacheLayers = cacheMgrBase.captureKVCache(CACHE_BATCH_IDX, promptIdsLength, context.stream);
-
-    // Save recurrent / conv states for hybrid layers.
-    if (mDeployment.base.numLinearAttnLayers > 0)
-    {
-        savedKVCacheBase.recurrentStateContents = cacheMgrBase.captureRecurrentStates(CACHE_BATCH_IDX, context.stream);
-        savedKVCacheBase.convStateContents = cacheMgrBase.captureConvStates(CACHE_BATCH_IDX, context.stream);
-    }
+    savedKVCacheBase.recurrentStateContents = std::move(recurrentStateContents);
+    savedKVCacheBase.convStateContents = std::move(convStateContents);
 
     mSystemPromptKVCacheBase.insert({promptKey, std::move(savedKVCacheBase)});
 
