@@ -1375,6 +1375,10 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::finalizeSequenceAdmission
             && advance.committedStateLength == static_cast<int32_t>(sequence.tokenIds.size()),
         "Context cache sequence-admission progress does not describe a complete input plus one lookahead");
     sequence.tokenIds.push_back(*advance.acceptedTokenIds);
+    if (!sequence.perPositionMediaHash.empty())
+    {
+        sequence.perPositionMediaHash.resize(sequence.tokenIds.size(), Hash128{});
+    }
     sequence.committedStateLength = advance.committedStateLength;
     sequence.commonStateLength = advance.committedStateLength;
     // Vanilla-attention publication, matching BaseEndpointPolicy::onPrefillFinalized for one slot;
@@ -1553,6 +1557,10 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::applyAdvances(
         {
             sequence.tokenIds.insert(sequence.tokenIds.end(), delta.acceptedTokenIds,
                 delta.acceptedTokenIds + static_cast<std::ptrdiff_t>(delta.acceptedTokenCount));
+            if (!sequence.perPositionMediaHash.empty())
+            {
+                sequence.perPositionMediaHash.resize(sequence.tokenIds.size(), Hash128{});
+            }
         }
         sequence.committedStateLength = delta.committedStateLength;
     }

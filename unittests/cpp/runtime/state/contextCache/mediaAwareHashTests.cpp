@@ -313,3 +313,44 @@ TEST_F(MediaAwareCoordinatorTests, CoordinatorSameMediaHitDifferentMediaMiss)
     EXPECT_EQ(result3.admission->prefillStarts[0], 0);
     ASSERT_EQ(mCoordinator->finish(result3.admission->request), ContextCacheCoordinatorStatus::kOk);
 }
+
+TEST_F(MediaAwareCoordinatorTests, CoordinatorReusesGeneratedPageAfterMediaPrompt)
+{
+    auto const prompt = makeTokens(kPAGE_SIZE);
+    auto const generated = makeTokens(kPAGE_SIZE + 1, 9001);
+    std::vector<Hash128> mediaHash(prompt.size(), Hash128{});
+    mediaHash[5] = makeMediaHash(0xDDDD);
+
+    auto producer = beginWithMedia(prompt, mediaHash);
+    ASSERT_EQ(producer.status, ContextCacheCoordinatorStatus::kOk);
+    ASSERT_TRUE(producer.admission.has_value());
+    ASSERT_EQ(mCoordinator->preparePrefill(producer.admission->request), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    std::vector<ContextCacheSequenceAdvance> progress{{generated.data(), 1, kPAGE_SIZE}};
+    ASSERT_EQ(mCoordinator->finalizePrefillPublication(producer.admission->request, progress),
+        ContextCacheCoordinatorStatus::kOk);
+
+    for (int32_t step = 1; step <= kPAGE_SIZE; ++step)
+    {
+        ASSERT_EQ(mCoordinator->prepareDecodeStep(producer.admission->request, DecodingKvHeadroom{1, 0}),
+            ContextCacheCoordinatorStatus::kOk);
+        ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+        progress[0] = ContextCacheSequenceAdvance{generated.data() + step, 1, kPAGE_SIZE + step};
+        std::vector<int32_t> const completedSlots
+            = step == kPAGE_SIZE ? std::vector<int32_t>{0} : std::vector<int32_t>{};
+        ASSERT_EQ(mCoordinator->completeDecodeStep(producer.admission->request, progress, completedSlots),
+            ContextCacheCoordinatorStatus::kOk);
+    }
+    ASSERT_EQ(mCoordinator->finish(producer.admission->request), ContextCacheCoordinatorStatus::kOk);
+
+    // The trailing lookahead lets lookup reuse both full pages without a full-input rewind.
+    auto lookupTokens = prompt;
+    lookupTokens.insert(lookupTokens.end(), generated.begin(), generated.end());
+    mediaHash.resize(lookupTokens.size(), Hash128{});
+    auto reader = beginWithMedia(lookupTokens, mediaHash);
+    ASSERT_EQ(reader.status, ContextCacheCoordinatorStatus::kOk);
+    ASSERT_TRUE(reader.admission.has_value());
+    ASSERT_EQ(reader.admission->prefillStarts.size(), 1U);
+    EXPECT_EQ(reader.admission->prefillStarts[0], 2 * kPAGE_SIZE);
+    ASSERT_EQ(mCoordinator->finish(reader.admission->request), ContextCacheCoordinatorStatus::kOk);
+}
