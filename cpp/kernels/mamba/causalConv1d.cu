@@ -33,6 +33,7 @@
 #include "common/checkMacros.h"
 #include "conversion.cuh"
 
+#include <algorithm>
 #include <cstdint>
 #include <cuda_fp16.h>
 #include <stdexcept>
@@ -93,13 +94,14 @@ __global__ void causalConv1dKernelT(T const* __restrict__ x, T const* __restrict
     int64_t const outBatchOff = static_cast<int64_t>(batchIdx) * outSeqLen * dim;
 
     int32_t const zBlocks = static_cast<int32_t>(gridDim.z);
-    int32_t const chunkSize = (outSeqLen + zBlocks - 1) / zBlocks;
-    int32_t const chunkStart = static_cast<int32_t>(blockIdx.z) * chunkSize;
-    int32_t const chunkEnd = chunkStart + chunkSize < outSeqLen ? chunkStart + chunkSize : outSeqLen;
-    if (chunkStart >= outSeqLen)
+    int64_t const chunkSize = (static_cast<int64_t>(outSeqLen) + zBlocks - 1) / zBlocks;
+    int64_t const chunkStart64 = static_cast<int64_t>(blockIdx.z) * chunkSize;
+    if (chunkStart64 >= outSeqLen)
     {
         return;
     }
+    int32_t const chunkStart = static_cast<int32_t>(chunkStart64);
+    int32_t const chunkEnd = static_cast<int32_t>(std::min<int64_t>(chunkStart64 + chunkSize, outSeqLen));
 
     float xBuf[kWidth];
 #pragma unroll
@@ -171,13 +173,14 @@ __global__ void causalConv1dKernel(T const* __restrict__ x, T const* __restrict_
 
     // Contiguous chunk for this z-block
     int32_t const zBlocks = static_cast<int32_t>(gridDim.z);
-    int32_t const chunkSize = (outSeqLen + zBlocks - 1) / zBlocks;
-    int32_t const chunkStart = static_cast<int32_t>(blockIdx.z) * chunkSize;
-    int32_t const chunkEnd = chunkStart + chunkSize < outSeqLen ? chunkStart + chunkSize : outSeqLen;
-    if (chunkStart >= outSeqLen)
+    int64_t const chunkSize = (static_cast<int64_t>(outSeqLen) + zBlocks - 1) / zBlocks;
+    int64_t const chunkStart64 = static_cast<int64_t>(blockIdx.z) * chunkSize;
+    if (chunkStart64 >= outSeqLen)
     {
         return;
     }
+    int32_t const chunkStart = static_cast<int32_t>(chunkStart64);
+    int32_t const chunkEnd = static_cast<int32_t>(std::min<int64_t>(chunkStart64 + chunkSize, outSeqLen));
 
     // Pre-fill shift register
     float xBuf[kMaxWidth];
@@ -271,20 +274,21 @@ void invokeCausalConv1d(trt_edgellm::rt::Tensor const& x, trt_edgellm::rt::Tenso
     dim3 const block(kThreads);
     uint32_t const dimBlocks = static_cast<uint32_t>((dim + kThreads - 1) / kThreads);
 
-    // Adaptive seq-parallel: add z-blocks only when dim-blocks under-utilize the SMs
+    // Each thread walks its chunk serially with one load per output, so split the sequence until
+    // there are enough CTAs per SM to hide the load latency; chunks keep at least
+    // kMinChunkTokens outputs so the width - 1 halo re-reads stay negligible.
+    constexpr int64_t kTargetCtasPerSm{16};
+    constexpr int32_t kMinChunkTokens{16};
     int32_t smCount = 0;
     int32_t deviceId = 0;
     cudaGetDevice(&deviceId);
     cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, deviceId);
-    uint32_t seqBlocks = 1;
-    if (dimBlocks < static_cast<uint32_t>(smCount) * 2)
-    {
-        seqBlocks = (static_cast<uint32_t>(smCount) * 4 + dimBlocks - 1) / dimBlocks;
-    }
-    if (seqBlocks > static_cast<uint32_t>(outSeqLen))
-    {
-        seqBlocks = static_cast<uint32_t>(outSeqLen);
-    }
+    int64_t const ctas = std::max<int64_t>(1, static_cast<int64_t>(batch) * dimBlocks);
+    int64_t const targetCtas = static_cast<int64_t>(smCount) * kTargetCtasPerSm;
+    int64_t const maxSeqBlocks
+        = std::max<int64_t>(1, (static_cast<int64_t>(outSeqLen) + kMinChunkTokens - 1) / kMinChunkTokens);
+    uint32_t const seqBlocks
+        = static_cast<uint32_t>(std::min(std::max<int64_t>(1, (targetCtas + ctas - 1) / ctas), maxSeqBlocks));
     dim3 const grid(batch, dimBlocks, seqBlocks);
 
     half const* biasPtr = bias.has_value() ? bias->get().dataPointer<half>() : nullptr;
