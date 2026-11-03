@@ -39,6 +39,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -80,6 +81,34 @@ LLMGenerationRequest makeImageRequest(rt::DeviceType device)
 
     LLMGenerationRequest::Request sequence;
     sequence.imageBuffers.emplace_back(std::move(pixels));
+    LLMGenerationRequest request;
+    request.requests.push_back(std::move(sequence));
+    return request;
+}
+
+//! A two-group video between a full text page and a text tail: each temporal group is its own placeholder run.
+std::vector<int32_t> makeVideoTokens()
+{
+    std::vector<int32_t> tokens = makeTokens(kTOKENS_PER_PAGE);
+    for (int32_t group = 0; group < 2; ++group)
+    {
+        tokens.push_back(7000 + group);
+        tokens.insert(tokens.end(), 4, kIMAGE_TOKEN_ID);
+    }
+    std::vector<int32_t> const tail = makeTokens(kTOKENS_PER_PAGE);
+    tokens.insert(tokens.end(), tail.begin(), tail.end());
+    return tokens;
+}
+
+//! The same pixel bytes for every frame count: the frames split one 2 x 4 x 2 x 3 block.
+LLMGenerationRequest makeVideoRequest(unsigned char fill, int64_t frames = 2)
+{
+    Tensor pixels({frames, kIMAGE_EXTENT * 2 / frames, kIMAGE_EXTENT, 3}, rt::DeviceType::kCPU, DataType::kUINT8);
+    std::memset(pixels.dataPointer<unsigned char>(), fill, static_cast<size_t>(2 * kIMAGE_EXTENT * kIMAGE_EXTENT * 3));
+    imageUtils::ImageData video(std::move(pixels));
+    video.isVideo = true;
+    LLMGenerationRequest::Request sequence;
+    sequence.imageBuffers.push_back(std::move(video));
     LLMGenerationRequest request;
     request.requests.push_back(std::move(sequence));
     return request;
@@ -426,6 +455,65 @@ TEST_F(ContextCacheRequestTests, HostImageKeysThePlaceholderRunOnItsPixels)
     EXPECT_EQ(mCoordinator->metrics().mediaAwareSequences, 1U);
     EXPECT_EQ(mCoordinator->metrics().lookupBypassSequences, 0U);
     ASSERT_TRUE(admitted->finish());
+}
+
+TEST_F(ContextCacheRequestTests, VideoGroupsKeyOnTheWholeVideo)
+{
+    auto beginVideo = [&](DecodingInferenceContext const& context, unsigned char fill, int64_t frames = 2) {
+        return ContextCacheRequest::begin(
+            *mCoordinator, makeVideoRequest(fill, frames), context, false, DecodingKvHeadroom{1, 0}, {kIMAGE_TOKEN_ID});
+    };
+
+    DecodingInferenceContext producerContext = makeContext({makeVideoTokens()}, mStream);
+    std::optional<ContextCacheRequest> producer = beginVideo(producerContext, 0x5A);
+    ASSERT_TRUE(producer.has_value());
+    EXPECT_EQ(mCoordinator->metrics().mediaAwareSequences, 1U);
+    EXPECT_EQ(mCoordinator->metrics().lookupBypassSequences, 0U);
+    completeRuntimePrefill(*producer, producerContext);
+    ASSERT_TRUE(producer->finish());
+
+    DecodingInferenceContext sameContext = makeContext({makeVideoTokens()}, mStream);
+    std::optional<ContextCacheRequest> same = beginVideo(sameContext, 0x5A);
+    ASSERT_TRUE(same.has_value());
+    EXPECT_EQ(same->prefillStarts(), std::vector<int32_t>{2 * kTOKENS_PER_PAGE});
+    ASSERT_TRUE(same->finish());
+
+    DecodingInferenceContext otherContext = makeContext({makeVideoTokens()}, mStream);
+    std::optional<ContextCacheRequest> other = beginVideo(otherContext, 0x33);
+    ASSERT_TRUE(other.has_value());
+    EXPECT_EQ(other->prefillStarts(), std::vector<int32_t>{kTOKENS_PER_PAGE});
+    ASSERT_TRUE(other->finish());
+
+    DecodingInferenceContext resplitContext = makeContext({makeVideoTokens()}, mStream);
+    std::optional<ContextCacheRequest> resplit = beginVideo(resplitContext, 0x5A, 1);
+    ASSERT_TRUE(resplit.has_value());
+    EXPECT_EQ(resplit->prefillStarts(), std::vector<int32_t>{kTOKENS_PER_PAGE});
+    ASSERT_TRUE(resplit->finish());
+}
+
+TEST_F(ContextCacheRequestTests, SeatedAdmissionRejectsMultiRunVideo)
+{
+    DecodingInferenceContext founderContext = makeContext({makeTokens(kTOKENS_PER_PAGE)}, mStream);
+    std::optional<ContextCacheRequest> founder = begin(founderContext);
+    ASSERT_TRUE(founder.has_value());
+    completeRuntimePrefill(*founder, founderContext);
+
+    // A seated prefill indexes media embeddings from its first placeholder, so a video with more runs than buffers
+    // must not be keyed on the combined identity there.
+    LLMGenerationRequest const video = makeVideoRequest(0x5A);
+    int32_t prefillStart = -1;
+    std::string error;
+    try
+    {
+        founder->admitSequence(makeVideoTokens(), "", DecodingKvHeadroom{1, 0}, prefillStart, ResidentRef{1, 1},
+            mStream, {kIMAGE_TOKEN_ID}, video.requests[0].imageBuffers);
+    }
+    catch (std::runtime_error const& e)
+    {
+        error = e.what();
+    }
+    EXPECT_NE(error.find("exceeds provided image count"), std::string::npos) << error;
+    ASSERT_TRUE(founder->finish());
 }
 
 TEST_F(ContextCacheRequestTests, ImageTheHostCannotReadBypassesRatherThanFails)

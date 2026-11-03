@@ -62,7 +62,7 @@ bool isMediaToken(int32_t tokenId, std::vector<int32_t> const& mediaTokenIds)
 
 std::vector<Hash128> buildPerPositionMediaHash(std::vector<int32_t> const& tokenIds,
     std::vector<int32_t> const& mediaTokenIds, std::vector<imageUtils::ImageData> const& imageBuffers,
-    std::vector<audioUtils::AudioData> const& audioBuffers, cudaStream_t stream)
+    std::vector<audioUtils::AudioData> const& audioBuffers, cudaStream_t stream, bool allowCombinedImageKey)
 {
     if (mediaTokenIds.empty())
     {
@@ -75,7 +75,14 @@ std::vector<Hash128> buildPerPositionMediaHash(std::vector<int32_t> const& token
     {
         std::string_view const bytes(
             reinterpret_cast<char const*>(image.data()), static_cast<size_t>(image.addressedBytes()));
-        imageHashes.push_back(hashOpaqueIdentity(bytes, stream, false));
+        Hash128 const pixels = hashOpaqueIdentity(bytes, stream, false);
+        // The same bytes can be a different frame split, a transposed frame or another sample rate, each of which
+        // changes the vision input or the MRoPE positions.
+        std::string identity(reinterpret_cast<char const*>(&pixels), sizeof(pixels));
+        identity += "|" + std::to_string(image.width) + "x" + std::to_string(image.height) + "x"
+            + std::to_string(image.frames) + (image.isVideo ? "|video" : "|image") + (image.doResize ? "|r|" : "|n|");
+        identity.append(reinterpret_cast<char const*>(&image.fps), sizeof(image.fps));
+        imageHashes.push_back(hashOpaqueIdentity(identity));
     }
 
     std::vector<Hash128> audioHashes;
@@ -97,6 +104,24 @@ std::vector<Hash128> buildPerPositionMediaHash(std::vector<int32_t> const& token
 
     int32_t const imageTokenId = (!mediaTokenIds.empty()) ? mediaTokenIds[0] : -1;
     int32_t const audioTokenId = (mediaTokenIds.size() > 1) ? mediaTokenIds[1] : -1;
+
+    // A video expands to one placeholder run per temporal group (Qwen3-VL puts a timestamp between groups), so there
+    // can be more image runs than image buffers. Which runs belong to which buffer is not visible here; key every
+    // image position on all of the request's images together, which stays exact at the cost of no reuse past the
+    // first image when any image differs. Only for a founding request: a seated admission's prefill indexes media
+    // embeddings from its first placeholder, so a reused prefix that ends inside the video would misalign them.
+    size_t imageRuns = 0;
+    for (size_t i = 0; i < tokenIds.size(); ++i)
+    {
+        imageRuns += static_cast<size_t>(tokenIds[i] == imageTokenId && (i == 0 || tokenIds[i - 1] != imageTokenId));
+    }
+    std::optional<Hash128> combinedImageHash;
+    if (allowCombinedImageKey && !imageHashes.empty() && imageRuns > imageHashes.size())
+    {
+        std::string const digests(
+            reinterpret_cast<char const*>(imageHashes.data()), imageHashes.size() * sizeof(Hash128));
+        combinedImageHash = hashOpaqueIdentity(digests);
+    }
 
     std::vector<Hash128> perPositionHash(tokenIds.size(), Hash128{});
     size_t imageIdx = 0;
@@ -125,7 +150,11 @@ std::vector<Hash128> buildPerPositionMediaHash(std::vector<int32_t> const& token
                 }
             }
 
-            if (token == imageTokenId)
+            if (token == imageTokenId && combinedImageHash.has_value())
+            {
+                perPositionHash[i] = *combinedImageHash;
+            }
+            else if (token == imageTokenId)
             {
                 ELLM_CHECK(imageIdx < imageHashes.size(),
                     "Image token placeholder at position " + std::to_string(i) + " exceeds provided image count ("
@@ -172,7 +201,7 @@ std::vector<Hash128> buildPerPositionMediaHash(std::vector<int32_t> const& token
 ContextCacheSequenceAdmission makeContextCacheSequenceAdmission(std::vector<int32_t> const& tokenIds,
     std::string const& loraWeightsName, std::vector<int32_t> const& mediaTokenIds,
     std::vector<imageUtils::ImageData> const& imageBuffers, std::vector<audioUtils::AudioData> const& audioBuffers,
-    cudaStream_t stream)
+    cudaStream_t stream, bool allowCombinedImageKey)
 {
     ContextCacheSequenceAdmission admission;
     admission.tokenIds = tokenIds;
@@ -183,7 +212,7 @@ ContextCacheSequenceAdmission makeContextCacheSequenceAdmission(std::vector<int3
         admission.keyExtras.adapter = adapter;
     }
     admission.perPositionMediaHash
-        = buildPerPositionMediaHash(tokenIds, mediaTokenIds, imageBuffers, audioBuffers, stream);
+        = buildPerPositionMediaHash(tokenIds, mediaTokenIds, imageBuffers, audioBuffers, stream, allowCombinedImageKey);
     return admission;
 }
 
@@ -233,7 +262,7 @@ std::optional<ContextCacheRequest> ContextCacheRequest::begin(ContextCacheCoordi
         ContextCacheSequenceAdmission sequence
             = makeContextCacheSequenceAdmission(context.rawBatchedInputIds[seqIdx], context.loraWeightsName,
                 effectiveLookupPolicy == ContextCacheLookupPolicy::kUseCache ? mediaTokenIds : kEmptyMediaTokenIds,
-                images, audio, context.stream);
+                images, audio, context.stream, /*allowCombinedImageKey=*/true);
         sequence.resident = context.residentRefs[seqIdx];
         sequence.lookupPolicy = sequenceLookupPolicy;
         admission.sequences.push_back(std::move(sequence));
@@ -274,7 +303,7 @@ ContextCacheRequest::AdmitSequenceStatus ContextCacheRequest::admitSequence(std:
 {
     mPrefillStarts.reserve(mPrefillStarts.size() + 1);
     ContextCacheSequenceAdmission admission = makeContextCacheSequenceAdmission(
-        tokenIds, loraWeightsName, mediaTokenIds, imageBuffers, audioBuffers, stream);
+        tokenIds, loraWeightsName, mediaTokenIds, imageBuffers, audioBuffers, stream, /*allowCombinedImageKey=*/false);
     admission.resident = resident;
     ContextCacheCoordinator::AdmitSequenceResult result = mCoordinator.admitSequence(mRequest, admission, headroom);
     if (result.status != ContextCacheCoordinatorStatus::kOk)

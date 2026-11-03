@@ -44,7 +44,9 @@ contracts through the same native runtime.
 For vanilla media requests, decoded image bytes or PCM audio samples and their
 placeholder positions are part of the cache identity. Audio without decoded
 PCM uses its mel-spectrogram path. Changing media content or order invalidates
-the affected prefix. Speculative media requests follow the matrix: Gemma4 MTP
+the affected prefix. A video that expands into several placeholder runs (Qwen3-VL and
+Qwen3.5 emit one per temporal group) keys every image position of its request on all
+of that request's images together. Speculative media requests follow the matrix: Gemma4 MTP
 reuses the text prefix before the first media position, and the other
 speculative methods bypass the cache.
 
