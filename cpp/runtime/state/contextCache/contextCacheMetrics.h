@@ -43,6 +43,8 @@ struct ContextCacheMetrics
     uint64_t lookupBypassSequences{};
     //! Speculative media sequences whose lookup and publication stop at the first media block.
     uint64_t specMediaPrefixSequences{};
+    //! Vanilla hybrid media requests that published a checkpoint at the end of their text prefix.
+    uint64_t hybridMediaPrefixPublications{};
     uint64_t forcedColdSequences{};
     uint64_t standardPlans{};
     uint64_t noReusablePrefixPlans{};

@@ -180,6 +180,21 @@ protected:
         return std::move(*result.admission);
     }
 
+    ContextCacheCoordinator::AdmissionResult beginWithMedia(std::vector<int32_t> tokens, int32_t mediaStart,
+        int32_t mediaLength, Hash128 mediaHash, std::optional<ContextCacheLookupPolicy> lookupPolicy = std::nullopt)
+    {
+        std::vector<Hash128> perPositionMediaHash(tokens.size());
+        std::fill_n(perPositionMediaHash.begin() + mediaStart, mediaLength, mediaHash);
+        ContextCacheBatchAdmission admission;
+        admission.sequences.push_back(ContextCacheSequenceAdmission{
+            std::move(tokens), {}, std::move(perPositionMediaHash), ResidentRef{0, 1}, lookupPolicy});
+        ContextCacheCoordinator::BeginRequestResult result
+            = mCoordinator->beginRequest(admission, DecodingKvHeadroom{1, 0}, mStream);
+        EXPECT_EQ(result.status, ContextCacheCoordinatorStatus::kOk);
+        EXPECT_TRUE(result.admission.has_value());
+        return std::move(*result.admission);
+    }
+
     void seedRecurrent(uint8_t recurrentPattern, uint8_t convPattern)
     {
         MambaCacheManager& mamba = mCache->getMambaCacheManager();
@@ -405,6 +420,82 @@ TEST_F(ContextCacheHybridCoordinatorTests, PureRecurrentCheckpointNeedsNoKvPage)
     ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
     expectRecurrent(0x41, 0x71);
     EXPECT_EQ(mCoordinator->finish(consumer.request), ContextCacheCoordinatorStatus::kOk);
+}
+
+TEST_F(ContextCacheHybridCoordinatorTests, MediaPrefixCheckpointServesRequestWithDifferentMedia)
+{
+    constexpr int32_t kMediaStart{kTOKENS_PER_PAGE + 5};
+    constexpr int32_t kMediaLength{7};
+    constexpr int32_t kInputLength{2 * kTOKENS_PER_PAGE + 10};
+    auto producer = beginWithMedia(makeTokens(kInputLength), kMediaStart, kMediaLength, Hash128{1, 2});
+    ASSERT_EQ(producer.prefillStarts, std::vector<int32_t>{0});
+    ASSERT_EQ(mCoordinator->preparePrefill(producer.request), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(mCoordinator->hybridMediaPrefixBoundary(producer.request, 0), kTOKENS_PER_PAGE);
+
+    seedRecurrent(0x51, 0x52);
+    ASSERT_EQ(mCoordinator->publishHybridMediaPrefix(producer.request, 0, kTOKENS_PER_PAGE),
+        ContextCacheCoordinatorStatus::kOk);
+    EXPECT_EQ(mCoordinator->metrics().hybridMediaPrefixPublications, 1U);
+    EXPECT_EQ(mCoordinator->manager().records().size(), 1U);
+    EXPECT_EQ(mCoordinator->hybridMediaPrefixBoundary(producer.request, 0), 0);
+
+    seedRecurrent(0x53, 0x54);
+    publishPrefill(producer, kInputLength, 9001);
+    EXPECT_EQ(mCoordinator->manager().records().size(), 2U);
+    ASSERT_EQ(mCoordinator->finish(producer.request), ContextCacheCoordinatorStatus::kOk);
+
+    seedRecurrent(0, 0);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    auto consumer = beginWithMedia(makeTokens(kInputLength), kMediaStart, kMediaLength, Hash128{3, 4});
+    EXPECT_EQ(consumer.prefillStarts, std::vector<int32_t>{kTOKENS_PER_PAGE});
+    ASSERT_EQ(mCoordinator->preparePrefill(consumer.request), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    expectRecurrent(0x51, 0x52);
+    EXPECT_EQ(mCoordinator->metrics().hybridRestores, 1U);
+    EXPECT_EQ(mCoordinator->hybridMediaPrefixBoundary(consumer.request, 0), 0);
+    EXPECT_EQ(mCoordinator->finish(consumer.request), ContextCacheCoordinatorStatus::kOk);
+}
+
+TEST_F(ContextCacheHybridCoordinatorTests, MediaPrefixCaptureTakesTheRestoredSnapshotSlot)
+{
+    ASSERT_EQ(mCoordinator->shutdown(), ContextCacheCoordinatorStatus::kOk);
+    mCoordinator.reset();
+    createCoordinator({}, 1);
+
+    constexpr int32_t kCheckpointLength{kTOKENS_PER_PAGE + 1};
+    auto producer = begin(makeTokens(kCheckpointLength));
+    ASSERT_EQ(mCoordinator->preparePrefill(producer.request), ContextCacheCoordinatorStatus::kOk);
+    publishPrefill(producer, kCheckpointLength, 9001);
+    ASSERT_EQ(mCoordinator->finish(producer.request), ContextCacheCoordinatorStatus::kOk);
+
+    constexpr int32_t kInputLength{3 * kTOKENS_PER_PAGE + 10};
+    auto consumer = beginWithMedia(makeTokens(kInputLength), 2 * kTOKENS_PER_PAGE + 5, 7, Hash128{1, 2});
+    ASSERT_EQ(consumer.prefillStarts, std::vector<int32_t>{kCheckpointLength});
+    ASSERT_EQ(mCoordinator->preparePrefill(consumer.request), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(mCoordinator->hybridMediaPrefixBoundary(consumer.request, 0), 2 * kTOKENS_PER_PAGE);
+    ASSERT_EQ(mCoordinator->publishHybridMediaPrefix(consumer.request, 0, 2 * kTOKENS_PER_PAGE),
+        ContextCacheCoordinatorStatus::kOk);
+    EXPECT_EQ(mCoordinator->metrics().hybridSnapshotPressureSkips, 0U);
+    EXPECT_EQ(mCoordinator->metrics().hybridMediaPrefixPublications, 1U);
+    EXPECT_EQ(mCoordinator->finish(consumer.request), ContextCacheCoordinatorStatus::kOk);
+}
+
+TEST_F(ContextCacheHybridCoordinatorTests, MediaPrefixBoundaryNeedsFullTextPagesAndCacheLookup)
+{
+    constexpr int32_t kInputLength{2 * kTOKENS_PER_PAGE + 10};
+
+    auto textOnly = begin(makeTokens(kInputLength));
+    EXPECT_EQ(mCoordinator->hybridMediaPrefixBoundary(textOnly.request, 0), 0);
+    EXPECT_EQ(mCoordinator->finish(textOnly.request), ContextCacheCoordinatorStatus::kOk);
+
+    auto mediaInFirstPage = beginWithMedia(makeTokens(kInputLength), 5, 7, Hash128{1, 2});
+    EXPECT_EQ(mCoordinator->hybridMediaPrefixBoundary(mediaInFirstPage.request, 0), 0);
+    EXPECT_EQ(mCoordinator->finish(mediaInFirstPage.request), ContextCacheCoordinatorStatus::kOk);
+
+    auto bypass = beginWithMedia(
+        makeTokens(kInputLength), kTOKENS_PER_PAGE + 5, 7, Hash128{1, 2}, ContextCacheLookupPolicy::kBypass);
+    EXPECT_EQ(mCoordinator->hybridMediaPrefixBoundary(bypass.request, 0), 0);
+    EXPECT_EQ(mCoordinator->finish(bypass.request), ContextCacheCoordinatorStatus::kOk);
 }
 
 } // namespace

@@ -22,6 +22,7 @@ match.
 | Vanilla, pure recurrent text model | Supported | The recurrent snapshot budget must provide at least one slot. |
 | Vanilla, hybrid attention/recurrent text model | Supported | Recurrent and partial-KV snapshot budgets must each provide at least one slot. |
 | Vanilla image input on a supported base topology | Supported in the C++ runtime | Uses [media identity](#media-identity). |
+| Vanilla hybrid attention/recurrent request with image input | Supported | Recurrent checkpoints exist only where one was captured. A batch of one also captures one at the last full page before its first media position, so a later request with the same text before different media reuses that prefix. Place fixed instructions before the media to benefit. Audio input takes the same path but, like vanilla audio input, is not release-qualified. |
 | Vanilla audio input on a supported base topology | Implemented, not release-qualified | Uses [media identity](#media-identity), but release validation does not cover audio-input reuse. |
 | Attention-only EAGLE3 | Supported | The draft owns an independent KV pool, and the final matched page is replayed for the one-token future dependency. Linear and tree drafting are accepted. |
 | Attention-only DFlash, JetSpec, or DSpark | Supported | The draft owns an independent KV pool. These methods have no future-token replay dependency. |

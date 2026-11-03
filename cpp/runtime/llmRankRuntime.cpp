@@ -2202,7 +2202,14 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
     }
     else
     {
-        prefillStatus = runBaseModelPrefill(context, managedRequest);
+        bool const hasMedia = context.visualEmbeddings.has_value() || context.audioEmbeddings.has_value();
+        int32_t const mediaPrefixBoundary
+            = requestCacheEnabled && hasMedia && !enableSpecDecode && context.activeBatchSize == 1
+            ? managedRequest->hybridMediaPrefixBoundary(0)
+            : 0;
+        prefillStatus = mediaPrefixBoundary > 0
+            ? runHybridMediaPrefixPrefill(context, *managedRequest, mediaPrefixBoundary)
+            : runBaseModelPrefill(context, managedRequest);
     }
     if (!prefillStatus)
     {
@@ -3063,6 +3070,65 @@ bool LLMRankRuntime::runHybridMtpPrefill(
     }
     context.tokenIds[0].erase(context.tokenIds[0].begin());
     context.effectivePrefillLengths[0] = suffixLen;
+    return true;
+}
+
+bool LLMRankRuntime::runHybridMediaPrefixPrefill(
+    DecodingInferenceContext& context, ManagedKVCacheRequest& managedKVCacheRequest, int32_t boundaryLength)
+{
+    ELLM_CHECK(context.activeBatchSize == 1, "Hybrid media-prefix prefill requires a batch of one");
+    int32_t const suffixLength = context.effectivePrefillLengths[0];
+    int32_t const reuseLength = managedKVCacheRequest.reuseTokenLength(0);
+    int32_t const prefixChunkLength = boundaryLength - reuseLength;
+    ELLM_CHECK(prefixChunkLength > 0 && prefixChunkLength < suffixLength,
+        "Hybrid media-prefix boundary must split the prefill suffix");
+    std::vector<int32_t> const completeSuffix = context.tokenIds[0];
+    auto const chunkEnd = completeSuffix.begin() + prefixChunkLength;
+    int32_t const imageTokenId = mDeployment.base.imageTokenId;
+    int32_t const audioTokenId = mDeployment.base.audioTokenId;
+    ELLM_CHECK(std::none_of(completeSuffix.begin(), chunkEnd,
+                   [&](int32_t token) { return token == imageTokenId || token == audioTokenId; }),
+        "Hybrid media-prefix chunk contains a media token");
+
+    // The text chunk has no media indices to offset and no prefill-end capture of its own.
+    context.tokenIds[0].assign(completeSuffix.begin(), chunkEnd);
+    context.effectivePrefillLengths[0] = prefixChunkLength;
+    if (!runBaseModelPrefill(context, /*managedKVCacheRequest=*/nullptr, /*sampleOutput=*/false))
+    {
+        return false;
+    }
+    if (!managedKVCacheRequest.publishHybridMediaPrefix(0, boundaryLength))
+    {
+        return false;
+    }
+
+    // The sampling chunk sees a shorter token history than the request: its token callback and layer-debugger
+    // bookkeeping are rebased onto the complete suffix below.
+    std::optional<int32_t> const emittedBeforeSampling = context.callbackEmittedTokenCounts.empty()
+        ? std::nullopt
+        : std::optional<int32_t>{context.callbackEmittedTokenCounts[0]};
+    context.tokenIds[0].assign(chunkEnd, completeSuffix.end());
+    context.effectivePrefillLengths[0] = suffixLength - prefixChunkLength;
+    if (!runBaseModelPrefill(context, &managedKVCacheRequest, /*sampleOutput=*/true))
+    {
+        return false;
+    }
+    // A grammar failure finishes the slot without appending a token, so keep only what sampling actually appended.
+    std::vector<int32_t>& tokens = context.tokenIds[0];
+    std::vector<int32_t> const generated(
+        tokens.begin() + std::min(tokens.size(), static_cast<size_t>(suffixLength - prefixChunkLength)), tokens.end());
+    tokens = completeSuffix;
+    tokens.insert(tokens.end(), generated.begin(), generated.end());
+    context.effectivePrefillLengths[0] = suffixLength;
+    if (context.layerDebugger != nullptr)
+    {
+        context.layerDebugger->setReusedPrefixLengths({reuseLength});
+    }
+    if (emittedBeforeSampling.has_value())
+    {
+        context.callbackEmittedTokenCounts[0] = *emittedBeforeSampling;
+        emitTokenCallbacks(context);
+    }
     return true;
 }
 

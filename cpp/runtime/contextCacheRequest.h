@@ -91,6 +91,10 @@ public:
         int32_t slot, int32_t residentStateLength, Tensor const& baseHiddenStates, int32_t boundaryHiddenRow);
     //! Restore the reused checkpoint's saved boundary base-hidden row into baseHiddenStates for the fold micro-forward.
     bool restoreHybridMtpBoundaryHidden(int32_t slot, Tensor& baseHiddenStates, int32_t destinationRow);
+    //! See ContextCacheCoordinator::hybridMediaPrefixBoundary.
+    int32_t hybridMediaPrefixBoundary(int32_t slot);
+    //! See ContextCacheCoordinator::publishHybridMediaPrefix.
+    bool publishHybridMediaPrefix(int32_t slot, int32_t boundaryLength);
 
     bool preparePrefill();
     bool enqueuePrefillCaptures();

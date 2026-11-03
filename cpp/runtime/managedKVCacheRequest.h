@@ -57,6 +57,9 @@ public:
     bool publishHybridMtpEndpoint(
         int32_t slot, int32_t residentStateLength, Tensor const& baseHiddenStates, int32_t boundaryHiddenRow);
     bool restoreHybridMtpBoundaryHidden(int32_t slot, Tensor& baseHiddenStates, int32_t destinationRow);
+    //! 0 without context reuse; see ContextCacheCoordinator::hybridMediaPrefixBoundary.
+    int32_t hybridMediaPrefixBoundary(int32_t slot);
+    bool publishHybridMediaPrefix(int32_t slot, int32_t boundaryLength);
 
     bool preparePrefill();
     bool prepareSwaPrefill(std::vector<int32_t> const& effectiveInputLengths);

@@ -214,6 +214,15 @@ public:
     //! runtime's fold micro-forward. No synchronization: the caller orders this within its prefill stream.
     ContextCacheCoordinatorStatus restoreHybridMtpBoundaryHidden(
         RequestHandle& request, int32_t slot, Tensor& baseHiddenStates, int32_t destinationRow);
+    //! Length of the full pages before the slot's first media position when a vanilla hybrid request can publish a
+    //! checkpoint there, else 0. The only recurrent checkpoints are endpoints, so without this a request that shares
+    //! its text prefix but not its media with a cached one restores nothing.
+    int32_t hybridMediaPrefixBoundary(RequestHandle& request, int32_t slot);
+    //! Capture, synchronize and publish the checkpoint at @p boundaryLength, which the runtime has just finished
+    //! prefilling as its own chunk; the rest of the prompt is prefilled afterwards on the same stream. Snapshot-pool
+    //! pressure skips the capture.
+    ContextCacheCoordinatorStatus publishHybridMediaPrefix(
+        RequestHandle& request, int32_t slot, int32_t boundaryLength);
     //! Grow and upload every row needed for the next decode working set before model execution.
     ContextCacheCoordinatorStatus prepareDecodeStep(RequestHandle& request, DecodingKvHeadroom const& headroom);
     //! Apply the post-decode sequence advance after the decoder's existing synchronization.

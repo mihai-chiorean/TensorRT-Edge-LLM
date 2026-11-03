@@ -148,6 +148,16 @@ bool ManagedKVCacheRequest::prepareSwaPrefill(std::vector<int32_t> const& effect
             mBoundedSwaPageManager->preparePrefill(swaRequest(), effectiveInputLengths), "SWA prefill preparation");
 }
 
+int32_t ManagedKVCacheRequest::hybridMediaPrefixBoundary(int32_t slot)
+{
+    return hasContextReuse() ? contextRequest().hybridMediaPrefixBoundary(slot) : 0;
+}
+
+bool ManagedKVCacheRequest::publishHybridMediaPrefix(int32_t slot, int32_t boundaryLength)
+{
+    return contextRequest().publishHybridMediaPrefix(slot, boundaryLength);
+}
+
 bool ManagedKVCacheRequest::enqueuePrefillCaptures()
 {
     return !hasContextReuse() || contextRequest().enqueuePrefillCaptures();

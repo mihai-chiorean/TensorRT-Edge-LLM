@@ -1904,6 +1904,58 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::publishHybridMtpEndpoint(
         request, slot, residentStateLength, baseHiddenStates, boundaryHiddenRow);
 }
 
+int32_t ContextCacheCoordinator::hybridMediaPrefixBoundary(RequestHandle& request, int32_t slot)
+{
+    RequestHandle::Impl& impl = checkedImpl(request);
+    ELLM_CHECK(slot >= 0 && slot < static_cast<int32_t>(impl.sequences.size()),
+        "Hybrid media-prefix slot is outside the active batch");
+    auto const& sequence = impl.sequences[static_cast<size_t>(slot)];
+    if (!usesCheckpointReuse() || isSpecRequest(impl) || sequence.lookupPolicy == ContextCacheLookupPolicy::kBypass
+        || sequence.perPositionMediaHash.empty())
+    {
+        return 0;
+    }
+    int32_t const boundary = textPrefixBeforeFirstMedia(sequence.perPositionMediaHash);
+    if (boundary <= sequence.reuseTokenLength || boundary <= sequence.publishedExactLength
+        || static_cast<size_t>(boundary) >= sequence.tokenIds.size())
+    {
+        return 0;
+    }
+    return boundary;
+}
+
+ContextCacheCoordinatorStatus ContextCacheCoordinator::publishHybridMediaPrefix(
+    RequestHandle& request, int32_t slot, int32_t boundaryLength)
+{
+    RequestHandle::Impl& impl = checkedImpl(request);
+    ELLM_CHECK(impl.executing(), "Hybrid media-prefix publication requires an executing prefill");
+    ELLM_CHECK(boundaryLength > 0 && boundaryLength == hybridMediaPrefixBoundary(request, slot),
+        "Hybrid media-prefix publication must use the boundary the coordinator reported");
+    auto& sequence = impl.sequences[static_cast<size_t>(slot)];
+    ELLM_CHECK(
+        boundaryLength >= sequence.committedStateLength, "Hybrid media-prefix boundary precedes the committed state");
+    sequence.committedStateLength = boundaryLength;
+    // The restored snapshot was consumed by the text chunk; unpinning it lets this capture take its slot.
+    mManager.releaseRestoredHybridSnapshots(sequence.lease);
+    reserveHybridCapture(impl, slot, boundaryLength, PublicationPoint::kPrefillEnd);
+    if (!sequence.stagedHybridPublication.has_value())
+    {
+        return ContextCacheCoordinatorStatus::kOk;
+    }
+    enqueueHybridCaptures(impl);
+    ++mMetrics.hybridCaptureSynchronizations;
+    ContextCacheCoordinatorStatus const syncStatus = synchronizeRequest(request);
+    if (syncStatus != ContextCacheCoordinatorStatus::kOk)
+    {
+        return syncStatus;
+    }
+    publishReadyHybridEndpoints(impl);
+    ++mMetrics.hybridMediaPrefixPublications;
+    // The remaining prefill chunk is enqueued next and its prefill-end capture expects pending work.
+    impl.markDeviceWorkEnqueued();
+    return ContextCacheCoordinatorStatus::kOk;
+}
+
 ContextCacheCoordinatorStatus ContextCacheCoordinator::restoreHybridMtpBoundaryHidden(
     RequestHandle& request, int32_t slot, Tensor& baseHiddenStates, int32_t destinationRow)
 {
