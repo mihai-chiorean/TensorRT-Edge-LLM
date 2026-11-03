@@ -27,6 +27,7 @@
 #endif
 #ifdef CUTE_DSL_GDN_ENABLED
 #include "kernels/gdnKernels/gdnKernelUtils.cuh"
+#include "kernels/gdnKernels/gdnPrefillSequential.h"
 #endif
 
 #include "kernels/gdnKernels/gdnTreeChunkKernels.h"
@@ -85,6 +86,17 @@ bool requestGdnPdl()
     static bool const enabled = []() {
         char const* const value = std::getenv("EDGELLM_ENABLE_PDL");
         return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+//! Where the CuTe DSL sequential prefill would run, the register-resident CUDA kernel computes
+//! the same bits faster. EDGELLM_GDN_PREFILL_CUTEDSL=1 selects the CuTe DSL kernel again.
+bool cudaSequentialPrefillEnabled()
+{
+    static bool const enabled = []() {
+        char const* const value = std::getenv("EDGELLM_GDN_PREFILL_CUTEDSL");
+        return value == nullptr || std::strcmp(value, "1") != 0;
     }();
     return enabled;
 }
@@ -705,6 +717,36 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
             params.tensormap_scratch = workspace;
         }
 #endif
+    }
+
+    if (!mtpActive && CuteDslGDNRunner::selectBackend(params) == GDNBackend::kPrefill
+        && kernel::gdnPrefillSequentialSupported(h, hv, k_dim, v_dim) && cudaSequentialPrefillEnabled())
+    {
+        kernel::GdnPrefillSequentialParams sequential{};
+        sequential.q = params.q;
+        sequential.k = params.k;
+        sequential.v = params.v;
+        sequential.a = params.a;
+        sequential.b = params.b;
+        sequential.logA = params.A_log;
+        sequential.dtBias = params.dt_bias;
+        sequential.h0Source = params.h0_source;
+        sequential.stateIndices = params.state_indices;
+        sequential.contextLengths = params.context_lengths;
+        sequential.o = params.o;
+        sequential.n = n;
+        sequential.seqLen = seq_len;
+        sequential.h = h;
+        sequential.hv = hv;
+        sequential.kDim = k_dim;
+        sequential.vDim = v_dim;
+        cudaError_t const err = kernel::launchGdnPrefillSequential(sequential, stream);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("gated_delta_net: sequential prefill launch failed: %s", cudaGetErrorString(err));
+            return -1;
+        }
+        return 0;
     }
 
     CuteDslGDNRunner runner;

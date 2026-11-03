@@ -199,12 +199,15 @@ list(REMOVE_ITEM KERNELS_CU_SRCS ${PLUGIN_JIT_CU_SRCS})
 
 file(GLOB_RECURSE SAMPLER_CPP_SRCS "sampler/*.cpp")
 file(GLOB_RECURSE SAMPLER_CU_SRCS "sampler/*.cu")
-# RoPE cache initialization needs accurate pow/sin/cos and division. Keep fast
-# math on the other CUDA sources, including the per-token RoPE/KV write kernel.
+# RoPE cache initialization needs accurate pow/sin/cos and division, and the
+# sequential GDN prefill reproduces the CuTe DSL kernel's IEEE exp/log/division
+# without flush-to-zero. Keep fast math on the other CUDA sources, including the
+# per-token RoPE/KV write kernel.
 set(FAST_MATH_CU_SRCS ${COMMON_CU_SRCS} ${KERNELS_CU_SRCS}
                       ${PLUGIN_JIT_CU_SRCS} ${SAMPLER_CU_SRCS})
 list(REMOVE_ITEM FAST_MATH_CU_SRCS
-     "${CMAKE_CURRENT_SOURCE_DIR}/kernels/posEncoding/initializeCosSinCache.cu")
+     "${CMAKE_CURRENT_SOURCE_DIR}/kernels/posEncoding/initializeCosSinCache.cu"
+     "${CMAKE_CURRENT_SOURCE_DIR}/kernels/gdnKernels/gdnPrefillSequential.cu")
 set_property(
   SOURCE ${FAST_MATH_CU_SRCS}
   APPEND
