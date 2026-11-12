@@ -338,6 +338,10 @@ compiled maximum does the same.
 Adapters already processed into the engine directory are discovered
 automatically: each subdirectory of `<engine>/llm/lora_weights/` holding a
 `processed_adapter_model.safetensors` file registers under the directory name.
+Hidden entries (names starting with `.`) and plain files are ignored. Every
+visible subdirectory is loaded onto the GPU and gets its own decode CUDA graphs,
+so keep rollback or staging copies of an adapter outside `lora_weights/` (for
+example in a sibling `lora_rollback/` directory).
 Additional sidecars anywhere on disk can be named explicitly with the
 repeatable `--lora-adapter NAME=PATH` flag:
 
