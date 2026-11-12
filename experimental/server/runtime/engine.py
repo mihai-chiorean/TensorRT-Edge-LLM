@@ -121,6 +121,8 @@ class SamplingParams:
     skip_special_tokens: bool = True
     reuse_context: bool = True
     cache_generated_tokens: bool = True
+    # Adapter selector resolved by the serving layer; "" is the base model.
+    lora_name: str = ""
 
     def __post_init__(self) -> None:
         self.top_p, self.top_k = normalize_greedy_sampling(
@@ -969,6 +971,118 @@ def _engine_config_value(builder_config: dict, field_name: str,
     return engine_value
 
 
+@dataclass(frozen=True)
+class LoraAdapter:
+    """One adapter registered for this deployment.
+
+    ``provenance`` carries the ``edgellm_lora_processing`` record from the
+    adapter's ``config.json`` (None when the sidecar has none, e.g. an
+    externally produced safetensors file).
+    """
+
+    name: str
+    path: str
+    rank: Optional[int] = None
+    provenance: Optional[Dict[str, Any]] = None
+
+
+_LORA_WEIGHTS_DIR = "lora_weights"
+_LORA_WEIGHTS_FILE = "processed_adapter_model.safetensors"
+
+
+def _discover_lora_adapters(engine_dir: str) -> List[LoraAdapter]:
+    """Discover processed adapters under ``<engine_dir>/lora_weights/``.
+
+    Each subdirectory holds one adapter: its name is the directory name and
+    its weights the ``processed_adapter_model.safetensors`` written by
+    ``tensorrt-edgellm-process-lora``. Names are filesystem names, so they
+    are re-validated against the same pattern the CLI enforces.
+    """
+    weights_dir = os.path.join(engine_dir, _LORA_WEIGHTS_DIR)
+    if not os.path.isdir(weights_dir):
+        return []
+    adapters = []
+    for entry in sorted(os.listdir(weights_dir)):
+        path = os.path.join(weights_dir, entry, _LORA_WEIGHTS_FILE)
+        if not entry or not os.path.isfile(path):
+            continue
+        try:
+            from ..config import _validate_lora_adapter_name
+
+            _validate_lora_adapter_name(entry, flag="lora_weights directory")
+        except (ImportError, ValueError):
+            continue
+        adapters.append(LoraAdapter(name=entry, path=path))
+    return adapters
+
+
+def _read_lora_provenance(adapter: LoraAdapter) -> LoraAdapter:
+    """Fill rank/provenance from the adapter config.json when present."""
+    config_path = os.path.join(os.path.dirname(adapter.path), "config.json")
+    try:
+        config = _read_json(config_path)
+    except (OSError, ValueError):
+        return adapter
+    if not isinstance(config, dict):
+        return adapter
+    provenance = config.get("edgellm_lora_processing")
+    rank = provenance.get("rank") if isinstance(provenance, dict) else None
+    return replace(
+        adapter,
+        rank=int(rank)
+        if isinstance(rank, int) and not isinstance(rank, bool) else None,
+        provenance=provenance if isinstance(provenance, dict) else None,
+    )
+
+
+def _resolve_lora_adapters(
+        engine_dir: str,
+        configured: Optional[List[Any]] = None) -> List[LoraAdapter]:
+    """Merge configured and discovered adapters and validate the set.
+
+    The engine's ``builder_config.max_lora_rank`` gates everything: adapters
+    on an engine without LoRA support (rank 0) refuse at startup, and any
+    adapter whose recorded rank exceeds the engine's compiled maximum does
+    the same. A configured name colliding with a discovered one is a
+    configuration error rather than a silent override.
+    """
+    adapters: Dict[str, LoraAdapter] = {}
+    for adapter in _discover_lora_adapters(engine_dir):
+        adapters[adapter.name] = adapter
+    for raw in configured or ():
+        name = getattr(raw, "name", None)
+        path = getattr(raw, "path", None)
+        if not name or not path:
+            continue
+        if name in adapters:
+            raise ValueError(
+                f"--lora-adapter name {name!r} collides with an adapter "
+                f"discovered in {engine_dir!r}/{_LORA_WEIGHTS_DIR}")
+        adapters[name] = LoraAdapter(name=name, path=path)
+    adapters = {
+        name: _read_lora_provenance(adapter)
+        for name, adapter in adapters.items()
+    }
+    if not adapters:
+        return []
+    builder_config = _read_bundle_builder_config(engine_dir)
+    max_lora_rank = int(builder_config.get("max_lora_rank", 0))
+    if max_lora_rank <= 0:
+        raise ValueError(
+            f"LoRA adapters are configured or discovered in "
+            f"{engine_dir!r}/{_LORA_WEIGHTS_DIR}, but the engine was built "
+            "with max_lora_rank=0. Rebuild with a positive --max-lora-rank "
+            "to serve adapters.")
+    over_rank = sorted(
+        name for name, adapter in adapters.items()
+        if adapter.rank is not None and adapter.rank > max_lora_rank)
+    if over_rank:
+        raise ValueError(
+            f"adapter rank exceeds the engine's max_lora_rank={max_lora_rank}"
+            f": {', '.join(over_rank)}")
+    return [adapters[name] for name in sorted(adapters)]
+
+
 # ---------------------------------------------------------------------------
 # LLM class
 # ---------------------------------------------------------------------------
@@ -1009,6 +1123,7 @@ class LLM:
         enable_in_flight_batching: bool = False,
         host_embedding_tables: bool = False,
         host_ple_table: bool = False,
+        lora_adapters: Optional[List[Any]] = None,
         on_progress: Optional[Callable[[str], None]] = None,
     ):
         if not model:
@@ -1048,6 +1163,7 @@ class LLM:
                 "memory; pass only one of it and host_ple_table")
         self._host_embedding_tables = host_embedding_tables
         self._host_ple_table = host_ple_table
+        self._configured_lora_adapters = list(lora_adapters or ())
         self._admission_sem = threading.Semaphore(1)
         self._infer_lock = threading.Lock()
         self._close_lock = threading.Lock()
@@ -1145,6 +1261,15 @@ class LLM:
         self._verify_tree_size = runtime_options.verify_size
         self._dflash_block_size = runtime_options.dflash_block_size
         self._init_from_bundle(prepared.bundle_dir)
+        self._lora_adapters = _resolve_lora_adapters(
+            self._engine_dir, self._configured_lora_adapters)
+        if self._lora_adapters:
+            logger.info(
+                "LoRA adapters registered (%d): %s (engine max_lora_rank=%d)",
+                len(self._lora_adapters),
+                ", ".join(adapter.name for adapter in self._lora_adapters),
+                self._max_lora_rank,
+            )
 
         if on_progress is not None:
             on_progress("Loading runtime and capturing CUDA graphs")
@@ -1176,6 +1301,7 @@ class LLM:
         self._max_kv_cache_capacity = _engine_config_value(
             builder_config, "max_kv_cache_capacity",
             self._max_kv_cache_capacity)
+        self._max_lora_rank = int(builder_config.get("max_lora_rank", 0))
 
         self._media_dir = self._layout.media_dir
         logger.info("Using engine bundle: %s", self._bundle_dir)
@@ -1202,6 +1328,10 @@ class LLM:
         residency = {"host_embedding_tables": host_embedding_tables}
         if host_ple_table:
             residency["host_ple_table"] = True
+        lora_weights_map = {
+            adapter.name: adapter.path
+            for adapter in getattr(self, "_lora_adapters", ())
+        }
         if self._layout.engine_type == EngineType.SPEC_DECODE:
             logger.info(
                 "Speculative decoding enabled (top_k=%d, step=%d, "
@@ -1214,7 +1344,7 @@ class LLM:
             self._runtime = self._rt.LLMRuntime(
                 self._engine_dir,
                 self._media_dir,
-                {},
+                lora_weights_map,
                 self._draft_top_k,
                 self._draft_step,
                 self._verify_tree_size,
@@ -1235,7 +1365,7 @@ class LLM:
                 self._engine = self._rt.RequestEngine(
                     self._engine_dir,
                     self._media_dir,
-                    {},
+                    lora_weights_map,
                     self._checkpoint_dir,
                     context_cache_config,
                     max_batch_size=self._max_batch_size,
@@ -1266,7 +1396,7 @@ class LLM:
             self._runtime = self._rt.LLMRuntime(
                 self._engine_dir,
                 self._media_dir,
-                {},
+                lora_weights_map,
                 self._checkpoint_dir,
                 context_cache_config,
                 **residency,
@@ -1521,6 +1651,13 @@ class LLM:
             self._rt, tool_config)
         request.parallel_tool_calls = tool_config.parallel_tool_calls
         request.disable_spec_decode = params.disable_spec_decode
+        # Under in-flight batching the engine refuses any request carrying a
+        # LoRA selector, so refuse at build time with a 400-class reason
+        # instead of surfacing the engine's throw as a 500.
+        if params.lora_name and getattr(self, "_engine", None) is not None:
+            raise ValueError(
+                "LoRA adapters are not supported under in-flight batching")
+        request.lora_weights_name = params.lora_name or ""
         if getattr(self, "_spec_decode_type", "") == "gemma4_mtp":
             self._apply_gemma4_mtp_request_limits(request, params)
         request.skip_special_tokens = params.skip_special_tokens
@@ -2342,6 +2479,45 @@ class LLM:
         """Whether this runtime reuses matching text prefixes."""
         return self._context_cache_config.enabled
 
+    @property
+    def max_lora_rank(self) -> int:
+        """Compiled LoRA rank bound of the engine (0 when LoRA is absent)."""
+        return self._max_lora_rank
+
+    @property
+    def lora_adapters(self) -> Tuple[LoraAdapter, ...]:
+        """Adapters registered for this deployment, sorted by name."""
+        return tuple(self._lora_adapters)
+
+    def lora_names(self) -> List[str]:
+        """Registered adapter names, sorted."""
+        return [adapter.name for adapter in self._lora_adapters]
+
+    def lora_adapter_info(self) -> List[Dict[str, Any]]:
+        """Per-adapter health report: rank and binding coverage.
+
+        Counts come from the ``edgellm_lora_processing`` record; a record is
+        optional, so absent fields report ``None`` rather than a guess.
+        """
+        report = []
+        for adapter in self._lora_adapters:
+            provenance = adapter.provenance or {}
+            bound = provenance.get("bound_modules")
+            unbound = provenance.get("unbound_untargeted_bindings")
+            report.append({
+                "name":
+                adapter.name,
+                "rank":
+                adapter.rank,
+                "bound_modules":
+                len(bound) if isinstance(bound, list) else None,
+                "unbound_untargeted_bindings":
+                len(unbound) if isinstance(unbound, list) else None,
+                "processed":
+                provenance is not None,
+            })
+        return report
+
     def get_scheduling_metrics(self):
         """Engine scheduling counters as a dict, or ``None`` on the blocking path."""
         engine = getattr(self, "_engine", None)
@@ -2623,6 +2799,9 @@ def load_model(**kwargs):
                 or kwargs.pop("host_ple_table", False)):
             raise ValueError(
                 "standalone TTS models have no embedding sidecar tables")
+        if kwargs.pop("lora_adapters", None):
+            raise ValueError(
+                "standalone TTS models do not serve LoRA adapters")
         if kwargs.pop("enable_in_flight_batching", False):
             raise _ifb_unsupported_error(
                 ifb_unsupported_reason(None, model_type=model_type))

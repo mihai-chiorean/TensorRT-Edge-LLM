@@ -17,18 +17,34 @@
 import argparse
 import json
 import math
+import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, Optional, Sequence, Union
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 from .runtime.engine_layout import is_prebuilt_engine_tree
 
 _INT32_MAX = 2**31 - 1
 _INT64_MAX = 2**63 - 1
 _DEFAULT_ENCODER_EMBEDDING_CACHE_BUDGET_BYTES = 256 * 1024 * 1024
+_LORA_ADAPTER_NAME_RE = re.compile(r"[A-Za-z0-9_.-]+")
 
 
 class ServerConfigError(ValueError):
     """Raised when a launch option cannot be honored by Edge-LLM."""
+
+
+def _validate_lora_adapter_name(name: str,
+                                flag: str = "--lora-adapter") -> str:
+    """Check an adapter name is accepted by the CLI and the HTTP selector.
+
+    The name becomes a request-level `model`/`lora_name` alias, so it must
+    stay a simple token; anything else would make the ``<served>:<adapter>``
+    selector ambiguous.
+    """
+    if not name or not _LORA_ADAPTER_NAME_RE.fullmatch(name):
+        raise ServerConfigError(
+            f"{flag} name {name!r} must match [A-Za-z0-9_.-]+")
+    return name
 
 
 @dataclass(frozen=True)
@@ -200,6 +216,28 @@ class ContextCacheConfig:
 
 
 @dataclass(frozen=True)
+class LoraAdapterConfig:
+    """One named LoRA adapter sidecar served alongside the base engine."""
+
+    name: str
+    path: str
+
+
+def _parse_lora_adapter(value: str) -> LoraAdapterConfig:
+    """Parse one ``--lora-adapter NAME=PATH`` argument."""
+    name, sep, path = value.partition("=")
+    if not sep or not name or not path:
+        raise argparse.ArgumentTypeError(
+            "must be NAME=PATH, e.g. --lora-adapter french=/adapters/fr.safetensors"
+        )
+    try:
+        _validate_lora_adapter_name(name)
+    except ServerConfigError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return LoraAdapterConfig(name=name, path=path)
+
+
+@dataclass(frozen=True)
 class ModelConfig:
     """Checkpoint, build-cache, and runtime-profile options."""
 
@@ -223,6 +261,7 @@ class ModelConfig:
     enable_in_flight_batching: bool = False
     host_embedding_tables: bool = False
     host_ple_table: bool = False
+    lora_adapters: Tuple[LoraAdapterConfig, ...] = ()
 
     def __post_init__(self) -> None:
         if self.host_embedding_tables and self.host_ple_table:
@@ -234,6 +273,14 @@ class ModelConfig:
                 or self.engine_cache_max_size_gb <= 0):
             raise ServerConfigError(
                 "engine_cache_max_size_gb must be positive")
+        seen = set()
+        for adapter in self.lora_adapters:
+            _validate_lora_adapter_name(adapter.name)
+            if adapter.name in seen:
+                raise ServerConfigError(
+                    f"--lora-adapter name {adapter.name!r} was given more "
+                    "than once")
+            seen.add(adapter.name)
 
     def llm_kwargs(self) -> Dict[str, Any]:
         return {
@@ -256,6 +303,7 @@ class ModelConfig:
             "enable_in_flight_batching": self.enable_in_flight_batching,
             "host_embedding_tables": self.host_embedding_tables,
             "host_ple_table": self.host_ple_table,
+            "lora_adapters": list(self.lora_adapters),
         }
 
 
@@ -501,6 +549,18 @@ def create_argument_parser(
         "--host-embedding-tables.",
     )
     model.add_argument(
+        "--lora-adapter",
+        action="append",
+        type=_parse_lora_adapter,
+        default=None,
+        metavar="NAME=PATH",
+        help="Serve a processed LoRA adapter sidecar under NAME, e.g. "
+        "--lora-adapter french=/adapters/fr.safetensors. Repeatable. "
+        "Adapters already in <engine>/llm/lora_weights/ are discovered "
+        "automatically; names must match [A-Za-z0-9_.-]+ and adapters are "
+        "selectable per request through the model name or lora_name.",
+    )
+    model.add_argument(
         "--context-cache-max-records",
         type=_non_negative_int,
         default=1024,
@@ -597,6 +657,7 @@ def parse_server_config(argv: Optional[Sequence[str]] = None,
         enable_in_flight_batching=args.enable_in_flight_batching,
         host_embedding_tables=args.host_embedding_tables,
         host_ple_table=args.host_ple_table,
+        lora_adapters=tuple(args.lora_adapter or ()),
     )
     api = ApiConfig(
         host=args.host,

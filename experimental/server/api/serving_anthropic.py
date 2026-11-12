@@ -247,7 +247,7 @@ class AnthropicServingMessages:
                     finish_reason = delta.finish_reason or "stop"
                 if not started:
                     for chunk in protocol.message_start_events(
-                            prepared.message_id, self._client.model_name,
+                            prepared.message_id, prepared.chat.served_model,
                             prompt_tokens):
                         yield chunk
                     started = True
@@ -282,9 +282,9 @@ class AnthropicServingMessages:
                 await native_stream.aclose()
 
         if not started:
-            for chunk in protocol.message_start_events(prepared.message_id,
-                                                       self._client.model_name,
-                                                       prompt_tokens):
+            for chunk in protocol.message_start_events(
+                    prepared.message_id, prepared.chat.served_model,
+                    prompt_tokens):
                 yield chunk
         try:
             flushed = list(parser.flush())
