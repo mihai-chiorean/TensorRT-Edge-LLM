@@ -20,9 +20,11 @@
 #include "common/tensor.h"
 #include "runtime/exec/tensorMap.h"
 
+#include <NvInferRuntime.h>
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -45,6 +47,11 @@ class EngineExecutor;
 //! Switching adapters is O(1) — no GPU copies are required because the
 //! TensorRT engine binds directly to the stored tensor pointers.
 //!
+//! Adapters are registered at startup, before the engine bindings are known,
+//! and stay immutable for the runtime's lifetime: there is no supported
+//! hot load/unload lifecycle, because the context cache and the captured CUDA
+//! graphs are keyed by adapter name.
+//!
 //! Usage:
 //!   1. `loadWeights()` or `addWeights()` to register adapter(s).
 //!   2. `switchWeights(name)` to activate an adapter.
@@ -53,8 +60,9 @@ class EngineExecutor;
 class LoRAManager
 {
 public:
-    //! @brief Default constructor
-    LoRAManager() = default;
+    //! @brief Construct with the engine's maximum supported LoRA rank.
+    //! @param maxSupportedLoraRank The engine's `max_lora_rank` build setting.
+    explicit LoRAManager(int32_t maxSupportedLoraRank) noexcept;
 
     //! Deleted copy to prevent accidental duplication of GPU resources.
     LoRAManager(LoRAManager const&) = delete;
@@ -67,12 +75,14 @@ public:
     //! Load LoRA adapter weights from a safetensors file.
     //!
     //! Each tensor in the safetensors file is stored under its tensor name
-    //! as the binding name.
+    //! as the binding name. The adapter metadata is validated from the file
+    //! mapping before any adapter GPU memory is allocated.
     //!
     //! @param name     Adapter name (user-facing identifier).
     //! @param path     Path to the `.safetensors` file.
     //! @param stream   CUDA stream for async loading.
-    //! @throws std::runtime_error if file cannot be read or format is invalid.
+    //! @throws std::runtime_error if file cannot be read, format is invalid, or
+    //!   an adapter tensor violates the adapter contract.
     void loadWeights(std::string const& name, std::filesystem::path const& path, cudaStream_t stream);
 
     //! Register adapter weights directly (useful for unit testing without I/O).
@@ -128,11 +138,17 @@ public:
     //! is constructed so that `refreshTensorMap()` knows which names to
     //! populate.
     //!
+    //! After the bindings are recorded, every registered adapter is checked
+    //! against them (before any CUDA-graph capture): each adapter tensor must
+    //! name an engine LoRA binding, its non-rank dimensions must equal the
+    //! binding's, and its rank must fit the binding's max rank dimension.
+    //!
     //! Encapsulates the LoRA binding-shape convention:
     //!   - `lora_A_*` weights have shape [k, rank]; dummy sets last dim to 1.
     //!   - `lora_B_*` weights have shape [rank, n]; dummy sets first dim to 1.
     //!
     //! @param runner Source of the engine I/O list and per-binding max shapes.
+    //! @throws std::runtime_error when a registered adapter cannot bind.
     void initializeEngineBindings(EngineExecutor const& runner);
 
     //! Refresh all LoRA entries in the given TensorMap.
@@ -140,6 +156,11 @@ public:
     //! For each registered engine binding name, either the active adapter's
     //! weight tensor or the per-binding dummy tensor is written into @p map.
     //! Must be called after every `switchWeights()` / `resetWeights()`.
+    //!
+    //! When an adapter is active but leaves engine bindings on the rank-1
+    //! dummy (the fused-QKV naming case), a warning naming the adapter, the
+    //! unbound count, and up to three sample bindings is logged once per
+    //! adapter — on the first refresh that sees it active.
     //!
     //! @param map  TensorMap to update with the current LoRA bindings.
     void refreshTensorMap(TensorMap& map);
@@ -162,6 +183,19 @@ private:
 
     //! Per-binding dummy tensors (correct engine shape, zero-filled).
     std::map<std::string, rt::Tensor> mEngineDummyTensors{};
+
+    //! Per-binding max profile shapes from the engine; the shapes registered
+    //! adapters are validated against (the dummies carry rank=1 in the rank
+    //! dimension and cannot serve as the ceiling).
+    std::map<std::string, nvinfer1::Dims> mEngineMaxBindingShapes{};
+
+    //! The engine's `max_lora_rank` build setting; the rank ceiling every
+    //! registered adapter is validated against.
+    int32_t mMaxSupportedLoraRank{0};
+
+    //! Adapters whose unbound bindings have already been reported by
+    //! `refreshTensorMap`, so each adapter is warned about at most once.
+    std::set<std::string> mWarnedUnboundAdapters{};
 };
 
 } // namespace rt
