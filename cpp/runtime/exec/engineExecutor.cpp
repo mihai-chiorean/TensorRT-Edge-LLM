@@ -390,11 +390,12 @@ bool TrtEngineExecutor::prepare(
     ContextBindingTarget target(*mContext);
     if (!mMapBindingCache.apply(map, target))
     {
+        char const* failed = mMapBindingCache.lastFailedBinding();
         LOG_ERROR(
-            "engine binding is neither registry-bound nor present in the TensorMap, or a setter failed for "
-            "profile %d; every engine I/O tensor must be handled by the registry, by LoRAManager, or by an "
-            "explicit TensorMap entry",
-            profileIndex);
+            "engine binding %s is missing from the TensorMap or its setter failed (profile %d); every engine "
+            "I/O tensor must be handled by the registry, by LoRAManager, or by an explicit TensorMap entry. "
+            "Most likely the runtime is missing a binding for a model variant.",
+            failed != nullptr ? failed : "?", profileIndex);
         return false;
     }
 

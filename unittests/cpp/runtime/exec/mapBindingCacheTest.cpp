@@ -199,6 +199,8 @@ TEST(MapBindingCacheTest, MissingTensorFails)
     TensorMap partial;
     partial.set(Fixture::kIn0, f.in0);
     EXPECT_FALSE(f.cache.apply(partial, f.target));
+    ASSERT_NE(f.cache.lastFailedBinding(), nullptr);
+    EXPECT_EQ(std::string(f.cache.lastFailedBinding()), Fixture::kIn1);
 }
 
 TEST(MapBindingCacheTest, FailedAddressSetterFailsAndRetriesNextApply)

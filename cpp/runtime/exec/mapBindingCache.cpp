@@ -50,12 +50,14 @@ void MapBindingCache::invalidateAll()
 
 bool MapBindingCache::apply(TensorMap const& map, BindingTarget& target)
 {
+    mLastFailedBinding = nullptr;
     for (auto& binding : mMapBindings)
     {
         char const* name = binding.name;
         Tensor* tensor = map.get(name);
         if (tensor == nullptr)
         {
+            mLastFailedBinding = name;
             return false;
         }
         auto const address = reinterpret_cast<uintptr_t>(tensor->rawPointer());
@@ -67,10 +69,12 @@ bool MapBindingCache::apply(TensorMap const& map, BindingTarget& target)
         binding.valid = false;
         if (!target.setTensorAddress(name, tensor->rawPointer()))
         {
+            mLastFailedBinding = name;
             return false;
         }
         if (binding.isInput && !target.setInputShape(name, dims))
         {
+            mLastFailedBinding = name;
             return false;
         }
         binding.address = address;

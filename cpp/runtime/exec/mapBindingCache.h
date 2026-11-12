@@ -115,7 +115,14 @@ public:
      */
     std::optional<std::pair<uintptr_t, nvinfer1::Dims>> cached(int32_t ioIndex) const;
 
+    //! @brief Name of the binding that made the last apply() fail, or nullptr after a successful apply().
+    char const* lastFailedBinding() const noexcept
+    {
+        return mLastFailedBinding;
+    }
+
 private:
+    char const* mLastFailedBinding{nullptr};
     std::vector<MapBinding> mMapBindings;
     //! Per I/O index: position in mMapBindings, or -1 for a registry-bound tensor.
     std::vector<int32_t> mMapBindingIndex;
