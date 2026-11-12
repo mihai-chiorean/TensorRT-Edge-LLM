@@ -56,6 +56,13 @@ class PreparedChatRequest:
     # Whether the rendered prompt leaves generation inside a reasoning span;
     # None keeps each response path's default.
     reasoning_open: Optional[bool] = None
+    # Model name echoed in responses: the adapter-qualified name when the
+    # request selected a LoRA adapter, the served name for the base model.
+    response_model: Optional[str] = None
+
+    @property
+    def served_model(self) -> str:
+        return self.response_model or ""
 
 
 def _entry_to_openai(entry) -> Dict[str, Any]:
@@ -166,15 +173,62 @@ class OpenAIServingChat:
             raise InvalidRequestError(reason, param=param)
         return resolved
 
+    def _resolve_lora_selection(self, request: ChatCompletionRequest,
+                                client) -> str:
+        """Resolve the request's adapter selector to an adapter name or "".
+
+        Both spellings are accepted: ``model: "<served>:<adapter>"`` and
+        ``lora_name: "<adapter>"``. ``model`` equal to the bare served name
+        (or absent) names the base model unless ``lora_name`` selects an
+        adapter — OpenAI clients always send ``model``, so it cannot veto
+        ``lora_name``. When ``model`` is adapter-qualified and ``lora_name``
+        is present and different — including ``lora_name: ""`` naming the
+        base — the request is refused rather than silently picking one.
+        """
+        served = self._client.model_name
+        known = self._client.llm.lora_names() if hasattr(
+            self._client.llm, "lora_names") else []
+        model = request.model or ""
+        model_adapter = ""
+        if model and model != served:
+            base, sep, suffix = model.rpartition(":")
+            if sep and base == served and suffix:
+                model_adapter = suffix
+            else:
+                raise ModelNotFoundError(
+                    f"model {model!r} is not served by this process")
+        lora_name = request.lora_name
+        lora_requested = lora_name is not None
+        lora_name = lora_name or ""
+        if lora_requested and model_adapter and lora_name != model_adapter:
+            raise InvalidRequestError(
+                f"model {model!r} selects adapter {model_adapter!r} but "
+                f"lora_name selects "
+                f"{'the base model' if not lora_name else lora_name!r}; "
+                "they must agree",
+                param="lora_name")
+        adapter = lora_name or model_adapter
+        if not adapter:
+            return ""
+        if not known:
+            raise InvalidRequestError(
+                f"no LoRA adapters are loaded on this deployment; "
+                f"lora_name={adapter!r} cannot be served",
+                param="lora_name")
+        if adapter not in known:
+            raise InvalidRequestError(
+                f"unknown LoRA adapter {adapter!r}; available: " +
+                ", ".join(known),
+                param="lora_name")
+        return adapter
+
     def prepare_request(self,
                         request: ChatCompletionRequest) -> PreparedChatRequest:
         capabilities = self._client.capabilities
         if not capabilities.chat:
             raise UnsupportedFeatureError(
                 "this runtime only supports /v1/audio/speech")
-        if request.model and request.model != self._client.model_name:
-            raise ModelNotFoundError(
-                f"model {request.model!r} is not served by this process")
+        adapter = self._resolve_lora_selection(request, self._client)
         from ..media.media_source import (enforce_local_media_policy,
                                           message_media_modalities)
 
@@ -296,9 +350,17 @@ class OpenAIServingChat:
                                  and not tool_config.parse_output),
             reuse_context=request.reuse_context,
             cache_generated_tokens=request.cache_generated_tokens,
+            lora_name=adapter,
         )
-        return PreparedChatRequest(sampling, tool_config, reasoning_parser,
-                                   audio_params, reasoning_open)
+        return PreparedChatRequest(
+            sampling,
+            tool_config,
+            reasoning_parser,
+            audio_params,
+            reasoning_open,
+            response_model=(f"{self._client.model_name}:{adapter}"
+                            if adapter else self._client.model_name),
+        )
 
     def parse_output(self, text: str, prepared: PreparedChatRequest):
         return parse_assistant_output(
@@ -380,7 +442,7 @@ class OpenAIServingChat:
                 request.top_logprobs is not None,
             )
         return ChatCompletionResponse(
-            model=self._client.model_name,
+            model=prepared.served_model,
             choices=[
                 ChatCompletionChoice(
                     message=message,
@@ -436,7 +498,7 @@ class OpenAIServingChat:
         )
         return ChatCompletionResponse(
             id=response_id,
-            model=self._client.model_name,
+            model=prepared.served_model,
             choices=[
                 ChatCompletionChoice(message=message,
                                      finish_reason=finish_reason)
@@ -479,11 +541,15 @@ class OpenAIServingChat:
         prepared = prepared or self.prepare_request(request)
         response_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
+        model = prepared.served_model
         include_usage = bool(request.stream_options
                              and request.stream_options.include_usage)
         prompt_tokens = None
 
-        yield self._chunk(response_id, created, DeltaMessage(role="assistant"))
+        yield self._chunk(response_id,
+                          created,
+                          DeltaMessage(role="assistant"),
+                          model=model)
         if prepared.audio_params is not None:
             async for chunk in self._stream_audio(request, prepared,
                                                   response_id, created,
@@ -530,26 +596,25 @@ class OpenAIServingChat:
                                 } if parsed.field == "reasoning" else {
                                     "content": parsed.text
                                 }))
-                            yield self._chunk(
-                                response_id,
-                                created,
-                                message,
-                                logprobs=logprobs,
-                            )
+                            yield self._chunk(response_id,
+                                              created,
+                                              message,
+                                              model=model,
+                                              logprobs=logprobs)
                             logprobs = None
                     else:
-                        yield self._chunk(
-                            response_id,
-                            created,
-                            DeltaMessage(content=text),
-                            logprobs=logprobs,
-                        )
+                        yield self._chunk(response_id,
+                                          created,
+                                          DeltaMessage(content=text),
+                                          model=model,
+                                          logprobs=logprobs)
                         logprobs = None
                 if logprobs is not None:
                     # The parser may withhold this token's bytes.
                     yield self._chunk(response_id,
                                       created,
                                       DeltaMessage(),
+                                      model=model,
                                       logprobs=logprobs)
                 if delta.finished:
                     finish_reason = delta.finish_reason or "stop"
@@ -574,16 +639,20 @@ class OpenAIServingChat:
                 } if parsed.field == "reasoning" else {
                     "content": parsed.text
                 })
-                yield self._chunk(response_id, created, DeltaMessage(**delta))
+                yield self._chunk(response_id,
+                                  created,
+                                  DeltaMessage(**delta),
+                                  model=model)
         yield self._chunk(response_id,
                           created,
                           DeltaMessage(),
+                          model=model,
                           finish_reason=finish_reason)
         if include_usage:
             usage_chunk = ChatCompletionStreamResponse(
                 id=response_id,
                 created=created,
-                model=self._client.model_name,
+                model=model,
                 choices=[],
                 usage=_usage(prompt_tokens, completion_tokens),
             )
@@ -604,6 +673,7 @@ class OpenAIServingChat:
         prompt_tokens = None
         finish_reason = "stop"
         audio_id = f"audio-{response_id}"
+        model = prepared.served_model
         stripper = self.stream_stripper(prepared)
         try:
             async for delta in self._client.stream_with_audio(
@@ -626,10 +696,12 @@ class OpenAIServingChat:
                                 response_id,
                                 created,
                                 DeltaMessage(**{field: parsed.text}),
-                            )
+                                model=model)
                     else:
-                        yield self._chunk(response_id, created,
-                                          DeltaMessage(content=text))
+                        yield self._chunk(response_id,
+                                          created,
+                                          DeltaMessage(content=text),
+                                          model=model)
                 if delta.audio_bytes:
                     yield self._chunk(
                         response_id,
@@ -645,6 +717,7 @@ class OpenAIServingChat:
                                 "sample_rate":
                                 OMNI_AUDIO_SAMPLE_RATE,
                             }),
+                        model=model,
                     )
                 if delta.finished:
                     finish_reason = delta.finish_reason or "stop"
@@ -659,18 +732,21 @@ class OpenAIServingChat:
             for parsed in stream_parser.flush():
                 field = ("reasoning_content"
                          if parsed.field == "reasoning" else "content")
-                yield self._chunk(response_id, created,
-                                  DeltaMessage(**{field: parsed.text}))
+                yield self._chunk(response_id,
+                                  created,
+                                  DeltaMessage(**{field: parsed.text}),
+                                  model=model)
         yield self._chunk(response_id,
                           created,
                           DeltaMessage(),
+                          model=model,
                           finish_reason=finish_reason)
         if include_usage:
             yield _sse(
                 ChatCompletionStreamResponse(
                     id=response_id,
                     created=created,
-                    model=self._client.model_name,
+                    model=model,
                     choices=[],
                     usage=_usage(prompt_tokens, completion_tokens),
                 ))
@@ -694,6 +770,7 @@ class OpenAIServingChat:
         reasoning_first = (reasoning is not None
                            and reasoning.precedes_tool_calls)
         stripper = self.stream_stripper(prepared)
+        model = prepared.served_model
         completion_tokens = 0
         prompt_tokens = None
         finish_reason = "stop"
@@ -765,6 +842,7 @@ class OpenAIServingChat:
                         yield self._chunk(response_id,
                                           created,
                                           message,
+                                          model=model,
                                           logprobs=logprobs)
                         logprobs = None
                 if logprobs is not None:
@@ -773,6 +851,7 @@ class OpenAIServingChat:
                     yield self._chunk(response_id,
                                       created,
                                       DeltaMessage(),
+                                      model=model,
                                       logprobs=logprobs)
                 if delta.finished:
                     finish_reason = delta.finish_reason or "stop"
@@ -812,25 +891,28 @@ class OpenAIServingChat:
                 yield chunk
             return
         for message in flushed:
-            yield self._chunk(response_id, created, message)
+            yield self._chunk(response_id, created, message, model=model)
         if reasoning_stream is not None and not reasoning_first:
             for parsed in reasoning_stream.flush():
                 field = ("reasoning_content"
                          if parsed.field == "reasoning" else "content")
-                yield self._chunk(response_id, created,
-                                  DeltaMessage(**{field: parsed.text}))
+                yield self._chunk(response_id,
+                                  created,
+                                  DeltaMessage(**{field: parsed.text}),
+                                  model=model)
 
         if tool_heads and finish_reason == "stop":
             finish_reason = "tool_calls"
         yield self._chunk(response_id,
                           created,
                           DeltaMessage(),
+                          model=model,
                           finish_reason=finish_reason)
         if include_usage:
             usage_chunk = ChatCompletionStreamResponse(
                 id=response_id,
                 created=created,
-                model=self._client.model_name,
+                model=model,
                 choices=[],
                 usage=_usage(prompt_tokens, completion_tokens),
             )
@@ -872,13 +954,14 @@ class OpenAIServingChat:
         created: int,
         delta: DeltaMessage,
         *,
+        model: Optional[str] = None,
         finish_reason: Optional[str] = None,
         logprobs: Optional[Dict[str, Any]] = None,
     ) -> str:
         response = ChatCompletionStreamResponse(
             id=response_id,
             created=created,
-            model=self._client.model_name,
+            model=model or self._client.model_name,
             choices=[
                 ChatCompletionStreamChoice(
                     delta=delta,

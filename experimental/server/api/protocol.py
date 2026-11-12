@@ -93,6 +93,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     disable_spec_decode: bool = False
     reuse_context: StrictBool = True
     cache_generated_tokens: StrictBool = True
+    # LoRA adapter selector for deployments serving adapters. The model
+    # name's ``<served>:<adapter>`` form is the other spelling; both may be
+    # sent, but they must name the same adapter (or the base model).
+    lora_name: Optional[str] = None
 
     @field_validator("stop")
     @classmethod

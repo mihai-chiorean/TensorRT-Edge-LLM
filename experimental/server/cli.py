@@ -40,15 +40,17 @@ def main(argv=None, *, prog="tensorrt-edgellm-serve") -> None:
     except TensorRTDependencyError as exc:
         raise SystemExit(f"TensorRT prerequisite error: {exc}") from exc
     client = EngineClient(llm, config.api)
+    lora_adapters = getattr(getattr(client, "llm", None), "lora_adapters", ())
     logging.getLogger("edgellm.server").info(
         "Loaded model=%s max_model_len=%s kv_cache_dtype=%s "
-        "speculative_decoding=%s context_reuse=%s "
+        "speculative_decoding=%s context_reuse=%s lora_adapters=%s "
         "encoder_embedding_cache_budget_bytes=%d",
         client.model_name,
         client.capabilities.max_model_len,
         client.capabilities.kv_cache_dtype,
         client.capabilities.speculative_decoding,
         client.capabilities.context_reuse,
+        len(tuple(lora_adapters)),
         config.model.context_cache_config.encoder_embedding_cache_budget_bytes,
     )
     run_http_server(client, config.api)
