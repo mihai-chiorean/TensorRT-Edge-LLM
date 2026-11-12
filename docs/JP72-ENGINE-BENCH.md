@@ -274,6 +274,40 @@ an identical base request matched the reuse-off adapter result exactly, so it
 did not reuse the base prefix (the cache key includes the adapter name). The runtime captures one decode graph per
 adapter plus one for base at start.
 
+### Through the server (2026-11-12)
+
+The same rank-16 engine, with the processed adapter placed at
+`llm/lora_weights/tool/`, served by `experimental.server` from fork `main`
+`cf8d968` (`--enable-context-reuse --enable-auto-tool-choice
+--served-model-name gemma`). The adapter is discovered without flags.
+`/v1/models` lists `gemma` and `gemma:tool`, and `/health` reports
+`max_lora_rank 16` and, for `tool`, rank 16, 258 bound modules and 85
+unbound bindings.
+
+Six tool prompts (three tools declared, temperature 0) were sent as base,
+`model: "gemma:tool"`, `model: "gemma"` + `lora_name: "tool"`, then base
+again. Both selector spellings gave identical output and echoed `gemma:tool`,
+and the second base run repeated the first.
+
+| Prompt | base | adapter |
+|---|---|---|
+| "Turn the volume down to 20 please." | `set_volume{level: 20}` | same |
+| "Can you look to your left?" | `look_at{direction: left}` | same |
+| "What time is it?" | `get_time{}` | same |
+| "Make it louder, like 80." | `set_volume{level: 80}` | same |
+| "Look up and then tell me what you see." | `look_at{direction: center}` | `look_at{direction: up}` |
+| "Tell me a short joke about robots." | "...it had a virus!" | "...a little \"buggy\"!" |
+
+An unknown alias, conflicting selectors and an unknown `lora_name` each
+returned 400. An adapter given to the rank-0 engine stopped the server at
+startup. Decode through the server: 27.3 tok/s base, 27.4 tok/s adapter.
+
+At startup the runtime warns once that `tool` leaves 170 of 686 LoRA
+bindings (the 85 PLE pairs) on the rank-1 zero dummy. An adapter above the
+engine's rank (the same adapter zero-padded to rank 32) now fails runtime
+construction. Before that check, it loaded, decode-graph capture failed with
+only a warning, and the first adapter request failed in `setInputShape`.
+
 Verdict: rank 16 is usable for an adapter-serving bundle, but costs about 40 %
 of decode throughput on every request and 437 MiB more arena. Production
 engines stay at rank 0, which is the script default.
