@@ -994,7 +994,8 @@ _LORA_WEIGHTS_FILE = "processed_adapter_model.safetensors"
 def _discover_lora_adapters(engine_dir: str) -> List[LoraAdapter]:
     """Discover processed adapters under ``<engine_dir>/lora_weights/``.
 
-    Each subdirectory holds one adapter: its name is the directory name and
+    Each visible subdirectory holds one adapter (hidden entries and plain
+    files are ignored): its name is the directory name and
     its weights the ``processed_adapter_model.safetensors`` written by
     ``tensorrt-edgellm-process-lora``. Names are filesystem names, so they
     are re-validated against the same pattern the CLI enforces; an invalid
@@ -1006,7 +1007,12 @@ def _discover_lora_adapters(engine_dir: str) -> List[LoraAdapter]:
         return []
     adapters = []
     for entry in sorted(os.listdir(weights_dir)):
-        if not entry:
+        # Hidden entries (rollback or staging copies such as ``.tool-v1-prev``)
+        # are never adapters: each discovered adapter costs GPU memory and its
+        # own decode graphs.
+        if not entry or entry.startswith("."):
+            continue
+        if not os.path.isdir(os.path.join(weights_dir, entry)):
             continue
         _validate_lora_adapter_name(entry, flag="lora_weights directory")
         path = os.path.join(weights_dir, entry, _LORA_WEIGHTS_FILE)

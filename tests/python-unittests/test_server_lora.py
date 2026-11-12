@@ -270,6 +270,20 @@ def test_discovered_adapters_come_from_the_lora_weights_directory(
     assert llm.max_lora_rank == 16
 
 
+def test_discovery_ignores_hidden_entries_and_plain_files(
+        tmp_path, _fake_runtime):
+    bundle = _engine_tree(tmp_path, max_lora_rank=16)
+    _adapter(bundle / "llm", "tool", rank=8)
+    _adapter(bundle / "llm", ".tool-v1-prev", rank=8)
+    (bundle / "llm" / "lora_weights" / "README").write_text("notes")
+
+    llm = LLM(model=str(bundle), cache_dir=str(tmp_path / "cache"))
+
+    assert llm.lora_names() == ["tool"]
+    # The name -> path map handed to the native runtime.
+    assert sorted(llm._runtime.args[2]) == ["tool"]
+
+
 def test_discovery_stops_on_an_invalid_adapter_directory_name(
         tmp_path, _fake_runtime):
     bundle = _engine_tree(tmp_path, max_lora_rank=16)
