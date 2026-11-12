@@ -187,7 +187,7 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
     // LoRA
     if (cfg.maxSupportedLoraRank > 0)
     {
-        resources->loraManager = std::make_unique<LoRAManager>();
+        resources->loraManager = std::make_unique<LoRAManager>(cfg.maxSupportedLoraRank);
         for (auto const& [loraWeightsName, loraWeightsPath] : loraWeightsMap)
         {
             if (loraWeightsPath.empty())
@@ -333,7 +333,7 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
     // LoRA
     if (bundle.base.maxSupportedLoraRank > 0)
     {
-        resources->loraManager = std::make_unique<LoRAManager>();
+        resources->loraManager = std::make_unique<LoRAManager>(bundle.base.maxSupportedLoraRank);
         for (auto const& [loraWeightsName, loraWeightsPath] : loraWeightsMap)
         {
             if (loraWeightsPath.empty())
