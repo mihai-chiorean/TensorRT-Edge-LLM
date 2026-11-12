@@ -349,15 +349,21 @@ trtedge serve Qwen/Qwen3.5-0.8B \
 ```
 
 Names must match `[A-Za-z0-9_.-]+` and may not collide with a discovered
-adapter. `/v1/models` lists one card per adapter as `<served>:<adapter>`, and
-`/health` reports the adapter list with each adapter's rank and binding
-coverage from its `edgellm_lora_processing` record.
+adapter; a subdirectory of `lora_weights/` whose name does not match the
+pattern is a startup error rather than an adapter quietly left unserved
+(a directory without a `processed_adapter_model.safetensors` file is skipped
+with a warning). `/v1/models` lists one card per adapter as
+`<served>:<adapter>`, and `/health` reports the adapter list with each
+adapter's rank and binding coverage from its `edgellm_lora_processing`
+record.
 
 A request selects an adapter with either spelling — a model name of
-`<served>:<adapter>` or a `lora_name` field. Sending both requires them to
-name the same adapter; naming the base model on one side and an adapter on
-the other is refused with 400, as is an unknown adapter name. Omitting both,
-or naming the plain served model, uses the base weights:
+`<served>:<adapter>` or a `lora_name` field. Clients that always send
+`model` can keep using the bare served name: `model` equal to the bare
+served name (or omitted) means the base model unless `lora_name` selects an
+adapter. When `model` is adapter-qualified and `lora_name` is present and
+different — including `lora_name: ""` naming the base model — the request
+is refused with 400, as is an unknown adapter name:
 
 ```bash
 curl -s http://localhost:8000/v1/chat/completions \
@@ -367,6 +373,11 @@ curl -s http://localhost:8000/v1/chat/completions \
 curl -s http://localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"lora_name": "french", "messages": [{"role": "user", "content": "Bonjour"}]}'
+
+# OpenAI clients always send model; the bare served name does not veto lora_name.
+curl -s http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "Qwen/Qwen3.5-0.8B", "lora_name": "french", "messages": [{"role": "user", "content": "Bonjour"}]}'
 ```
 
 Responses echo the selected model, so an adapter request is answered as

@@ -47,7 +47,8 @@ from pathlib import Path
 from typing import (TYPE_CHECKING, Any, Callable, Dict, Iterator, List,
                     Mapping, Optional, Sequence, Tuple, Union)
 
-from ..config import DEFAULT_MAX_QUEUED_REQUESTS, ContextCacheConfig
+from ..config import (DEFAULT_MAX_QUEUED_REQUESTS, ContextCacheConfig,
+                      _validate_lora_adapter_name)
 from ..parsing.reasoning import REASONING_PARSERS, prompt_reasoning_state
 from ..parsing.terminal_tokens import (ended_on_stop, strip_terminal_tokens,
                                        terminal_special_tokens)
@@ -996,21 +997,24 @@ def _discover_lora_adapters(engine_dir: str) -> List[LoraAdapter]:
     Each subdirectory holds one adapter: its name is the directory name and
     its weights the ``processed_adapter_model.safetensors`` written by
     ``tensorrt-edgellm-process-lora``. Names are filesystem names, so they
-    are re-validated against the same pattern the CLI enforces.
+    are re-validated against the same pattern the CLI enforces; an invalid
+    name stops startup (it would otherwise be silently unservable while a
+    directory with the same intent sits on disk).
     """
     weights_dir = os.path.join(engine_dir, _LORA_WEIGHTS_DIR)
     if not os.path.isdir(weights_dir):
         return []
     adapters = []
     for entry in sorted(os.listdir(weights_dir)):
-        path = os.path.join(weights_dir, entry, _LORA_WEIGHTS_FILE)
-        if not entry or not os.path.isfile(path):
+        if not entry:
             continue
-        try:
-            from ..config import _validate_lora_adapter_name
-
-            _validate_lora_adapter_name(entry, flag="lora_weights directory")
-        except (ImportError, ValueError):
+        _validate_lora_adapter_name(entry, flag="lora_weights directory")
+        path = os.path.join(weights_dir, entry, _LORA_WEIGHTS_FILE)
+        if not os.path.isfile(path):
+            logger.warning(
+                "Skipping %r under %s: no %s (adapters must be written by "
+                "tensorrt-edgellm-process-lora)", entry, weights_dir,
+                _LORA_WEIGHTS_FILE)
             continue
         adapters.append(LoraAdapter(name=entry, path=path))
     return adapters
@@ -2501,9 +2505,10 @@ class LLM:
         """
         report = []
         for adapter in self._lora_adapters:
-            provenance = adapter.provenance or {}
-            bound = provenance.get("bound_modules")
-            unbound = provenance.get("unbound_untargeted_bindings")
+            provenance = adapter.provenance
+            bound = provenance.get("bound_modules") if provenance else None
+            unbound = (provenance.get("unbound_untargeted_bindings")
+                       if provenance else None)
             report.append({
                 "name":
                 adapter.name,

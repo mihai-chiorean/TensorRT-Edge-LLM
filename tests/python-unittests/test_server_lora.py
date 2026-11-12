@@ -12,18 +12,175 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""LoRA adapter serving: discovery, configuration, selection and switching."""
+"""LoRA adapter serving: discovery, configuration, selection and switching.
+
+Only the pybind module is faked; every test drives the real ``LLM`` built
+from an engine tree under ``tmp_path``.
+"""
 
 import asyncio
 import json
+import logging
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from experimental.server.config import (ApiConfig, LoraAdapterConfig,
                                         ModelConfig, ServerConfigError,
                                         parse_server_config)
-from experimental.server.runtime.engine import LLM, LoraAdapter, SamplingParams
+from experimental.server.runtime.engine import (LLM, SamplingParams,
+                                                finish_reason_name)
+
+# ---------------------------------------------------------------------------
+# Fake pybind runtime: records the adapter each request carries
+# ---------------------------------------------------------------------------
+
+
+class _FakeChunk:
+    """One StreamChannel pop: a full turn in a single terminal delta."""
+
+    text = "hello"
+    token_ids = [1, 2]
+    prompt_token_count = 7
+    finished = True
+    reason = None
+    logprobs = []
+
+    @property
+    def metrics(self):
+        return None
+
+
+class _FakeChannel:
+    """Minimal native StreamChannel: one chunk, then finished."""
+
+    def __init__(self):
+        self._chunks = [_FakeChunk()]
+        self._finished = False
+
+    def set_skip_special_tokens(self, _enabled):
+        pass
+
+    def wait_pop(self, timeout_ms=0):
+        if self._chunks:
+            return self._chunks.pop(0)
+        self._finished = True
+        return None
+
+    def try_pop(self):
+        return self._chunks.pop(0) if self._chunks else None
+
+    def is_finished(self):
+        return self._finished
+
+    def is_cancelled(self):
+        return False
+
+    def cancel(self):
+        self._finished = True
+
+
+class _FakeLLMRuntime:
+    """Blocking-path runtime: records ``lora_weights_name`` per request."""
+
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        self.switch_names = []
+        self._lock = threading.Lock()
+
+    def record(self, request):
+        with self._lock:
+            self.switch_names.append(request.lora_weights_name)
+
+    def capture_decoding_cuda_graph(self):
+        return True
+
+    def has_draft_model(self):
+        return False
+
+    def handle_request(self, request):
+        self.record(request)
+        return SimpleNamespace(
+            output_texts=["hello"],
+            output_ids=[[1, 2, 3]],
+            prompt_token_counts=[7],
+            finish_reasons=["stop"],
+            spec_verify_counts=[],
+            spec_acceptance_lengths=[],
+            logprobs=[],
+        )
+
+
+class _FakeContextCacheConfig:
+
+    def __init__(self):
+        self.enabled = False
+        self.max_records = 0
+        self.recurrent_snapshot_pool_bytes = 0
+        self.partial_kv_snapshot_pool_bytes = 0
+        self.encoder_embedding_cache_budget_bytes = -1
+
+
+class _NativeValue:
+    """pybind value type stand-in: accepts positional args and attributes."""
+
+    def __init__(self, *args, **values):
+        self.args = args
+        self.__dict__.update(values)
+
+
+class _FakeRuntimeModule:
+    """The pybind surface ``LLM`` touches on the blocking request path."""
+
+    LLMRuntime = _FakeLLMRuntime
+    ContextCacheConfig = _FakeContextCacheConfig
+    FinishReason = SimpleNamespace(NOT_FINISHED="not_finished",
+                                   END_ID="end_id",
+                                   LENGTH="length",
+                                   CANCELLED="cancelled",
+                                   ERROR="error",
+                                   STOP_WORDS="stop_words")
+    Message = _NativeValue
+    MessageContent = _NativeValue
+    MessageToolCall = _NativeValue
+    LLMGenerationRequest = _NativeValue
+    Request = _NativeValue
+    ToolChoice = _NativeValue
+    ToolDefinition = _NativeValue
+    ToolChoiceMode = SimpleNamespace(NONE="none",
+                                     AUTO="auto",
+                                     REQUIRED="required",
+                                     FUNCTION="function")
+    ContextCacheLookupPolicy = SimpleNamespace(USE_CACHE="use",
+                                               BYPASS="bypass")
+    ContextCacheCommitPolicy = SimpleNamespace(
+        INCLUDING_GENERATED_TOKENS="all", PREFILL_STATE_ONLY="prefill")
+
+    class StreamChannel:
+
+        @staticmethod
+        def create(*, collect_metrics=False):
+            return _FakeChannel()
+
+    @staticmethod
+    def load_image_from_path(_path):
+        raise AssertionError("no media in LoRA tests")
+
+    @staticmethod
+    def load_image_from_bytes(_data):
+        raise AssertionError("no media in LoRA tests")
+
+    @staticmethod
+    def load_audio_buffer_from_bytes(_data):
+        raise AssertionError("no audio in LoRA tests")
+
+
+#: Fixed served name: the engine tree's directory name would otherwise leak
+#: tmp_path into every model alias.
+SERVED_MODEL = "qwen3"
 
 # ---------------------------------------------------------------------------
 # Fixtures: a prebuilt engine tree, with or without adapter sidecars
@@ -75,30 +232,24 @@ def _adapter(engine_dir: Path, name: str, rank=None) -> Path:
     return directory / "processed_adapter_model.safetensors"
 
 
-class _FakeRuntime:
-
-    def __init__(self, *args, **kwargs):
-        self.args = args
-        self.kwargs = kwargs
-
-    def capture_decoding_cuda_graph(self):
-        return True
-
-    def has_draft_model(self):
-        return False
-
-
-class _FakeBindings:
-    LLMRuntime = _FakeRuntime
-    ContextCacheConfig = type(
-        "Config", (), {
-            "__init__": lambda self: setattr(self, "enabled", False),
-        })
-
-
-def _monkeypatch_runtime(monkeypatch):
+@pytest.fixture
+def _fake_runtime(monkeypatch):
+    """Swap the pybind module for the recording fake in every HTTP-path test."""
     monkeypatch.setattr("experimental.server.runtime.engine._import_runtime",
-                        lambda: _FakeBindings)
+                        lambda: _FakeRuntimeModule)
+
+
+def _build_llm(tmp_path: Path, *, max_lora_rank: int = 16) -> LLM:
+    """Real LLM over the fake pybind module, with french + poetic adapters.
+
+    ``french`` carries an ``edgellm_lora_processing`` record; ``poetic`` is a
+    bare sidecar without one, so both health-report shapes are exercised.
+    Requires the ``_fake_runtime`` fixture.
+    """
+    bundle = _engine_tree(tmp_path, max_lora_rank=max_lora_rank)
+    _adapter(bundle / "llm", "french", rank=8)
+    _adapter(bundle / "llm", "poetic")
+    return LLM(model=str(bundle), cache_dir=str(tmp_path / "cache"))
 
 
 # ---------------------------------------------------------------------------
@@ -107,11 +258,9 @@ def _monkeypatch_runtime(monkeypatch):
 
 
 def test_discovered_adapters_come_from_the_lora_weights_directory(
-        tmp_path, monkeypatch):
-    _monkeypatch_runtime(monkeypatch)
+        tmp_path, _fake_runtime):
     bundle = _engine_tree(tmp_path, max_lora_rank=16)
     _adapter(bundle / "llm", "french", rank=8)
-    _adapter(bundle / "llm", " pirate ", rank=8)  # invalid name, skipped
     (bundle / "llm" / "lora_weights" / "empty").mkdir()
     (bundle / "llm" / "lora_weights" / "loose.safetensors").touch()
 
@@ -121,9 +270,35 @@ def test_discovered_adapters_come_from_the_lora_weights_directory(
     assert llm.max_lora_rank == 16
 
 
+def test_discovery_stops_on_an_invalid_adapter_directory_name(
+        tmp_path, _fake_runtime):
+    bundle = _engine_tree(tmp_path, max_lora_rank=16)
+    invalid = bundle / "llm" / "lora_weights" / " pirate "
+    invalid.mkdir(parents=True)
+    (invalid / "processed_adapter_model.safetensors").touch()
+
+    with pytest.raises(ServerConfigError, match=" pirate "):
+        LLM(model=str(bundle), cache_dir=str(tmp_path / "cache"))
+
+
+def test_discovery_skips_a_sidecarless_directory_with_a_warning(
+        tmp_path, _fake_runtime, caplog):
+    bundle = _engine_tree(tmp_path, max_lora_rank=16)
+    _adapter(bundle / "llm", "french", rank=8)
+    stray = bundle / "llm" / "lora_weights" / "stray"
+    stray.mkdir()
+    (stray / "unrelated.bin").touch()
+
+    with caplog.at_level(logging.WARNING, logger="edgellm.server"):
+        llm = LLM(model=str(bundle), cache_dir=str(tmp_path / "cache"))
+
+    assert llm.lora_names() == ["french"]
+    assert any("stray" in record.message and record.levelno == logging.WARNING
+               for record in caplog.records)
+
+
 def test_adapters_without_a_sidecar_directory_are_not_discovered(
-        tmp_path, monkeypatch):
-    _monkeypatch_runtime(monkeypatch)
+        tmp_path, _fake_runtime):
     bundle = _engine_tree(tmp_path, max_lora_rank=16)
     llm = LLM(model=str(bundle), cache_dir=str(tmp_path / "cache"))
     assert llm.lora_names() == []
@@ -185,8 +360,7 @@ def test_cli_rejects_malformed_adapter_argument():
 
 
 def test_cli_rejects_adapter_name_colliding_with_a_discovered_one(
-        tmp_path, monkeypatch):
-    _monkeypatch_runtime(monkeypatch)
+        tmp_path, _fake_runtime):
     bundle = _engine_tree(tmp_path, max_lora_rank=16)
     _adapter(bundle / "llm", "french", rank=8)
     with pytest.raises(ValueError, match="collides"):
@@ -200,16 +374,16 @@ def test_cli_rejects_adapter_name_colliding_with_a_discovered_one(
 # ---------------------------------------------------------------------------
 
 
-def test_adapters_on_a_rank_zero_engine_refuse_to_start(tmp_path, monkeypatch):
-    _monkeypatch_runtime(monkeypatch)
+def test_adapters_on_a_rank_zero_engine_refuse_to_start(
+        tmp_path, _fake_runtime):
     bundle = _engine_tree(tmp_path, max_lora_rank=0)
     _adapter(bundle / "llm", "french", rank=8)
     with pytest.raises(ValueError, match="max_lora_rank=0"):
         LLM(model=str(bundle), cache_dir=str(tmp_path / "cache"))
 
 
-def test_adapter_rank_above_the_engine_refuses_to_start(tmp_path, monkeypatch):
-    _monkeypatch_runtime(monkeypatch)
+def test_adapter_rank_above_the_engine_refuses_to_start(
+        tmp_path, _fake_runtime):
     bundle = _engine_tree(tmp_path, max_lora_rank=16)
     _adapter(bundle / "llm", "wide", rank=32)
     with pytest.raises(ValueError, match="exceeds the engine's max_lora_rank"):
@@ -217,8 +391,7 @@ def test_adapter_rank_above_the_engine_refuses_to_start(tmp_path, monkeypatch):
 
 
 def test_configured_adapters_on_a_rank_zero_engine_refuse_to_start(
-        tmp_path, monkeypatch):
-    _monkeypatch_runtime(monkeypatch)
+        tmp_path, _fake_runtime):
     bundle = _engine_tree(tmp_path, max_lora_rank=0)
     with pytest.raises(ValueError, match="max_lora_rank=0"):
         LLM(model=str(bundle),
@@ -227,107 +400,11 @@ def test_configured_adapters_on_a_rank_zero_engine_refuse_to_start(
 
 
 # ---------------------------------------------------------------------------
-# Request-time selection over HTTP
+# Request-time selection over HTTP (real LLM + fake pybind module)
 # ---------------------------------------------------------------------------
 
 
-class _FakeLLM:
-    runtime_kind = "chat"
-    video_capable = False
-    has_draft_model = False
-    max_batch_size = 1
-
-    def __init__(self, root: Path, adapters=(), max_lora_rank=16):
-        self.model_dir = str(root / "qwen3")
-        self.bundle_dir = str(root / "engines")
-        self.model_id = "fake-model"
-        self._lora_adapters = tuple(adapters)
-        self._max_lora_rank = max_lora_rank
-        self.prepared_messages = None
-        self.last_sampling_params = None
-        self.next_text = "answer"
-        self.switches = []  # lora_weights_name sequence seen by the runtime
-        Path(self.model_dir).mkdir(parents=True)
-        Path(self.bundle_dir).mkdir(parents=True)
-        (Path(self.bundle_dir) / "config.json").write_text(
-            json.dumps({
-                "builder_config": {
-                    "max_input_len": 32,
-                    "max_batch_size": 1,
-                    "max_kv_cache_capacity": 128,
-                    "max_lora_rank": max_lora_rank,
-                },
-                "kv_cache_dtype": "fp16",
-            }),
-            encoding="utf-8",
-        )
-        from experimental.server.runtime.engine_layout import inspect_bundle
-        self.bundle_layout = inspect_bundle(self.bundle_dir)
-
-    @property
-    def lora_adapters(self):
-        return self._lora_adapters
-
-    @property
-    def max_lora_rank(self):
-        return self._max_lora_rank
-
-    def lora_names(self):
-        return [adapter.name for adapter in self._lora_adapters]
-
-    def lora_adapter_info(self):
-        report = []
-        for adapter in self._lora_adapters:
-            provenance = adapter.provenance or {}
-            bound = provenance.get("bound_modules")
-            unbound = provenance.get("unbound_untargeted_bindings")
-            report.append({
-                "name":
-                adapter.name,
-                "rank":
-                adapter.rank,
-                "bound_modules":
-                len(bound) if isinstance(bound, list) else None,
-                "unbound_untargeted_bindings":
-                len(unbound) if isinstance(unbound, list) else None,
-                "processed":
-                provenance is not None,
-            })
-        return report
-
-    def _make_generation_request(self, messages, params, **kwargs):
-        self.prepared_messages = messages
-        self.last_sampling_params = params
-        self.switches.append(params.lora_name)
-        if getattr(self, "_engine", None) is not None and params.lora_name:
-            raise ValueError(
-                "LoRA adapters are not supported under in-flight batching")
-        return object()
-
-    def _count_prepared_prompt_tokens(self, _request):
-        return 7
-
-    def _complete_prepared_request(self, _request, _params, tool_config,
-                                   **_kwargs):
-        from experimental.server.runtime.engine import CompletionOutput
-        return CompletionOutput(text=self.next_text,
-                                token_ids=[1, 2, 3],
-                                prompt_tokens=7,
-                                finish_reason="stop")
-
-    def generate_stream(self, _messages, _params, *, tools=None, **_kwargs):
-        from experimental.server.runtime.engine import StreamDelta
-        yield StreamDelta(text="hello",
-                          token_ids=[1, 2],
-                          prompt_tokens=7,
-                          finished=True,
-                          finish_reason="stop")
-
-    def close(self):
-        pass
-
-
-def _client_with(llm, config=None):
+def _client_with(llm: LLM, config=None):
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
@@ -335,28 +412,8 @@ def _client_with(llm, config=None):
     from experimental.server.api.app import create_app
     from experimental.server.runtime.engine_client import EngineClient
 
-    config = config or ApiConfig()
+    config = config or ApiConfig(served_model_name=SERVED_MODEL)
     return TestClient(create_app(EngineClient(llm, config), config)), llm
-
-
-def _lora_llm(tmp_path):
-    return _FakeLLM(
-        tmp_path,
-        adapters=(
-            LoraAdapter(
-                name="french",
-                path="/x/fr.safetensors",
-                rank=8,
-                provenance={
-                    "rank": 8,
-                    "bound_modules": ["a", "b"],
-                    "unbound_untargeted_bindings": ["c"],
-                },
-            ),
-            LoraAdapter(name="poetic", path="/x/po.safetensors", rank=16),
-        ),
-        max_lora_rank=16,
-    )
 
 
 def _chat(model=None, lora_name=None):
@@ -368,80 +425,97 @@ def _chat(model=None, lora_name=None):
     return body
 
 
-def _switches(llm):
-    return llm.switches
+def _switches(llm: LLM):
+    """``lora_weights_name`` values the llm's runtime recorded, in order."""
+    return llm._runtime.switch_names
 
 
-def test_selector_accepts_both_spellings(tmp_path):
-    client, llm = _client_with(_lora_llm(tmp_path))
+def test_selector_accepts_both_spellings(tmp_path, _fake_runtime):
+    client, llm = _client_with(_build_llm(tmp_path))
+    served = SERVED_MODEL
 
     response = client.post("/v1/chat/completions",
-                           json=_chat(model="fake-model:french"))
+                           json=_chat(model=f"{served}:french"))
     assert response.status_code == 200, response.text
-    assert response.json()["model"] == "fake-model:french"
+    assert response.json()["model"] == f"{served}:french"
 
     response = client.post("/v1/chat/completions",
                            json=_chat(lora_name="poetic"))
     assert response.status_code == 200, response.text
-    assert response.json()["model"] == "fake-model:poetic"
+    assert response.json()["model"] == f"{served}:poetic"
 
     response = client.post("/v1/chat/completions", json=_chat())
     assert response.status_code == 200, response.text
-    assert response.json()["model"] == "fake-model"
+    assert response.json()["model"] == served
 
-    response = client.post("/v1/chat/completions",
-                           json=_chat(model="fake-model"))
+    response = client.post("/v1/chat/completions", json=_chat(model=served))
     assert response.status_code == 200, response.text
-    assert response.json()["model"] == "fake-model"
+    assert response.json()["model"] == served
 
     assert _switches(llm) == ["french", "poetic", "", ""]
 
 
-def test_selector_conflict_is_a_bad_request(tmp_path):
-    client, _ = _client_with(_lora_llm(tmp_path))
+def test_selector_conflict_is_a_bad_request(tmp_path, _fake_runtime):
+    client, _ = _client_with(_build_llm(tmp_path))
     response = client.post("/v1/chat/completions",
-                           json=_chat(model="fake-model:french",
+                           json=_chat(model=f"{SERVED_MODEL}:french",
                                       lora_name="poetic"))
     assert response.status_code == 400
     assert "french" in response.text and "poetic" in response.text
 
 
-def test_selector_conflict_with_base_is_a_bad_request(tmp_path):
-    client, _ = _client_with(_lora_llm(tmp_path))
+def test_selector_conflict_with_base_is_a_bad_request(tmp_path, _fake_runtime):
+    client, _ = _client_with(_build_llm(tmp_path))
     response = client.post("/v1/chat/completions",
-                           json=_chat(model="fake-model:french", lora_name=""))
+                           json=_chat(model=f"{SERVED_MODEL}:french",
+                                      lora_name=""))
     assert response.status_code == 400
 
 
-def test_selector_base_vs_adapter_conflict_via_lora_name(tmp_path):
-    # ``model`` explicitly names the base; ``lora_name`` names an adapter.
-    # Both are present and disagree, so the request is refused.
-    client, _ = _client_with(_lora_llm(tmp_path))
+def test_selector_lora_name_with_bare_model_selects_the_adapter(
+        tmp_path, _fake_runtime):
+    # ``model`` is what OpenAI clients always send; it must not veto
+    # ``lora_name``. The bare served name plus lora_name runs the adapter.
+    client, llm = _client_with(_build_llm(tmp_path))
     response = client.post("/v1/chat/completions",
-                           json=_chat(model="fake-model", lora_name="french"))
-    assert response.status_code == 400
-    assert "french" in response.text
+                           json=_chat(model=SERVED_MODEL, lora_name="french"))
+    assert response.status_code == 200, response.text
+    assert response.json()["model"] == f"{SERVED_MODEL}:french"
+    assert _switches(llm) == ["french"]
 
 
-def test_unknown_adapter_is_a_bad_request_listing_known_names(tmp_path):
-    client, _ = _client_with(_lora_llm(tmp_path))
+def test_selector_lora_name_alone_selects_the_adapter(tmp_path, _fake_runtime):
+    client, llm = _client_with(_build_llm(tmp_path))
     response = client.post("/v1/chat/completions",
-                           json=_chat(model="fake-model:missing"))
+                           json=_chat(lora_name="french"))
+    assert response.status_code == 200, response.text
+    assert response.json()["model"] == f"{SERVED_MODEL}:french"
+    assert _switches(llm) == ["french"]
+
+
+def test_unknown_adapter_is_a_bad_request_listing_known_names(
+        tmp_path, _fake_runtime):
+    client, _ = _client_with(_build_llm(tmp_path))
+    response = client.post("/v1/chat/completions",
+                           json=_chat(model=f"{SERVED_MODEL}:missing"))
     assert response.status_code == 400
     assert "french" in response.text and "poetic" in response.text
 
 
-def test_adapter_selection_without_loaded_adapters_is_a_bad_request(tmp_path):
-    client, _ = _client_with(_FakeLLM(tmp_path))
+def test_adapter_selection_without_loaded_adapters_is_a_bad_request(
+        tmp_path, _fake_runtime):
+    bundle = _engine_tree(tmp_path, max_lora_rank=16)
+    llm = LLM(model=str(bundle), cache_dir=str(tmp_path / "cache"))
+    client, _ = _client_with(llm)
     response = client.post("/v1/chat/completions", json=_chat(lora_name="x"))
     assert response.status_code == 400
     response = client.post("/v1/chat/completions",
-                           json=_chat(model="fake-model:x"))
+                           json=_chat(model=f"{SERVED_MODEL}:x"))
     assert response.status_code == 400
 
 
-def test_unknown_model_without_adapter_still_404s(tmp_path):
-    client, _ = _client_with(_lora_llm(tmp_path))
+def test_unknown_model_without_adapter_still_404s(tmp_path, _fake_runtime):
+    client, _ = _client_with(_build_llm(tmp_path))
     response = client.post("/v1/chat/completions", json=_chat(model="other"))
     assert response.status_code == 404
 
@@ -463,7 +537,7 @@ def test_lora_name_field_is_accepted_by_the_protocol():
 # ---------------------------------------------------------------------------
 
 
-def test_ifb_refuses_adapter_requests_at_build_time(tmp_path):
+def test_ifb_refuses_adapter_requests_at_build_time(tmp_path, _fake_runtime):
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
@@ -471,14 +545,15 @@ def test_ifb_refuses_adapter_requests_at_build_time(tmp_path):
     from experimental.server.api.app import create_app
     from experimental.server.runtime.engine_client import EngineClient
 
-    llm = _FakeLLM(tmp_path,
-                   adapters=(LoraAdapter(name="french",
-                                         path="/x/fr.safetensors",
-                                         rank=8), ),
-                   max_lora_rank=16)
-    # Under IFB the runtime is a RequestEngine; the fake marks it via _engine.
+    bundle = _engine_tree(tmp_path, max_lora_rank=16)
+    _adapter(bundle / "llm", "french", rank=8)
+    llm = LLM(model=str(bundle), cache_dir=str(tmp_path / "cache"))
+    # Under IFB the runtime is a RequestEngine; mark the deployment so the
+    # request-build refusal fires.
     llm._engine = object()
-    client = TestClient(create_app(EngineClient(llm), ApiConfig()))
+    client = TestClient(
+        create_app(EngineClient(llm),
+                   ApiConfig(served_model_name=SERVED_MODEL)))
     response = client.post("/v1/chat/completions",
                            json=_chat(lora_name="french"))
     assert response.status_code == 400
@@ -486,8 +561,6 @@ def test_ifb_refuses_adapter_requests_at_build_time(tmp_path):
 
 
 def test_ifb_refuses_adapter_requests_from_the_engine_api(monkeypatch):
-    from types import SimpleNamespace
-
     from experimental.server.runtime import engine as engine_module
 
     class NativeValue:
@@ -525,20 +598,24 @@ def test_ifb_refuses_adapter_requests_from_the_engine_api(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# /v1/models and /health
+# /v1/models and /health (served by the real LLM)
 # ---------------------------------------------------------------------------
 
 
-def test_models_endpoint_lists_adapter_variants(tmp_path):
-    client, _ = _client_with(_lora_llm(tmp_path))
+def test_models_endpoint_lists_adapter_variants(tmp_path, _fake_runtime):
+    client, _ = _client_with(_build_llm(tmp_path))
     response = client.get("/v1/models")
     assert response.status_code == 200
     ids = [card["id"] for card in response.json()["data"]]
-    assert ids == ["fake-model", "fake-model:french", "fake-model:poetic"]
+    assert ids == [
+        SERVED_MODEL,
+        f"{SERVED_MODEL}:french",
+        f"{SERVED_MODEL}:poetic",
+    ]
 
 
-def test_health_reports_adapters_and_max_lora_rank(tmp_path):
-    client, _ = _client_with(_lora_llm(tmp_path))
+def test_health_reports_adapters_and_max_lora_rank(tmp_path, _fake_runtime):
+    client, _ = _client_with(_build_llm(tmp_path))
     response = client.get("/health")
     assert response.status_code == 200
     lora = response.json()["lora"]
@@ -548,56 +625,59 @@ def test_health_reports_adapters_and_max_lora_rank(tmp_path):
     assert french["rank"] == 8
     assert french["bound_modules"] == 2
     assert french["unbound_untargeted_bindings"] == 1
+    assert french["processed"] is True
 
 
-def test_health_reports_null_coverage_without_a_provenance_record(tmp_path):
-    client, _ = _client_with(
-        _FakeLLM(tmp_path,
-                 adapters=(LoraAdapter(name="bare",
-                                       path="/x/bare.safetensors"), ),
-                 max_lora_rank=8))
+def test_health_reports_unprocessed_adapter_without_a_provenance_record(
+        tmp_path, _fake_runtime):
+    # ``poetic`` has no config.json, so lora_adapter_info must report both
+    # the null coverage counts and processed=False for it.
+    client, _ = _client_with(_build_llm(tmp_path))
     response = client.get("/health")
+    assert response.status_code == 200
     lora = response.json()["lora"]
-    bare = lora["adapters"][0]
-    assert bare["rank"] is None
-    assert bare["bound_modules"] is None
-    assert bare["unbound_untargeted_bindings"] is None
+    poetic = lora["adapters"][1]
+    assert poetic["name"] == "poetic"
+    assert poetic["rank"] is None
+    assert poetic["bound_modules"] is None
+    assert poetic["unbound_untargeted_bindings"] is None
+    assert poetic["processed"] is False
 
 
 # ---------------------------------------------------------------------------
-# Adapter switching through a recording runtime
+# Adapter switching through the real LLM and the recording fake runtime
 # ---------------------------------------------------------------------------
 
 
-def test_runtime_receives_the_adapter_switch_sequence(tmp_path):
+def test_runtime_receives_the_adapter_switch_sequence(tmp_path, _fake_runtime):
     """base -> french -> poetic -> french -> base, in one session.
 
-    The fake runtime records every ``lora_weights_name`` the engine passes
-    down, which is the wire the C++ LoRAManager switches on. Each response
-    echoes the selector the request named.
+    The fake runtime records every ``lora_weights_name`` the real engine
+    passes down, which is the wire the C++ LoRAManager switches on. Each
+    response echoes the selector the request named.
     """
-    client, llm = _client_with(_lora_llm(tmp_path))
+    client, llm = _client_with(_build_llm(tmp_path))
+    served = SERVED_MODEL
 
     sequence = [
-        (_chat(), "fake-model", ""),
-        (_chat(model="fake-model:french"), "fake-model:french", "french"),
-        (_chat(lora_name="poetic"), "fake-model:poetic", "poetic"),
-        (_chat(model="fake-model:french",
-               lora_name="french"), "fake-model:french", "french"),
-        (_chat(), "fake-model", ""),
+        (_chat(), served, ""),
+        (_chat(model=f"{served}:french"), f"{served}:french", "french"),
+        (_chat(lora_name="poetic"), f"{served}:poetic", "poetic"),
+        (_chat(model=f"{served}:french",
+               lora_name="french"), f"{served}:french", "french"),
+        (_chat(), served, ""),
     ]
     for body, expected_model, expected_switch in sequence:
         response = client.post("/v1/chat/completions", json=body)
         assert response.status_code == 200, response.text
         assert response.json()["model"] == expected_model
-        assert llm.switches[-1] == expected_switch
 
-    assert llm.switches == ["", "french", "poetic", "french", ""]
+    assert _switches(llm) == ["", "french", "poetic", "french", ""]
 
 
-def test_streamed_response_echoes_the_adapter_model(tmp_path):
-    client, _ = _client_with(_lora_llm(tmp_path))
-    body = _chat(model="fake-model:french")
+def test_streamed_response_echoes_the_adapter_model(tmp_path, _fake_runtime):
+    client, _ = _client_with(_build_llm(tmp_path))
+    body = _chat(model=f"{SERVED_MODEL}:french")
     body["stream"] = True
     response = client.post("/v1/chat/completions", json=body)
     assert response.status_code == 200, response.text
@@ -605,7 +685,28 @@ def test_streamed_response_echoes_the_adapter_model(tmp_path):
         json.loads(line.removeprefix("data: "))["model"]
         for line in response.text.splitlines() if line.startswith("data: {")
     }
-    assert models == {"fake-model:french"}
+    assert models == {f"{SERVED_MODEL}:french"}
+
+
+def test_blocking_generation_reaches_the_fake_runtime_with_the_adapter(
+        tmp_path, _fake_runtime):
+    # Direct (non-HTTP) path: the real LLM builds the native request and the
+    # fake runtime observes the selector on it. generate() takes a message
+    # batch list, so the conversation is wrapped once more.
+    llm = _build_llm(tmp_path)
+    output = llm.generate([[{
+        "role": "user",
+        "content": "Hello"
+    }]], SamplingParams(lora_name="french"))
+    assert output[0].text == "hello"
+    assert output[0].finish_reason == "stop"
+    assert _switches(llm) == ["french"]
+
+
+def test_finish_reason_maps_the_fake_enum():
+    assert finish_reason_name(_FakeRuntimeModule, "stop_words") == "stop"
+    assert finish_reason_name(_FakeRuntimeModule, "end_id") == "stop"
+    assert finish_reason_name(_FakeRuntimeModule, "not_finished") is None
 
 
 # ---------------------------------------------------------------------------
@@ -613,17 +714,21 @@ def test_streamed_response_echoes_the_adapter_model(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_engine_client_carries_the_adapter_to_the_request(tmp_path):
+def test_engine_client_carries_the_adapter_to_the_request(
+        tmp_path, _fake_runtime):
     from experimental.server.runtime.engine_client import EngineClient
 
-    llm = _FakeLLM(tmp_path)
+    llm = _build_llm(tmp_path)
     client = EngineClient(llm)
 
     async def exercise():
-        await client.prepare_request([{
+        prepared = await client.prepare_request([{
             "role": "user",
             "content": "hello"
         }], SamplingParams(lora_name="french"))
+        return prepared
 
-    asyncio.run(exercise())
-    assert llm.switches == ["french"]
+    prepared = asyncio.run(exercise())
+    # Request preparation builds the native request; the adapter selector
+    # rides on it ready for the runtime's LoRAManager.
+    assert prepared.request.lora_weights_name == "french"

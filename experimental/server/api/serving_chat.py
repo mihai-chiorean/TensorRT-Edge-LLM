@@ -178,11 +178,12 @@ class OpenAIServingChat:
         """Resolve the request's adapter selector to an adapter name or "".
 
         Both spellings are accepted: ``model: "<served>:<adapter>"`` and
-        ``lora_name: "<adapter>"``. Naming two different adapters — or an
-        adapter on one side and the base model on the other — is refused
-        rather than silently picking one. ``lora_name: ""`` explicitly
-        names the base model, so it conflicts with an adapter-qualified
-        ``model`` the same way a different adapter name would.
+        ``lora_name: "<adapter>"``. ``model`` equal to the bare served name
+        (or absent) names the base model unless ``lora_name`` selects an
+        adapter — OpenAI clients always send ``model``, so it cannot veto
+        ``lora_name``. When ``model`` is adapter-qualified and ``lora_name``
+        is present and different — including ``lora_name: ""`` naming the
+        base — the request is refused rather than silently picking one.
         """
         served = self._client.model_name
         known = self._client.llm.lora_names() if hasattr(
@@ -205,13 +206,6 @@ class OpenAIServingChat:
                 f"lora_name selects "
                 f"{'the base model' if not lora_name else lora_name!r}; "
                 "they must agree",
-                param="lora_name")
-        # ``model`` naming the plain served name means the base model; it
-        # cannot be combined with an adapter named through lora_name.
-        if lora_requested and model and not model_adapter and lora_name:
-            raise InvalidRequestError(
-                f"model {model!r} is the base model but lora_name selects "
-                f"{lora_name!r}; they must agree",
                 param="lora_name")
         adapter = lora_name or model_adapter
         if not adapter:
