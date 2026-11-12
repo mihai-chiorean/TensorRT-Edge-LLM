@@ -185,6 +185,12 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
     initializeRopeCaches(*resources, cfg, stream);
 
     // LoRA
+    for (auto const& [loraWeightsName, loraWeightsPath] : loraWeightsMap)
+    {
+        ELLM_CHECK(cfg.maxSupportedLoraRank > 0 || loraWeightsPath.empty(),
+            "LoRA adapter '" + loraWeightsName
+                + "' was given, but the engine was built without LoRA inputs (max_lora_rank 0)");
+    }
     if (cfg.maxSupportedLoraRank > 0)
     {
         resources->loraManager = std::make_unique<LoRAManager>(cfg.maxSupportedLoraRank);
@@ -331,6 +337,12 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
     initializeRopeCaches(*resources, *bundle.draft, stream);
 
     // LoRA
+    for (auto const& [loraWeightsName, loraWeightsPath] : loraWeightsMap)
+    {
+        ELLM_CHECK(bundle.base.maxSupportedLoraRank > 0 || loraWeightsPath.empty(),
+            "LoRA adapter '" + loraWeightsName
+                + "' was given, but the engine was built without LoRA inputs (max_lora_rank 0)");
+    }
     if (bundle.base.maxSupportedLoraRank > 0)
     {
         resources->loraManager = std::make_unique<LoRAManager>(bundle.base.maxSupportedLoraRank);

@@ -145,4 +145,24 @@ TEST_F(LoraRuntimeAssemblyTest, RankFittingAdapterAssembles)
     EXPECT_STREQ(runtime.getSpeculativeDecodingStrategyName(), "vanilla");
 }
 
+//! The same deployment built without LoRA inputs.
+class RankZeroLoraRuntimeAssemblyTest : public LoraRuntimeAssemblyTest
+{
+protected:
+    std::filesystem::path stageModelDir() override
+    {
+        return writeModelDir("loraRuntimeAssemblyTests", makeTinyVanillaConfig());
+    }
+};
+
+// Given a deployment whose config declares max_lora_rank 0
+// When the runtime is assembled with an adapter
+// Then construction throws instead of serving the base model under the adapter's name
+TEST_F(RankZeroLoraRuntimeAssemblyTest, AdapterOnRankZeroEngineFailsRuntimeConstruction)
+{
+    writeAdapter(mModelDir / "adapter_rank4.safetensors", 4, mStream);
+
+    EXPECT_THROW(makeRuntime(makeArtifacts(makeEngine()), "adapter_rank4"), std::runtime_error);
+}
+
 } // namespace

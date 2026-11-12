@@ -91,15 +91,17 @@ int64_t loraRankDimension(std::string const& name, Coords const& shape)
 }
 
 //! Header-level validation of one adapter tensor, before its payload is read
-//! or any GPU memory is allocated. @p ranksOf pairs every adapter tensor with
-//! its rank dimension so the A/B partner check can compare ranks.
-void validateAdapterTensorName(std::string const& adapterName, std::string const& tensorName)
+//! or any GPU memory is allocated; returns its rank dimension.
+int64_t validateAdapterTensorHeader(std::string const& adapterName, std::string const& tensorName, Coords const& shape)
 {
     bool const isA = tensorName.find(binding_names::kLoraAPrefix) != std::string::npos;
     bool const isB = tensorName.find(binding_names::kLoraBPrefix) != std::string::npos;
     ELLM_CHECK(isA || isB,
         "LoRAManager: adapter '" + adapterName + "' tensor '" + tensorName
             + "' is neither a lora_A nor a lora_B weight");
+    ELLM_CHECK(
+        shape.getNumDims() == 2, "LoRAManager: adapter '" + adapterName + "' tensor '" + tensorName + "' must be 2-D");
+    return loraRankDimension(tensorName, shape);
 }
 
 void validateAdapterTensorMetadata(std::string const& adapterName, safetensors::TensorMetadata const& tensor,
@@ -135,16 +137,19 @@ void validateAdapterTensorMetadata(std::string const& adapterName, safetensors::
 //! Reject non-finite FP16 payloads. Any Inf or NaN bit pattern makes the
 //! adapter's output undefined, and the decode CUDA-graph capture only warns on
 //! failure, so the garbage would otherwise reach the server silently.
-void validateFiniteOnHost(char const* contextLabel, std::string const& name, void const* payload, size_t bytes)
+//! Safetensors payload offsets are not guaranteed to be 2-byte aligned, so words are read through memcpy.
+void validateFiniteOnHost(
+    std::string const& adapterName, std::string const& tensorName, void const* payload, size_t bytes)
 {
-    auto const* const words = static_cast<uint16_t const*>(payload);
+    auto const* const data = static_cast<unsigned char const*>(payload);
     size_t const count = bytes / sizeof(uint16_t);
     for (size_t i = 0; i < count; ++i)
     {
-        uint16_t const bits = words[i];
+        uint16_t bits{};
+        std::memcpy(&bits, data + i * sizeof(uint16_t), sizeof(bits));
         ELLM_CHECK((bits & 0x7C00U) != 0x7C00U,
-            std::string(contextLabel) + ": adapter '" + name + "' has a non-finite (Inf/NaN) value at element "
-                + std::to_string(i));
+            "LoRAManager: adapter '" + adapterName + "' tensor '" + tensorName
+                + "' has a non-finite (Inf/NaN) value at element " + std::to_string(i));
     }
 }
 
@@ -214,17 +219,16 @@ void LoRAManager::loadWeights(std::string const& name, std::filesystem::path con
     std::map<std::string, int64_t> ranksOf;
     for (auto const& entry : metadata.tensors)
     {
-        validateAdapterTensorName(name, entry.name);
-        ELLM_CHECK(ranksOf.emplace(entry.name, loraRankDimension(entry.name, entry.shape)).second,
+        ELLM_CHECK(ranksOf.emplace(entry.name, validateAdapterTensorHeader(name, entry.name, entry.shape)).second,
             "LoRAManager: adapter '" + name + "' contains duplicate tensor '" + entry.name + "'");
     }
     for (auto const& entry : metadata.tensors)
     {
         validateAdapterTensorMetadata(name, entry, ranksOf, mMaxSupportedLoraRank);
+        validateFiniteOnHost(name, entry.name, reader.getByteData() + metadata.dataOffset + entry.offset, entry.bytes);
     }
 
-    // Metadata is valid; allocate and copy the payloads (the loop from
-    // safetensors::loadSafetensors), then verify finiteness from the mapping.
+    // Metadata and values are valid; allocate and copy the payloads (the loop from safetensors::loadSafetensors).
     WeightMap weights;
     for (auto const& entry : metadata.tensors)
     {
@@ -232,7 +236,6 @@ void LoRAManager::loadWeights(std::string const& name, std::filesystem::path con
         ELLM_CHECK(static_cast<size_t>(tensor.getMemoryCapacity()) == entry.bytes,
             "LoRAManager: adapter '" + name + "' tensor '" + entry.name + "' byte count does not match its metadata");
         int8_t const* tensorData = reader.getByteData() + metadata.dataOffset + entry.offset;
-        validateFiniteOnHost("LoRAManager", name, tensorData, entry.bytes);
         CUDA_CHECK(cudaMemcpyAsync(tensor.rawPointer(), tensorData, entry.bytes, cudaMemcpyHostToDevice, stream));
         weights.emplace(entry.name, std::move(tensor));
     }
@@ -258,8 +261,7 @@ void LoRAManager::addWeights(std::string const& name, std::map<std::string, rt::
     std::map<std::string, int64_t> ranksOf;
     for (auto const& [tensorName, tensor] : weights)
     {
-        validateAdapterTensorName(name, tensorName);
-        ELLM_CHECK(ranksOf.emplace(tensorName, loraRankDimension(tensorName, tensor.getShape())).second,
+        ELLM_CHECK(ranksOf.emplace(tensorName, validateAdapterTensorHeader(name, tensorName, tensor.getShape())).second,
             "LoRAManager: adapter '" + name + "' contains duplicate tensor '" + tensorName + "'");
     }
     for (auto const& [tensorName, tensor] : weights)
@@ -268,17 +270,16 @@ void LoRAManager::addWeights(std::string const& name, std::map<std::string, rt::
             safetensors::TensorMetadata{tensorName, tensor.getDataType(), tensor.getShape(), 0, 0}, ranksOf,
             mMaxSupportedLoraRank);
 
-        // getActiveWeight hands these tensors to the engine directly; values
-        // copied from GPU are checked from a host copy so the finiteness rule
-        // is testable and deterministic.
-        if (tensor.getDataType() == nvinfer1::DataType::kHALF && tensor.getDeviceType() == DeviceType::kGPU
-            && tensor.getShape().volume() > 0)
+        size_t const bytes = static_cast<size_t>(tensor.getShape().volume()) * sizeof(uint16_t);
+        if (tensor.getDeviceType() == DeviceType::kGPU)
         {
-            std::vector<uint16_t> host(static_cast<size_t>(tensor.getShape().volume()));
-            CUDA_CHECK(cudaMemcpyAsync(host.data(), tensor.rawPointer(), host.size() * sizeof(uint16_t),
-                cudaMemcpyDeviceToHost, /*stream=*/nullptr));
-            CUDA_CHECK(cudaStreamSynchronize(nullptr));
-            validateFiniteOnHost("LoRAManager", tensorName, host.data(), host.size() * sizeof(uint16_t));
+            std::vector<uint16_t> host(bytes / sizeof(uint16_t));
+            CUDA_CHECK(cudaMemcpy(host.data(), tensor.rawPointer(), bytes, cudaMemcpyDeviceToHost));
+            validateFiniteOnHost(name, tensorName, host.data(), bytes);
+        }
+        else
+        {
+            validateFiniteOnHost(name, tensorName, tensor.rawPointer(), bytes);
         }
     }
 

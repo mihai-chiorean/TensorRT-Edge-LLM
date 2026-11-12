@@ -199,6 +199,18 @@ TEST_F(LoRAManagerTest, UnpairedLoraAThrows)
     EXPECT_THROW(mgr.addWeights("adapter1", std::move(weights)), std::runtime_error);
 }
 
+//! A factor that is not 2-D has no rank dimension; it is refused before its shape is indexed.
+TEST_F(LoRAManagerTest, OneDimensionalFactorThrows)
+{
+    LoRAManager mgr(kMaxLoraRank);
+
+    std::map<std::string, rt::Tensor> weights;
+    weights.emplace("lora_A_layer_0", makeGpuTensor({kHiddenSize}, "a1_A0"));
+    weights.emplace("lora_B_layer_0", makeGpuTensor({4, kHiddenSize}, "a1_B0"));
+
+    EXPECT_THROW(mgr.addWeights("adapter1", std::move(weights)), std::runtime_error);
+}
+
 //! FP16 is the only dtype the engine's LoRA bindings accept.
 TEST_F(LoRAManagerTest, NonFp16AdapterThrows)
 {
