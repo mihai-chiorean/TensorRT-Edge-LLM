@@ -23,7 +23,13 @@
 #include <string>
 #include <vector>
 
-using namespace trt_edgellm::rt;
+using namespace trt_edgellm;
+using trt_edgellm::rt::BindingTarget;
+using trt_edgellm::rt::Coords;
+using trt_edgellm::rt::DeviceType;
+using trt_edgellm::rt::MapBindingCache;
+using trt_edgellm::rt::Tensor;
+using trt_edgellm::rt::TensorMap;
 
 namespace
 {
@@ -31,6 +37,14 @@ namespace
 class RecordingTarget final : public BindingTarget
 {
 public:
+    RecordingTarget()
+    {
+        // 2-D so a cached output dims differs from a default-constructed Dims.
+        reportedShape.nbDims = 2;
+        reportedShape.d[0] = 4;
+        reportedShape.d[1] = 32000;
+    }
+
     struct Call
     {
         std::string name;
@@ -42,7 +56,8 @@ public:
     std::vector<Call> shapeCalls;
     //! Next setTensorAddress for a name in this set returns false (and is still recorded).
     std::vector<std::string> failingNames;
-    //! Shape reported by getTensorShape for every name.
+    //! Shape reported by getTensorShape for every name; 2-D so a cached output differs from a
+    //! default-constructed Dims.
     nvinfer1::Dims reportedShape{};
 
     bool setTensorAddress(char const* name, void* address) override
@@ -69,7 +84,6 @@ public:
         (void) name;
         return reportedShape;
     }
-
     void reset()
     {
         addressCalls.clear();
@@ -193,12 +207,16 @@ TEST(MapBindingCacheTest, FailedAddressSetterFailsAndRetriesNextApply)
     f.target.failingNames = {Fixture::kIn1};
     EXPECT_FALSE(f.cache.apply(f.map, f.target));
 
-    // The failed entry stays invalid, so the next apply retries exactly that name.
-    f.target.reset();
+    // The failed entry stays invalid, so the next apply retries exactly that name plus the
+    // bindings after it that were never reached.
+    f.target.failingNames.clear();
+    f.target.addressCalls.clear();
+    f.target.shapeCalls.clear();
     EXPECT_TRUE(f.cache.apply(f.map, f.target));
-    EXPECT_EQ(f.target.totalCalls(), 2u);
-    ASSERT_EQ(f.target.addressCalls.size(), 1u);
+    EXPECT_EQ(f.target.totalCalls(), 3u);
+    ASSERT_EQ(f.target.addressCalls.size(), 2u);
     EXPECT_EQ(f.target.addressCalls[0].name, Fixture::kIn1);
+    EXPECT_EQ(f.target.addressCalls[1].name, Fixture::kOut);
     ASSERT_EQ(f.target.shapeCalls.size(), 1u);
     EXPECT_EQ(f.target.shapeCalls[0].name, Fixture::kIn1);
 }
