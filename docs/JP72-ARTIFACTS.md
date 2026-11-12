@@ -247,6 +247,36 @@ The experimental direct checkpoint builder (`tensorrt-edgellm-build
 must therefore consume this ONNX directory via `llm_build`/`visual_build`,
 not the direct builder.
 
+## Stage 3b — LoRA inputs and adapters (optional)
+
+Only for an engine that serves LoRA adapters. On the export host, add the
+adapter inputs to the exported decoder and convert a PEFT adapter against
+them:
+
+```bash
+cd ~/tensorrt-edgellm-workspace
+PYTHONPATH="$REPO" ./quantvenv/bin/python -c \
+  'from tensorrt_edgellm.scripts.insert_lora import main; main()' \
+  --onnx-dir $ONNX/llm
+PYTHONPATH="$REPO" ./quantvenv/bin/python -c \
+  'from tensorrt_edgellm.scripts.process_lora_weights import main; main()' \
+  --input-dir $ADAPTER --output-dir $OUT/<name> \
+  --onnx-dir $ONNX/llm --max-lora-rank 16
+```
+
+`insert-lora` writes `llm/lora_model.onnx` (1.1 MB) next to `model.onnx`; it
+references the same `model.onnx.data`, so stage it into the `llm/` directory
+the device builds from. For Gemma 4 E4B (0.11.1 export) it adds 686 inputs,
+an `lora_A`/`lora_B` pair for each of 343 GEMMs: 132 attention and 126 MLP
+projections, 84 per-layer PLE gates and projections, and the PLE model
+projection. Each is bound to a rank-1 zero when an adapter does not cover it.
+
+`process-lora` checks the adapter against those inputs and writes
+`processed_adapter_model.safetensors` plus a `config.json` whose
+`edgellm_lora_processing` record lists bound, unused and unbound modules.
+For the attention+MLP tool adapter (PEFT r 16, alpha 32, 258 modules): 258
+bound, 0 unused, 85 PLE bindings unbound, 69,822,824 bytes FP16.
+
 ## Target capacity
 
 Capacity is **not** baked into these artifacts. `--max-kv-cache-capacity` in
