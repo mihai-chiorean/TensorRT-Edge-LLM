@@ -115,6 +115,7 @@ async def health(request: Request):
         context_cache = getter()
     engine = client.engine_status()
     healthy = engine is None or engine["serving"]
+    lora_info = getattr(client.llm, "lora_adapter_info", None)
     body = {
         "status": "healthy" if healthy else "unhealthy",
         "model": client.model_name,
@@ -123,6 +124,10 @@ async def health(request: Request):
         "scheduling": scheduling,
         "context_cache": context_cache,
         "engine": engine,
+        "lora": {
+            "adapters": lora_info() if lora_info is not None else [],
+            "max_lora_rank": getattr(client.llm, "max_lora_rank", 0),
+        },
         "capabilities": {
             "chat": caps.chat,
             "transcription": caps.transcription,
@@ -169,13 +174,19 @@ async def readiness(request: Request):
 @router.get("/v1/models")
 async def list_models(request: Request):
     client = request.app.state.engine_client
-    response = ModelList(data=[
+    cards = [
         ModelCard(
             id=client.model_name,
             max_model_len=client.capabilities.max_model_len,
         )
-    ])
-    return JSONResponse(response.model_dump(exclude_none=True))
+    ]
+    for adapter in getattr(client.llm, "lora_adapters", ()):
+        cards.append(
+            ModelCard(
+                id=f"{client.model_name}:{adapter.name}",
+                max_model_len=client.capabilities.max_model_len,
+            ))
+    return JSONResponse(ModelList(data=cards).model_dump(exclude_none=True))
 
 
 @router.post("/v1/chat/completions")

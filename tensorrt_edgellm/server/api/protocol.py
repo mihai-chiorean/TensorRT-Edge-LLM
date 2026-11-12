@@ -114,6 +114,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     reuse_context: StrictBool = True
     # None lets the deployment choose; see SamplingParams.cache_generated_tokens.
     cache_generated_tokens: Optional[StrictBool] = None
+    # LoRA adapter selector for deployments serving adapters. The model
+    # name's ``<served>:<adapter>`` form is the other spelling; both may be
+    # sent, but they must name the same adapter (or the base model).
+    lora_name: Optional[str] = None
     priority: StrictInt = Field(default=0, ge=-(2**31), le=2**31 - 1)
 
     @field_validator("stop")

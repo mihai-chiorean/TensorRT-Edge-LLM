@@ -399,6 +399,68 @@ For encoder-cache behavior and server configuration limits, see
 
 For tenant isolation, follow the [cache-domain requirements](../features/kv-cache-reuse.md#cache-domain).
 
+## LoRA Adapters
+
+Serve LoRA adapters alongside the base engine and select one per request. The
+engine must be built with a positive `--max-lora-rank`; adapters on a rank-0
+engine refuse to load, and an adapter whose recorded rank exceeds the engine's
+compiled maximum does the same.
+
+Adapters already processed into the engine directory are discovered
+automatically: each subdirectory of `<engine>/llm/lora_weights/` holding a
+`processed_adapter_model.safetensors` file registers under the directory name.
+Hidden entries (names starting with `.`) and plain files are ignored. Every
+visible subdirectory is loaded onto the GPU and gets its own decode CUDA graphs,
+so keep rollback or staging copies of an adapter outside `lora_weights/` (for
+example in a sibling `lora_rollback/` directory).
+Additional sidecars anywhere on disk can be named explicitly with the
+repeatable `--lora-adapter NAME=PATH` flag:
+
+```bash
+trtedge serve Qwen/Qwen3.5-0.8B \
+  --cache-dir /data/edgellm-cache \
+  --max-lora-rank 16 \
+  --lora-adapter french=/adapters/fr.safetensors
+```
+
+Names must match `[A-Za-z0-9_.-]+` and may not collide with a discovered
+adapter; a subdirectory of `lora_weights/` whose name does not match the
+pattern is a startup error rather than an adapter quietly left unserved
+(a directory without a `processed_adapter_model.safetensors` file is skipped
+with a warning). `/v1/models` lists one card per adapter as
+`<served>:<adapter>`, and `/health` reports the adapter list with each
+adapter's rank and binding coverage from its `edgellm_lora_processing`
+record.
+
+A request selects an adapter with either spelling — a model name of
+`<served>:<adapter>` or a `lora_name` field. Clients that always send
+`model` can keep using the bare served name: `model` equal to the bare
+served name (or omitted) means the base model unless `lora_name` selects an
+adapter. When `model` is adapter-qualified and `lora_name` is present and
+different — including `lora_name: ""` naming the base model — the request
+is refused with 400, as is an unknown adapter name:
+
+```bash
+curl -s http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "Qwen/Qwen3.5-0.8B:french", "messages": [{"role": "user", "content": "Bonjour"}]}'
+
+curl -s http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"lora_name": "french", "messages": [{"role": "user", "content": "Bonjour"}]}'
+
+# OpenAI clients always send model; the bare served name does not veto lora_name.
+curl -s http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "Qwen/Qwen3.5-0.8B", "lora_name": "french", "messages": [{"role": "user", "content": "Bonjour"}]}'
+```
+
+Responses echo the selected model, so an adapter request is answered as
+`<served>:<adapter>`. The adapter weights are switched per request through the
+runtime's LoRA manager; requests under
+`--enable-in-flight-batching` cannot carry an adapter and are refused with
+400, matching the engine's own submit-time refusal.
+
 ## OpenAI Chat
 
 ```bash
@@ -637,7 +699,7 @@ When `--api-key` is set, both OpenAI bearer authentication and Anthropic
 | Method | Path | Contract |
 |---|---|---|
 | `GET` | `/health`, `/health/ready` | Runtime, queue, and capability state; under in-flight batching `/health` also reports the scheduler counters (`scheduling`) and the engine state (`engine`), and both return 503 once the engine no longer serves |
-| `GET` | `/v1/models` | The loaded model |
+| `GET` | `/v1/models` | The loaded model, plus one card per served LoRA adapter |
 | `POST` | `/v1/chat/completions` | OpenAI chat and SSE |
 | `POST` | `/v1/responses` | OpenAI Responses, translated to chat |
 | `POST` | `/v1/completions` | OpenAI text completion and SSE |
