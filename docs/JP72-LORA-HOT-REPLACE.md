@@ -1,11 +1,13 @@
 # LoRA adapter hot replacement: design
 
-Status: draft for review, 2026-11-12. Fork `main` c090e173. Implementation is split into issues only after the
-prerequisites below have merged.
+Status: draft for review, 2026-11-12. Fork `main` c090e173. Priority: low. A service restart already serves a
+new adapter in about 13 s end to end (AGX, 2026-11-12), so this ranks behind the binding cache (MIT-2102), the
+adapter discovery fix (MIT-2103), target selection (MIT-2097), content-keyed caches (MIT-2098), the manifest
+(MIT-2100) and the graph gate (MIT-2099). Implementation is split into issues only after those have merged.
 
 ## 1. Problem
 
-The robot should receive behaviour updates as LoRA adapter directories (about 140 MB at rank 16, FP16) while
+The robot should receive behaviour updates as LoRA adapter directories (69.8 MB FP16 for the rank-16 attention+MLP adapter; 37.4 MB with int8 transport, MIT-2104) while
 the engine files (about 2.65 GB base + 0.16 GB MTP draft, plus embedding tables) stay in place. Copying a new
 adapter and restarting `trt-llm.service` already works once the adapter is packaged (MIT-2100). What does not
 exist is replacing or adding an adapter **without restarting the server**, with a defined failure behaviour:
@@ -15,8 +17,7 @@ exist is replacing or adding an adapter **without restarting the server**, with 
 - a restart at any moment comes back to a known-good adapter;
 - nothing on the network can trigger the swap.
 
-A restart costs about the server's start time (engine load and graph capture) and drops the warm context
-cache. Hot replacement avoids both. It is worth building only if the swap window is short and the failure
+A restart costs about 13 s (measured end to end on the AGX) and drops the warm context cache. Hot replacement avoids both. It is worth building only if the swap window is short and the failure
 behaviour is at least as safe as a restart, which is the bar this design sets.
 
 ## 2. What the code does today (verified on c090e173)
@@ -105,7 +106,7 @@ struct AdapterRegistration
 ### 4.3 Residency budget
 
 - At most **two** GPU-resident registrations per alias: active plus one candidate (or the retiring one while
-  in-flight requests finish). The rollback version stays on disk and is reloaded if needed; at 140 MB per
+  in-flight requests finish). The rollback version stays on disk and is reloaded if needed; at 70 MB per
   version, a resident rollback copy is not worth the memory on the NX.
 - A global cap `--lora-max-resident-adapters` (default: number of aliases + 1) bounds the total across aliases.
   Staging a candidate that would exceed the cap fails before allocation.
