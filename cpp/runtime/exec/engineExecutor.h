@@ -21,6 +21,7 @@
 #include "common/trtUtils.h"
 #include "runtime/config/deploymentConfig.h"
 #include "runtime/config/llmEngineConfig.h"
+#include "runtime/exec/mapBindingCache.h"
 #include "runtime/exec/tensorMap.h"
 #include "runtime/exec/tensorRegistry.h"
 #include <NvInferRuntime.h>
