@@ -31,6 +31,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace trt_edgellm
 {
@@ -202,6 +203,40 @@ private:
 
     //! Build a full snapshot of the current binding state.
     BindingSnapshot snapshotBindings() const;
+
+    //! Adapts the TRT execution context to MapBindingCache's BindingTarget seam.
+    class ContextBindingTarget final : public BindingTarget
+    {
+    public:
+        explicit ContextBindingTarget(nvinfer1::IExecutionContext& context) noexcept
+            : mContext(context)
+        {
+        }
+
+        bool setTensorAddress(char const* name, void* address) override
+        {
+            return mContext.setTensorAddress(name, address);
+        }
+
+        bool setInputShape(char const* name, nvinfer1::Dims const& dims) override
+        {
+            return mContext.setInputShape(name, dims);
+        }
+
+        nvinfer1::Dims getTensorShape(char const* name) const override
+        {
+            return mContext.getTensorShape(name);
+        }
+
+    private:
+        nvinfer1::IExecutionContext& mContext;
+    };
+
+    //! Caches of TensorMap-bound engine bindings (LoRA weights and a few others), one per execution
+    //! context because TensorRT keeps bindings per context; unchanged entries skip the setter calls,
+    //! and a profile switch invalidates the cache.
+    MapBindingCache mMapBindingCache;
+    MapBindingCache mDedicatedMapBindingCache;
 };
 
 TrtEngineExecutor::TrtEngineExecutor(std::filesystem::path const& enginePath, TensorRegistry registry,
@@ -328,6 +363,7 @@ bool TrtEngineExecutor::ensureDedicatedContext(int32_t profileIndex, cudaStream_
     mDedicatedAuxStreams = std::move(auxStreams);
     mDedicatedContext = std::move(context);
     mDedicatedProfileIndex = profileIndex;
+    mDedicatedMapBindingCache.invalidateAll();
     return true;
 }
 
@@ -473,15 +509,39 @@ bool TrtEngineExecutor::prepare(
         && !runsOnContextChunkContext(profileIndex, dims, mDedicatedProfileIndex, mRouteContextChunks))
     {
         context = mContext.get();
-        if (mCurrentProfileIndex != profileIndex && !context->setOptimizationProfileAsync(profileIndex, stream))
+        if (mCurrentProfileIndex != profileIndex)
         {
-            LOG_ERROR("failed to set optimization profile %d", profileIndex);
-            return false;
+            if (!context->setOptimizationProfileAsync(profileIndex, stream))
+            {
+                LOG_ERROR("failed to set optimization profile %d", profileIndex);
+                return false;
+            }
+            mMapBindingCache.invalidateAll();
         }
         mCurrentProfileIndex = profileIndex;
     }
     mActiveContext = context;
     mActiveProfileIndex = profileIndex;
+
+    if (!mMapBindingCache.initialized())
+    {
+        std::vector<char const*> names;
+        std::vector<bool> isInputFlags;
+        std::vector<bool> isMapBound;
+        int32_t const numIO = mEngine->getNbIOTensors();
+        names.reserve(static_cast<size_t>(numIO));
+        isInputFlags.reserve(static_cast<size_t>(numIO));
+        isMapBound.reserve(static_cast<size_t>(numIO));
+        for (int32_t i = 0; i < numIO; ++i)
+        {
+            char const* name = mEngine->getIOTensorName(i);
+            names.push_back(name);
+            isInputFlags.push_back(mEngine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT);
+            isMapBound.push_back(!mRegistry.contains(name));
+        }
+        mMapBindingCache.initialize(names, isInputFlags, isMapBound);
+        mDedicatedMapBindingCache.initialize(names, isInputFlags, isMapBound);
+    }
 
     if (!mRegistry.bindAll(context, map, dims))
     {
@@ -489,49 +549,25 @@ bool TrtEngineExecutor::prepare(
         return false;
     }
 
-    // Bind any TensorMap entries not covered by the registry. We rebind
-    // address+shape on every call (not just when getTensorAddress is null)
-    // because TRT does NOT clear bindings on setOptimizationProfileAsync —
-    // shapes and addresses persist across profile switches and across
-    // execute() calls. Unregistered tensors that change shape per step
-    // (notably kvcache_start_index, which uses [0] for initial prefill and
-    // [batch] for chunked prefill / decode) would otherwise stick at
-    // whatever shape was set by the previous step.
+    // Bind any TensorMap entries not covered by the registry. Bindings persist across profile
+    // switches and across execute() calls in TensorRT, so unchanged entries are skipped and a
+    // profile switch above invalidates the cache. Unregistered tensors that change shape per step
+    // (notably kvcache_start_index, which uses [0] for initial prefill and [batch] for chunked
+    // prefill / decode) are therefore still rebound whenever their shape changes.
     //
     // LoRA weights are model-dependent and populated into the TensorMap by
     // LoRAManager::refreshTensorMap() before prepare() is called.
-    int32_t const numIO = mEngine->getNbIOTensors();
-    for (int32_t i = 0; i < numIO; ++i)
+    MapBindingCache& cache = context == mContext.get() ? mMapBindingCache : mDedicatedMapBindingCache;
+    ContextBindingTarget target(*context);
+    if (!cache.apply(map, target))
     {
-        char const* name = mEngine->getIOTensorName(i);
-        if (mRegistry.contains(name))
-        {
-            // Already bound by bindAll above; leave alone.
-            continue;
-        }
-        Tensor* tensor = map.get(name);
-        if (tensor == nullptr)
-        {
-            LOG_ERROR(
-                "engine binding '%s' is neither registry-bound nor present in the TensorMap; "
-                "every engine I/O tensor must be handled by the registry, by LoRAManager, or by an explicit "
-                "TensorMap entry. Most likely the runtime is missing a binding for a model variant.",
-                name);
-            return false;
-        }
-        if (!context->setTensorAddress(name, tensor->rawPointer()))
-        {
-            LOG_ERROR("setTensorAddress failed for binding '%s'", name);
-            return false;
-        }
-        if (mEngine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT)
-        {
-            if (!context->setInputShape(name, toTrtDims(*tensor)))
-            {
-                LOG_ERROR("setInputShape failed for binding '%s'", name);
-                return false;
-            }
-        }
+        char const* failed = cache.lastFailedBinding();
+        LOG_ERROR(
+            "engine binding %s is missing from the TensorMap or its setter failed (profile %d); every engine "
+            "I/O tensor must be handled by the registry, by LoRAManager, or by an explicit TensorMap entry. "
+            "Most likely the runtime is missing a binding for a model variant.",
+            failed != nullptr ? failed : "?", profileIndex);
+        return false;
     }
 
     return true;
@@ -715,10 +751,16 @@ size_t computeExecutionGraphKey(
 EngineExecutor::BindingSnapshot TrtEngineExecutor::snapshotBindings() const
 {
     BindingSnapshot snap;
+    MapBindingCache const& cache = mActiveContext == mContext.get() ? mMapBindingCache : mDedicatedMapBindingCache;
     int32_t const numIO = mEngine->getNbIOTensors();
     snap.bindings.reserve(numIO);
     for (int32_t i = 0; i < numIO; ++i)
     {
+        if (auto const cached = cache.cached(i))
+        {
+            snap.bindings.emplace_back(cached->first, cached->second);
+            continue;
+        }
         char const* name = mEngine->getIOTensorName(i);
         auto const addr = reinterpret_cast<uintptr_t>(mActiveContext->getTensorAddress(name));
         nvinfer1::Dims const shape = mActiveContext->getTensorShape(name);
