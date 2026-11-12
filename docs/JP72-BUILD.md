@@ -394,3 +394,32 @@ Jetson AGX Orin 32 GB (JetPack 7.2 / CUDA 13.2 / TensorRT 10.16.2):
 7. **Unit tests** gain `unittests/unitTestScheduler`; the INT8 sidecar tests
    are in `unitTestKernelsMisc` and the media-boundary reuse test in
    `unitTestContextCache`.
+
+## Addendum: LoRA engines (opt-in)
+
+`scripts/jp72/build_engines.sh` builds without LoRA inputs unless
+`LORA_RANK` is set. `LORA_RANK=16` makes `llm_build` read
+`$O/llm/lora_model.onnx` (Stage 3b of `JP72-ARTIFACTS.md`) with
+`--maxLoraRank 16` and writes to a separate default engine directory
+(`engines-int8-16384-lora16`). The script refuses a missing
+`lora_model.onnx`, or one older than `model.onnx`. It runs `insert-lora`
+itself only when `tensorrt-edgellm-insert-lora` is on `PATH`, which it is not
+on the device (no onnx/torch).
+
+After `llm_build` the script checks `llm/config.json`: `eos_token_id` must be
+`[1, 106, 50]` and `builder_config.max_lora_rank` must equal `LORA_RANK`.
+The 0.11.x export writes those stop tokens, so nothing is edited by hand.
+
+`HW_COMPAT=same_compute_capability` passes `--hardware-compatibility` to both
+builders, so an engine built on the AGX loads on the NX. The default `none`
+targets the build GPU.
+
+```bash
+B=~/workspace/TensorRT-Edge-LLM/build O=<export with llm/lora_model.onnx> \
+  LORA_RANK=16 HW_COMPAT=same_compute_capability scripts/jp72/build_engines.sh
+```
+
+A rank-16 engine decodes about 40 % slower than the rank-0 engine on every
+request, with or without an adapter selected, and its context arena is
+437 MiB larger. See `JP72-ENGINE-BENCH.md` §10. Keep production engines at
+rank 0.
