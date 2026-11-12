@@ -210,3 +210,70 @@ its latency.
 Secondary follow-ups: the streaming `prompt_tokens: 0` bug (§7), and the
 1.5 GB memory overage, which is dominated by a fully preallocated 16,384-token
 KV pool that an 8,192 build would shrink.
+
+## 10. LoRA engine, rank 16 (2026-11-12)
+
+Jetson AGX Orin 32 GB, MAXN, JetPack 7.2 / CUDA 13.2 / TensorRT 10.16.2, fork
+`main` `17ec7c6` built with `BUILD_PYTHON_BINDINGS=ON`. Export: the 0.11.1
+vanilla Gemma 4 E4B QAT Q4_0 import (group-32 INT4, INT8 embedding/PLE
+sidecars, `rebase-0111/onnx/e4b-van`), the deployed weights without MTP.
+Both engines: `scripts/jp72/build_engines.sh`, 8192 input / 16384 KV / batch
+1, `HW_COMPAT=same_compute_capability`; one with `LORA_RANK=16` from
+`lora_model.onnx`, one with the default rank 0 from `model.onnx`. The service
+was not running on the AGX.
+
+Adapter: the PEFT tool-use adapter `adapter-qat-r16` (r 16, alpha 32, 258
+attention+MLP modules) processed per `JP72-ARTIFACTS.md` Stage 3b; the 85 PLE
+bindings stay at rank-1 zeros.
+
+| | rank 0 | rank 16 | delta |
+|---|---:|---:|---:|
+| `llm_build` wall time | 82 s | 138 s | +56 s |
+| `llm_build` peak `VmHWM` | 10,875,536 kB | 12,063,812 kB | +1.13 GiB |
+| `llm/llm.engine` | 2,648,771,260 B | 2,676,791,836 B | +28,020,576 B |
+| Context-profile activation (build log, = runtime context arena) | 1,477,777,408 B | 1,936,242,688 B | +458,465,280 B (+437 MiB) |
+| Context-profile max scratch (build log) | 353,697,792 B | 573,087,744 B | +219,389,952 B |
+| Decode-profile activation (build log) | 67,748,352 B | 67,779,072 B | +30,720 B |
+| Decode, base request | 45.0–45.2 tok/s | 27.1–27.2 tok/s | -40 % |
+| Decode, adapter request | — | 27.2–27.4 tok/s | — |
+
+Arena: the runtime logs `Setup shared execution context memory` with the same
+byte counts as the build log's context-profile `Total Activation Memory`. The
+decode profile is not the arena; the vision encoder needs 176,440,320 B and
+shares it. A first build without `HW_COMPAT` took 142 s at 11,901,936 kB (rank
+16) and 89 s at 10,948,248 kB (rank 0), with the same activation sizes.
+
+Decode: greedy, 256 tokens after a 28-token prompt, CUDA graphs captured,
+context reuse on. Two runs, each with three repeats; tok/s = 256 /
+(t(257 tokens) - t(1 token)), best of three; the prompt prefix is cached in
+both terms, so the difference is decode time. A rank-16 base request costs the
+same as an adapter request: the engine runs all 343 LoRA branches every step,
+bound either to the adapter or to rank-1 zeros. Inserting only the adapter's
+258 attention+MLP GEMMs would skip the 85 PLE branches; that selection is not
+implemented in `insert-lora`.
+
+Behaviour, on one runtime with the adapter loaded (top-5 first-token
+logprobs, greedy 64 tokens, two tools declared):
+
+| Prompt | Tools | First-token logprob, base | adapter | Greedy output |
+|---|---|---:|---:|---|
+| "Turn the volume down to 20 please." | yes | -0.108 (runner-up -2.28) | -0.0047 (runner-up -6.50) | `call:set_volume{level:20}` both |
+| "Can you look to your left?" | yes | -0.087 (runner-up -2.48) | -0.0047 (runner-up -5.98) | `call:look_at{direction:left}` both |
+| "Tell me a short joke about robots." | yes | -0.071 | -0.070 | punchline differs |
+| "What is the capital of Romania?" | no | -0.020 | -0.084 | same sentence |
+
+The adapter makes the tool-call opening near-certain where a tool applies;
+the base model's runner-up there is a different opening token.
+
+Base, adapter, base, adapter in that order gave the same tokens each time.
+With CUDA graphs captured and without them, tokens and logprobs were
+identical. With context reuse off, repeats were bit-identical; with it on, the
+second identical request reused its own adapter's prefix and moved first-token
+logprobs by up to 0.01 without changing tokens. The first adapter request after
+an identical base request matched the reuse-off adapter result exactly, so it
+did not reuse the base prefix (the cache key includes the adapter name). The runtime captures one decode graph per
+adapter plus one for base at start.
+
+Verdict: rank 16 is usable for an adapter-serving bundle, but costs about 40 %
+of decode throughput on every request and 437 MiB more arena. Production
+engines stay at rank 0, which is the script default.
