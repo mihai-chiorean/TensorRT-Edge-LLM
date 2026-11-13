@@ -46,17 +46,31 @@ void MapBindingCache::invalidateAll()
     {
         binding.valid = false;
     }
+    mResolvedMap = nullptr;
 }
 
 bool MapBindingCache::apply(TensorMap const& map, BindingTarget& target)
 {
     mLastFailedBinding = nullptr;
+    mLastApplyChanged = false;
+    // Name lookups are resolved once per TensorMap generation; every step still compares each
+    // tensor's current address and shape, because tensors are reshaped without a map change.
+    bool const resolve = mResolvedMap != &map || mResolvedGeneration != map.generation();
+    if (resolve)
+    {
+        mResolvedMap = nullptr; // set again only after every binding resolved and applied
+    }
     for (auto& binding : mMapBindings)
     {
         char const* name = binding.name;
-        Tensor* tensor = map.get(name);
+        if (resolve)
+        {
+            binding.tensor = map.get(name);
+        }
+        Tensor* tensor = binding.tensor;
         if (tensor == nullptr)
         {
+            mResolvedMap = nullptr;
             mLastFailedBinding = name;
             return false;
         }
@@ -67,6 +81,7 @@ bool MapBindingCache::apply(TensorMap const& map, BindingTarget& target)
             continue;
         }
         binding.valid = false;
+        mLastApplyChanged = true;
         if (!target.setTensorAddress(name, tensor->rawPointer()))
         {
             mLastFailedBinding = name;
@@ -81,6 +96,8 @@ bool MapBindingCache::apply(TensorMap const& map, BindingTarget& target)
         binding.dims = binding.isInput ? dims : target.getTensorShape(name);
         binding.valid = true;
     }
+    mResolvedMap = &map;
+    mResolvedGeneration = map.generation();
     return true;
 }
 

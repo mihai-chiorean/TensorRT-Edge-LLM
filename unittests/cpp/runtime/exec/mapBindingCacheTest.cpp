@@ -263,3 +263,57 @@ TEST(MapBindingCacheTest, OutOfRangeIndexReturnsNothing)
     Fixture f;
     EXPECT_FALSE(f.cache.cached(99).has_value());
 }
+
+//! A TensorMap entry repointed to another tensor (an adapter switch) is picked up even though name
+//! lookups are cached between applies; setting the same tensor again binds nothing.
+TEST(MapBindingCacheTest, RepointedMapEntryRebindsAndSameEntrySkips)
+{
+    Fixture f;
+    ASSERT_TRUE(f.cache.apply(f.map, f.target));
+    EXPECT_TRUE(f.cache.lastApplyChanged());
+    f.target.reset();
+    f.map.set(Fixture::kIn0, f.in0); // same tensor: no change
+    ASSERT_TRUE(f.cache.apply(f.map, f.target));
+    EXPECT_EQ(f.target.totalCalls(), 0u);
+    EXPECT_FALSE(f.cache.lastApplyChanged());
+
+    Tensor other{Coords{4, 128, 4096}, DeviceType::kCPU, nvinfer1::DataType::kHALF};
+    f.map.set(Fixture::kIn1, other);
+    ASSERT_TRUE(f.cache.apply(f.map, f.target));
+    EXPECT_TRUE(f.cache.lastApplyChanged());
+    ASSERT_EQ(f.target.addressCalls.size(), 1u);
+    EXPECT_EQ(f.target.addressCalls[0].name, Fixture::kIn1);
+    EXPECT_EQ(f.target.addressCalls[0].address, other.rawPointer());
+}
+
+//! Tensors are reshaped in place between steps without touching the map: the cached lookup must
+//! still see the new shape.
+TEST(MapBindingCacheTest, InPlaceReshapeIsSeenWithCachedLookups)
+{
+    Fixture f;
+    ASSERT_TRUE(f.cache.apply(f.map, f.target));
+    f.target.reset();
+    ASSERT_TRUE(f.in0.reshape(Coords{2, 128, 4096}));
+    ASSERT_TRUE(f.cache.apply(f.map, f.target));
+    ASSERT_EQ(f.target.shapeCalls.size(), 1u);
+    EXPECT_EQ(f.target.shapeCalls[0].name, Fixture::kIn0);
+    EXPECT_EQ(f.target.shapeCalls[0].dims.d[0], 2);
+}
+
+//! Assigning another map with the same number of edits must not look unchanged to the cache.
+TEST(MapBindingCacheTest, AssignedMapWithEqualEditCountRebinds)
+{
+    Fixture f;
+    ASSERT_TRUE(f.cache.apply(f.map, f.target));
+    Tensor other{Coords{4, 128, 4096}, DeviceType::kCPU, nvinfer1::DataType::kHALF};
+    TensorMap replacement;
+    replacement.set(Fixture::kIn0, other);
+    replacement.set(Fixture::kIn1, f.in1);
+    replacement.set(Fixture::kOut, f.out);
+    f.map = replacement;
+    f.target.reset();
+    ASSERT_TRUE(f.cache.apply(f.map, f.target));
+    ASSERT_EQ(f.target.addressCalls.size(), 1u);
+    EXPECT_EQ(f.target.addressCalls[0].name, Fixture::kIn0);
+    EXPECT_EQ(f.target.addressCalls[0].address, other.rawPointer());
+}

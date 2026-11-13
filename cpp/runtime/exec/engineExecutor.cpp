@@ -161,6 +161,19 @@ private:
     //! Build a full snapshot of the current binding state.
     BindingSnapshot snapshotBindings() const;
 
+    //! snapshotBindings() into @p out, reusing its storage (the per-step path allocates nothing).
+    void snapshotBindingsInto(BindingSnapshot& out) const;
+
+    //! Reused by execute() for the current step's snapshot.
+    BindingSnapshot mStepSnapshot;
+    size_t mStepKey{0};
+    //! False only while the context's bindings are exactly those mStepSnapshot/mStepKey describe:
+    //! prepare() sets it when any setter ran (or the profile changed), execute() clears it.
+    bool mBindingsDirty{true};
+    //! Graph whose snapshot matched mStepSnapshot since the bindings last changed.
+    cudaGraphExec_t mVerifiedExec{nullptr};
+    TensorRegistry::BindingCache mRegistryBindingCache;
+
     //! Adapts the TRT execution context to MapBindingCache's BindingTarget seam.
     class ContextBindingTarget final : public BindingTarget
     {
@@ -374,6 +387,8 @@ bool TrtEngineExecutor::prepare(
             return false;
         }
         mMapBindingCache.invalidateAll();
+        mRegistryBindingCache.invalidate();
+        mBindingsDirty = true;
     }
     mCurrentProfileIndex = profileIndex;
 
@@ -396,11 +411,15 @@ bool TrtEngineExecutor::prepare(
         mMapBindingCache.initialize(names, isInputFlags, isMapBound);
     }
 
-    if (!mRegistry.bindAll(mContext.get(), map, dims))
+    ContextBindingTarget target(*mContext);
+    bool registryChanged = false;
+    if (!mRegistry.bindAll(target, map, dims, mRegistryBindingCache, registryChanged))
     {
+        mBindingsDirty = true;
         LOG_ERROR("bindAll failed for profile %d", profileIndex);
         return false;
     }
+    mBindingsDirty = mBindingsDirty || registryChanged;
 
     // Bind any TensorMap entries not covered by the registry. Bindings persist across profile
     // switches and across execute() calls in TensorRT, so unchanged entries are skipped and a
@@ -410,8 +429,9 @@ bool TrtEngineExecutor::prepare(
     //
     // LoRA weights are model-dependent and populated into the TensorMap by
     // LoRAManager::refreshTensorMap() before prepare() is called.
-    ContextBindingTarget target(*mContext);
-    if (!mMapBindingCache.apply(map, target))
+    bool const applied = mMapBindingCache.apply(map, target);
+    mBindingsDirty = mBindingsDirty || mMapBindingCache.lastApplyChanged() || !applied;
+    if (!applied)
     {
         char const* failed = mMapBindingCache.lastFailedBinding();
         LOG_ERROR(
@@ -427,15 +447,25 @@ bool TrtEngineExecutor::prepare(
 
 bool TrtEngineExecutor::execute(cudaStream_t stream)
 {
-    BindingSnapshot const current = snapshotBindings();
-    size_t const hash
-        = computeExecutionGraphKey(reinterpret_cast<uintptr_t>(mEngine.get()), mCurrentProfileIndex, current);
+    // Unchanged bindings since the last step: the snapshot and key still describe the context, and
+    // querying TensorRT for every binding (output shapes re-run shape inference) is skipped.
+    if (mBindingsDirty)
+    {
+        snapshotBindingsInto(mStepSnapshot);
+        mStepKey
+            = computeExecutionGraphKey(reinterpret_cast<uintptr_t>(mEngine.get()), mCurrentProfileIndex, mStepSnapshot);
+        mBindingsDirty = false;
+        mVerifiedExec = nullptr;
+    }
+    BindingSnapshot const& current = mStepSnapshot;
+    size_t const hash = mStepKey;
     AtomicGraphCounters* const counters = countersForCurrentProfile();
     auto it = mGraphs.find(hash);
     if (it != mGraphs.end())
     {
-        if (current == it->second.snapshot)
+        if (it->second.exec == mVerifiedExec || current == it->second.snapshot)
         {
+            mVerifiedExec = it->second.exec;
             cudaError_t const err = cudaGraphLaunch(it->second.exec, stream);
             if (err == cudaSuccess)
             {
@@ -470,6 +500,7 @@ bool TrtEngineExecutor::captureGraph(cudaStream_t stream)
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
+    mVerifiedExec = nullptr;
     auto result = captureTRTCudaGraph(mContext.get(), stream);
     if (!result.has_value())
     {
@@ -632,21 +663,29 @@ size_t computeExecutionGraphKey(
 EngineExecutor::BindingSnapshot TrtEngineExecutor::snapshotBindings() const
 {
     BindingSnapshot snap;
+    snapshotBindingsInto(snap);
+    return snap;
+}
+
+void TrtEngineExecutor::snapshotBindingsInto(BindingSnapshot& out) const
+{
     int32_t const numIO = mEngine->getNbIOTensors();
-    snap.bindings.reserve(numIO);
+    out.bindings.resize(static_cast<size_t>(numIO));
+    auto const& mapBindings = mMapBindingCache.bindings();
     for (int32_t i = 0; i < numIO; ++i)
     {
-        if (auto const cached = mMapBindingCache.cached(i))
+        auto& entry = out.bindings[static_cast<size_t>(i)];
+        int32_t const m = mMapBindingCache.mapIndex(i);
+        if (m >= 0 && mapBindings[static_cast<size_t>(m)].valid)
         {
-            snap.bindings.emplace_back(cached->first, cached->second);
+            entry.first = mapBindings[static_cast<size_t>(m)].address;
+            entry.second = mapBindings[static_cast<size_t>(m)].dims;
             continue;
         }
         char const* name = mEngine->getIOTensorName(i);
-        auto const addr = reinterpret_cast<uintptr_t>(mContext->getTensorAddress(name));
-        nvinfer1::Dims const shape = mContext->getTensorShape(name);
-        snap.bindings.emplace_back(addr, shape);
+        entry.first = reinterpret_cast<uintptr_t>(mContext->getTensorAddress(name));
+        entry.second = mContext->getTensorShape(name);
     }
-    return snap;
 }
 
 } // namespace rt

@@ -17,14 +17,30 @@
 
 #include "runtime/exec/tensorMap.h"
 
+#include <atomic>
+
 namespace trt_edgellm
 {
 namespace rt
 {
 
+namespace
+{
+uint64_t nextGeneration() noexcept
+{
+    static std::atomic<uint64_t> sCounter{0};
+    return sCounter.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+} // namespace
+
 void TensorMap::set(std::string const& name, Tensor& tensor)
 {
-    mTensors[name] = &tensor;
+    auto [it, inserted] = mTensors.try_emplace(name, &tensor);
+    if (inserted || it->second != &tensor)
+    {
+        it->second = &tensor;
+        mGeneration = nextGeneration();
+    }
 }
 
 Tensor* TensorMap::get(std::string const& name) const
