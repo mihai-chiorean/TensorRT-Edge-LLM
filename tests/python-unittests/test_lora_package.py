@@ -291,7 +291,14 @@ def test_symlinked_engine_directory_is_refused(tmp_path):
 
 
 
-def test_full_verification_skips_files_whose_stamp_is_unchanged(tmp_path):
+@pytest.fixture
+def _settled(monkeypatch):
+    """Treat just-written test files as settled so they can be stamped."""
+    monkeypatch.setattr(lora_package, "_STAMP_SETTLE_NS", -10**12)
+
+
+def test_full_verification_skips_files_whose_stamp_is_unchanged(
+        tmp_path, _settled):
     llm = _engine(tmp_path)
     lora_package.write_base_identity(str(llm))
     stamps = str(tmp_path / "stamps" / "llm.json")
@@ -306,7 +313,7 @@ def test_full_verification_skips_files_whose_stamp_is_unchanged(tmp_path):
             second["verification"]["trusted_files"]) == (0, 3)
 
 
-def test_replaced_file_is_rehashed_despite_a_stamp(tmp_path):
+def test_replaced_file_is_rehashed_despite_a_stamp(tmp_path, _settled):
     llm = _engine(tmp_path)
     lora_package.write_base_identity(str(llm))
     stamps = str(tmp_path / "stamps.json")
@@ -327,3 +334,38 @@ def test_default_verification_is_full(tmp_path):
 
     with pytest.raises(ValueError, match="sha256 differs"):
         lora_package.read_base_identity(str(llm))
+
+
+def test_recently_modified_files_are_not_stamped(tmp_path):
+    llm = _engine(tmp_path)
+    lora_package.write_base_identity(str(llm))
+    stamps = str(tmp_path / "stamps.json")
+
+    lora_package.read_base_identity(str(llm), stamp_path=stamps)
+    again = lora_package.read_base_identity(str(llm), stamp_path=stamps)
+
+    assert again["verification"]["hashed_files"] == 3
+
+
+def test_stamp_cache_writable_by_others_is_ignored(tmp_path, _settled):
+    llm = _engine(tmp_path)
+    lora_package.write_base_identity(str(llm))
+    stamps = tmp_path / "stamps.json"
+    lora_package.read_base_identity(str(llm), stamp_path=str(stamps))
+    os.chmod(stamps, 0o666)
+
+    again = lora_package.read_base_identity(str(llm), stamp_path=str(stamps))
+
+    assert again["verification"]["hashed_files"] == 3
+
+
+def test_unwritable_stamp_cache_does_not_fail_verification(tmp_path, _settled):
+    llm = _engine(tmp_path)
+    lora_package.write_base_identity(str(llm))
+    blocked = tmp_path / "blocked"
+    blocked.write_text("a file where the cache directory should be")
+
+    record = lora_package.read_base_identity(
+        str(llm), stamp_path=str(blocked / "stamps.json"))
+
+    assert record["verification"]["hashed_files"] == 3

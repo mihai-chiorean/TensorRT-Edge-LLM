@@ -25,6 +25,7 @@ adapter processed for a different base. Stdlib only: the server imports it.
 import datetime
 import hashlib
 import json
+import logging
 import os
 import re
 import struct
@@ -32,6 +33,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 import tempfile
 from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 BASE_IDENTITY_FILE = "edgellm_base_identity.json"
 ADAPTER_MANIFEST_FILE = "edgellm_adapter_manifest.json"
@@ -128,15 +131,57 @@ def write_base_identity(engine_dir: str) -> dict:
     return record
 
 
-def _file_stamp(path: str) -> List[int]:
-    """Identity of a file's current inode and contents as the filesystem sees
-    it; replacing or rewriting the file changes it (ctime cannot be set)."""
-    st = os.stat(path)
+# A file modified this recently is hashed but not stamped: on filesystems with
+# coarse timestamps a same-size rewrite within one tick could keep the stamp.
+_STAMP_SETTLE_NS = 2_000_000_000
+
+
+def _stamp_of(st: os.stat_result) -> List[int]:
+    """Identity of a file's inode and contents as the filesystem sees it;
+    replacing or rewriting the file changes it (ctime cannot be set)."""
     return [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
+
+
+def _file_stamp(path: str) -> List[int]:
+    return _stamp_of(os.stat(path))
+
+
+def _hash_and_stamp(path: str) -> Tuple[str, List[int]]:
+    """SHA-256 of the file and the stamp of the exact inode that was read;
+    refuses a file that changed or was replaced while it was hashed."""
+    with open(path, "rb") as stream:
+        before = _stamp_of(os.fstat(stream.fileno()))
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(_CHUNK), b""):
+            digest.update(chunk)
+        after = _stamp_of(os.fstat(stream.fileno()))
+    if before != after or _file_stamp(path) != after:
+        raise ValueError(f"base identity mismatch: {os.path.basename(path)} "
+                         "changed while it was being verified")
+    return digest.hexdigest(), after
+
+
+def _trusted_cache_file(path: str) -> bool:
+    """Only a stamp cache that other users cannot replace may skip hashing:
+    a regular file and directory owned by this user and not group- or
+    world-writable, neither of them a symlink."""
+    for candidate in (path, os.path.dirname(os.path.abspath(path))):
+        try:
+            st = os.lstat(candidate)
+        except OSError:
+            return False
+        if (os.path.islink(candidate) or st.st_uid != os.geteuid()
+                or st.st_mode & 0o022):
+            return False
+    return os.path.isfile(path)
 
 
 def _load_stamps(stamp_path: Optional[str], digest: str) -> Dict[str, list]:
     if not stamp_path or not os.path.isfile(stamp_path):
+        return {}
+    if not _trusted_cache_file(stamp_path):
+        logger.warning("Ignoring base identity stamp cache %s: it is not a "
+                       "private file of this user", stamp_path)
         return {}
     try:
         with open(stamp_path) as stream:
@@ -199,26 +244,44 @@ def read_base_identity(engine_dir: str,
                 f"recorded {recorded[rel]['size']}")
     hashed = trusted = 0
     if verify == "full":
-        stamps = {rel: _file_stamp(os.path.join(engine_dir, rel)) for rel in paths}
         cached = _load_stamps(stamp_path, record["digest"])
+        stamps = {rel: _file_stamp(os.path.join(engine_dir, rel)) for rel in paths}
         pending = [rel for rel in paths if cached.get(rel) != stamps[rel]]
         trusted = len(paths) - len(pending)
         with ThreadPoolExecutor(max_workers=max(1, min(4, len(pending)))) as pool:
-            digests = dict(
+            results = dict(
                 zip(pending,
-                    pool.map(lambda rel: _sha256(os.path.join(engine_dir, rel)),
-                             pending)))
+                    pool.map(
+                        lambda rel: _hash_and_stamp(
+                            os.path.join(engine_dir, rel)), pending)))
         for rel in pending:
-            if digests[rel] != recorded[rel]["sha256"]:
+            digest, stamps[rel] = results[rel]
+            if digest != recorded[rel]["sha256"]:
                 raise ValueError(f"base identity mismatch: {rel} sha256 differs")
+        for rel in paths:
+            if rel not in results and _file_stamp(os.path.join(
+                    engine_dir, rel)) != stamps[rel]:
+                raise ValueError(f"base identity mismatch: {rel} changed "
+                                 "while the identity was being verified")
         hashed = len(pending)
         if stamp_path:
-            os.makedirs(os.path.dirname(os.path.abspath(stamp_path)),
-                        exist_ok=True)
-            _write_json_atomic(stamp_path, {
-                "digest": record["digest"],
-                "stamps": stamps
-            })
+            settle = time.time_ns() - _STAMP_SETTLE_NS
+            settled = {
+                rel: stamp
+                for rel, stamp in stamps.items()
+                if stamp[3] < settle and stamp[4] < settle
+            }
+            try:
+                directory = os.path.dirname(os.path.abspath(stamp_path))
+                os.makedirs(directory, mode=0o700, exist_ok=True)
+                _write_json_atomic(stamp_path, {
+                    "digest": record["digest"],
+                    "stamps": settled
+                })
+            except OSError as error:
+                # Verification succeeded; only the next start's shortcut is lost.
+                logger.warning("Could not record base identity stamps in %s: "
+                               "%s", stamp_path, error)
     record["verification"] = {
         "mode": verify,
         "hashed_files": hashed,

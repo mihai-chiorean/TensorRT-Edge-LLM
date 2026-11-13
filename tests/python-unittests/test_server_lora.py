@@ -1063,8 +1063,9 @@ def test_tts_dispatch_refuses_required_cuda_graphs(tmp_path, monkeypatch):
 
 
 def test_health_reports_how_the_base_identity_was_verified(
-        tmp_path, _fake_runtime):
+        tmp_path, _fake_runtime, monkeypatch):
     pytest.importorskip("fastapi")
+    monkeypatch.setattr(lora_package, "_STAMP_SETTLE_NS", -10**12)
     bundle = _engine_tree(tmp_path, max_lora_rank=16)
     _adapter(bundle / "llm", "tool", rank=4)
 
