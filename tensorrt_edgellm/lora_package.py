@@ -337,9 +337,21 @@ def read_safetensors_tensor_names(path: str) -> Dict[str, Tuple[str, List[int]]]
 def _adapter_targets(weights_path: str) -> Tuple[List[str], set]:
     """Module stems of a processed adapter and the set of ranks its factors carry."""
     tensors = read_safetensors_tensor_names(weights_path)
+    scales = {name for name in tensors if name.endswith("_scale")}
+    for scale in scales:
+        factor = scale[:-len("_scale")]
+        if factor not in tensors or tensors[factor][0] != "I8":
+            raise ValueError(f"{weights_path}: scale {scale!r} has no INT8 "
+                             "factor")
+    for name, (dtype, _) in tensors.items():
+        if dtype == "I8" and name + "_scale" not in tensors:
+            raise ValueError(f"{weights_path}: INT8 factor {name!r} has no "
+                             "scale")
     factors: Dict[str, set] = {}
     ranks = set()
     for name, (_, shape) in tensors.items():
+        if name in scales:
+            continue
         suffix = next((s for s in _FACTOR_SUFFIXES if name.endswith(s)), None)
         if suffix is None:
             raise ValueError(f"{weights_path}: tensor {name!r} is not a "

@@ -65,6 +65,14 @@ def main(argv=None, *, prog="tensorrt-edgellm-process-lora") -> None:
         type=int,
         default=None,
         help="Engine --maxLoraRank; the adapter rank must not exceed it")
+    parser.add_argument(
+        "--weight-format",
+        "--weight_format",
+        choices=("fp16", "int8"),
+        default="fp16",
+        help="fp16 (default), or int8: per-column INT8 factors with FP16 "
+        "scales, about half the size. A transport format only; the runtime "
+        "dequantizes to FP16 at load.")
 
     args = parser.parse_args(argv)
 
@@ -75,7 +83,8 @@ def main(argv=None, *, prog="tensorrt-edgellm-process-lora") -> None:
             input_dir=args.input_dir,
             output_dir=args.output_dir,
             onnx_dir=args.onnx_dir,
-            max_lora_rank=args.max_lora_rank)
+            max_lora_rank=args.max_lora_rank,
+            weight_format=args.weight_format)
 
         print(f"Wrote {report.output_path}: {len(report.bound)} modules, "
               f"rank {report.rank}, scale {report.lora_scale:.4f}")

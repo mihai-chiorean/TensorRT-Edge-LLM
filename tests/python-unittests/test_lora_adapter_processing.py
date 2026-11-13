@@ -447,3 +447,92 @@ def test_missing_lora_model_is_actionable(tmp_path, onnx_dir):
         process_lora_weights_and_save(str(adapter),
                                       str(tmp_path / "out"),
                                       onnx_dir=str(onnx_dir))
+
+
+def _processed(path):
+    from safetensors import safe_open
+    with safe_open(str(path), framework="pt") as f:
+        return {key: f.get_tensor(key) for key in f.keys()}, f.metadata()
+
+
+def test_int8_transport_writes_codes_and_per_column_scales(tmp_path):
+    adapter = _write_adapter(tmp_path / "adapter")
+    fp16_report = process_lora_weights_and_save(str(adapter),
+                                                str(tmp_path / "fp16"))
+    int8_report = process_lora_weights_and_save(str(adapter),
+                                                str(tmp_path / "int8"),
+                                                weight_format="int8")
+
+    reference, _ = _processed(fp16_report.output_path)
+    tensors, metadata = _processed(int8_report.output_path)
+    assert metadata == {"edgellm_lora_format": "int8_per_channel_v1"}
+    assert sorted(tensors) == sorted(
+        list(reference) + [name + "_scale" for name in reference])
+    for name, weight in reference.items():
+        codes, scale = tensors[name], tensors[name + "_scale"]
+        assert codes.dtype == torch.int8 and codes.shape == weight.shape
+        assert scale.dtype == torch.float16 and scale.shape == (weight.shape[-1], )
+        dequant = (codes.float() * scale.float()).half().float()
+        # Rounding to the code grid, then the runtime's FP16 rounding.
+        assert torch.all((dequant - weight.float()).abs() <= scale.float() / 2 +
+                         weight.float().abs() * 2.0**-10 + 1e-7)
+    record = json.loads((tmp_path / "int8" / "config.json").read_text())
+    processing = record["edgellm_lora_processing"]
+    assert processing["weight_format"] == "int8_per_channel_v1"
+    assert 0 < processing["max_relative_error"] < 0.01
+
+
+def test_int8_zero_column_gets_unit_scale(tmp_path):
+    tensors = _adapter_tensors()
+    first_a = next(key for key in tensors if "lora_A" in key)
+    tensors[first_a][0, :] = 0  # PEFT A is [r, k]: row 0 becomes column 0
+    adapter = _write_adapter(tmp_path / "adapter", tensors=tensors)
+    report = process_lora_weights_and_save(str(adapter),
+                                           str(tmp_path / "int8"),
+                                           weight_format="int8")
+
+    out, _ = _processed(report.output_path)
+    zero_scales = [
+        name for name, value in out.items()
+        if name.endswith("_scale") and bool((value == 1).any())
+    ]
+    assert zero_scales
+    for name in zero_scales:
+        factor = out[name[:-len("_scale")]]
+        column = (out[name] == 1).nonzero()[0].item()
+        assert bool((factor[:, column] == 0).all())
+
+
+def test_default_format_stays_fp16(tmp_path):
+    adapter = _write_adapter(tmp_path / "adapter")
+    report = process_lora_weights_and_save(str(adapter), str(tmp_path / "out"))
+    tensors, metadata = _processed(report.output_path)
+    assert all(t.dtype == torch.float16 for t in tensors.values())
+    assert not (metadata or {}).get("edgellm_lora_format")
+    record = json.loads((tmp_path / "out" / "config.json").read_text())
+    assert record["edgellm_lora_processing"]["weight_format"] == "fp16"
+
+
+def test_unknown_weight_format_is_refused(tmp_path):
+    adapter = _write_adapter(tmp_path / "adapter")
+    with pytest.raises(ValueError, match="weight_format"):
+        process_lora_weights_and_save(str(adapter),
+                                      str(tmp_path / "out"),
+                                      weight_format="int4")
+
+
+def test_int8_quantization_stays_finite_and_keeps_tiny_columns():
+    from tensorrt_edgellm.lora.lora import _quantize_int8_per_column
+    weight = torch.zeros((4, 3), dtype=torch.float16)
+    weight[0, 0] = 65504.0  # FP16 max
+    weight[1, 1] = 1.0132789611816406e-6  # needs a subnormal scale
+    weight[2, 2] = 1.0
+
+    codes, scales, error = _quantize_int8_per_column(weight)
+
+    dequant = (codes.float() * scales.float()).half()
+    assert torch.isfinite(dequant).all()
+    assert (scales > 0).all()
+    assert dequant[1, 1] != 0
+    assert dequant[2, 2] == 1.0
+    assert error < 0.01
