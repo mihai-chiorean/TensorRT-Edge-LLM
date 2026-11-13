@@ -50,10 +50,129 @@ trtedge process-lora \
   --output-file output.json
 ```
 
+## Adapter contract for engine-stable updates
+
+An adapter can ship as a behaviour update to a deployed device without
+rebuilding or replacing the engine. This section states what such an adapter
+can change, what it cannot, and what qualifying it means. The rules come from
+code; the function names below are where each one is enforced.
+
+### What an adapter can change
+
+- The output of the linear projections the engine was built with LoRA inputs
+  for, through `lora_A` / `lora_B` factors. For Gemma 4 robot engines these
+  are the attention and MLP projections (`q_proj`, `k_proj`, `v_proj`,
+  `o_proj`, `gate_proj`, `up_proj`, `down_proj`), selected at insertion with
+  `--lora-targets self_attn,mlp`.
+- Anything those projections influence: tool-call formatting, routing,
+  phrasing, refusals, within the limits below.
+
+### What it cannot change
+
+- **Tokens, tokenizer or chat template.** Embeddings, per-layer embeddings and
+  the LM head are never adaptable: `process-lora` refuses tensors for
+  `embed_tokens`, `embed_tokens_per_layer`, `lm_head`, `vision_tower`,
+  `audio_tower`, `visual` and `multi_modal_projector`
+  (`_UNSUPPORTED_MODULE_PARTS` in `tensorrt_edgellm/lora/lora.py`). A change that
+  needs a new token or a different template is an engine release.
+- **Modules the engine has no LoRA input for.** With `--lora-targets
+  self_attn,mlp` the per-layer-embedding projections (`per_layer_input_gate`,
+  `per_layer_projection`, `per_layer_model_projection`) have no inputs; an adapter
+  that trains them is refused ("adapter targets modules the engine has but did
+  not LoRA-insert"). Gemma 4's KV-shared layers have no `k_proj` / `v_proj`;
+  those adapter tensors are dropped and reported as `unused_adapter_modules`.
+- **PEFT features the runtime does not implement.** `_check_adapter_config`
+  refuses `use_rslora`, `use_dora`, `rank_pattern`, `alpha_pattern`,
+  `modules_to_save`, `layers_to_transform`, `layers_pattern`, any `bias` other
+  than `"none"`, and `r <= 0`. Processing folds one global `lora_alpha / r` into
+  B.
+- **Rank above the engine's `max_lora_rank`** (16 for the robot engine). The
+  runtime refuses an over-rank adapter at load, before any graph capture.
+- **The speculative draft.** With Gemma 4 MTP the draft (assistant) engine has
+  no LoRA inputs, so the draft predicts the base model while the target runs
+  the adapter. Output is unchanged (every draft token is verified against the
+  adapted target) but acceptance drops: measured 65 to 71 verify rounds for a
+  129-token story with the tool adapter, about 5% slower on long replies.
+
+### Training settings
+
+Train against the same base checkpoint revision the engine was exported from:
+
+```python
+from peft import LoraConfig
+
+LoraConfig(
+    r=16,                      # <= the engine's max_lora_rank
+    lora_alpha=32,             # any value; folded into B at processing
+    lora_dropout=0.05,
+    target_modules=r".*language_model\.layers\.\d+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)",
+    bias="none",
+    use_rslora=False,
+    use_dora=False,
+)
+```
+
+Do not set `modules_to_save`, `rank_pattern`, `alpha_pattern`,
+`layers_to_transform` or `layers_pattern`.
+
+### Packaging and identity
+
+1. `tensorrt-edgellm-process-lora --input-dir <peft adapter> --output-dir
+   <engine>/llm/lora_weights/<name> --onnx-dir <llm onnx dir> --max-lora-rank
+   16` converts the adapter against the engine's LoRA inputs. The runtime
+   adapter for a rank-16 attention+MLP Gemma 4 adapter is 69.8 MB in FP16 (the
+   140 MB sometimes quoted is the FP32 training file). `--weight-format int8`
+   writes per-column INT8 factors with FP16 scales instead (37.4 MB, at most
+   0.44% per-tensor error, identical greedy output on 9 of 9 test prompts). It
+   is a transport format only: the runtime dequantizes to FP16 at load, so
+   device memory and speed are those of the FP16 adapter.
+2. `tensorrt-edgellm-lora-package base-identity --engine-dir <engine>/llm` once
+   per engine directory, then `tensorrt-edgellm-lora-package adapter
+   --engine-dir <engine>/llm --adapter-dir <engine>/llm/lora_weights/<name>
+   --version <version>` per adapter, then `tensorrt-edgellm-lora-package verify
+   --engine-dir <engine>/llm --full` before shipping.
+3. The server refuses an adapter whose manifest is missing, names a different
+   base identity, or whose weights, modules or rank differ
+   (`_verify_lora_adapters` in `experimental/server/runtime/engine.py`). The base
+   identity covers every engine, embedding table, tokenizer, chat template and
+   config file in the engine directory, so re-exporting, re-quantizing,
+   rebuilding the engine or changing the tokenizer or template invalidates every
+   adapter: re-package and re-qualify them.
+
+### Qualification
+
+- Qualify on the exact deployed engine (behaviour, tool-call accuracy, a
+  numerical sanity check), not on the BF16 checkpoint: the engine runs W4A16
+  weights, INT8 embedding tables and FP16 activations, so an adapter validated
+  in BF16 or under another quantization is not qualified for it.
+- **Baking is not a fallback for the Gemma 4 QAT Q4_0 engine.** Merging the
+  adapter into the checkpoint and re-quantizing to the Q4_0 grid rounds the
+  low-rank delta away; the baked engine behaves like the base model (measured
+  on the AGX, 2026-11-12). The adapter only takes effect as the runtime FP16
+  LoRA branch. See also the note under [Static LoRA Merge](#static-lora-merge).
+
+### Serving limits
+
+- Adapters are selected per request (`model: "<served>:<adapter>"` or
+  `lora_name`); requests without one run the base model on the same engine.
+- The experimental server refuses adapter requests under
+  `--enable-in-flight-batching`; adapters are served on the blocking path, one
+  request at a time.
+- The CUDA graph counters in `/health.cuda_graphs` come from the root rank's
+  executors only; multi-rank (tensor-parallel) deployments do not aggregate
+  other ranks. Edge deployments are single-rank.
+- An adapter is loaded at server start. Replacing one means writing the new
+  version, re-packaging it and restarting the server (about 13 s end to end on
+  the AGX). Swapping an adapter in a running server is a draft design (fork PR
+  #64), not implemented.
+
 ## Static LoRA Merge
 
 Static merge permanently applies a LoRA adapter to the base HuggingFace
-checkpoint before optional quantization and ONNX export. For Phi-4-Multimodal,
+checkpoint before optional quantization and ONNX export. Quantizing the merged
+checkpoint can round the adapter's low-rank delta away: for the Gemma 4 QAT
+Q4_0 engine a baked adapter has no measurable effect, so ship it as a runtime
+adapter (see [Adapter contract](#adapter-contract-for-engine-stable-updates)). For Phi-4-Multimodal,
 merge the required `vision-lora` adapter before quantization and export; dynamic
 runtime LoRA is for adapters selected per request.
 
