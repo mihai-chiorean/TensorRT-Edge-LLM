@@ -787,8 +787,62 @@ def _lora_stem(gemm_name: str) -> str:
     return gemm_name.replace("/", ".").rsplit(".", 1)[0][1:]
 
 
+_LORA_GROUP_MAX_TARGETS = 3
+
+
+def _emit_lora_group_plugins(graph: gs.Graph, members) -> int:
+    """Replace the LoRA branches collected in ``members`` with LoraGroupPlugin nodes.
+
+    Branches that read the same activation (q/k/v, gate/up) share one node, up to
+    ``_LORA_GROUP_MAX_TARGETS``, in insertion order. Each output aliases its base GEMM
+    output (the plugin adds the residual in place), and every former consumer of the GEMM
+    output, including a graph output, reads the plugin output instead. Returns the number
+    of plugin nodes."""
+    groups = {}
+    for member in members:
+        groups.setdefault(id(member["input"]), []).append(member)
+    nodes = 0
+    for group in groups.values():
+        for start in range(0, len(group), _LORA_GROUP_MAX_TARGETS):
+            chunk = group[start:start + _LORA_GROUP_MAX_TARGETS]
+            for member in chunk:
+                member["final_output"] = gs.Variable(
+                    f"{member['name']}/lora_add_output", dtype=np.float16)
+                # Snapshot consumers before the plugin node also consumes the GEMM output.
+                member["consumers"] = list(member["output"].outputs)
+            graph.nodes.append(
+                gs.Node(op="LoraGroupPlugin",
+                        name=f"{chunk[0]['name']}/lora_group",
+                        domain="trt_edgellm",
+                        attrs={
+                            "num_targets": np.int32(len(chunk)),
+                            "inplace": np.int32(1)
+                        },
+                        inputs=[m["output"] for m in chunk] +
+                        [chunk[0]["input"]] + [m["lora_a"] for m in chunk] +
+                        [m["lora_b"] for m in chunk],
+                        outputs=[m["final_output"] for m in chunk]))
+            nodes += 1
+            for member in chunk:
+                output_tensor = member["output"]
+                final_output = member["final_output"]
+                for out_node in member["consumers"]:
+                    for idx, inp in enumerate(out_node.inputs):
+                        if inp is output_tensor:
+                            out_node.inputs[idx] = final_output
+                graph.outputs = [
+                    final_output if tensor is output_tensor else tensor
+                    for tensor in graph.outputs
+                ]
+                _check_lora_add_precedes_consumers(member["name"],
+                                                   output_tensor, final_output,
+                                                   member["consumers"])
+    return nodes
+
+
 def insert_lora_and_save(onnx_dir: str,
-                         lora_targets: Optional[Sequence[str]] = None):
+                         lora_targets: Optional[Sequence[str]] = None,
+                         lora_group_plugin: bool = False):
     """
     Insert LoRA patterns into ONNX models.
 
@@ -798,6 +852,9 @@ def insert_lora_and_save(onnx_dir: str,
         lora_targets: Module names selecting the GEMMs that get a LoRA branch
             (see :mod:`tensorrt_edgellm.lora_targets`); ``None`` selects every
             eligible GEMM. Each target must select at least one GEMM.
+        lora_group_plugin: Emit LoraGroupPlugin nodes (grouped by shared input, residual
+            added in place) instead of MatMul -> MatMul -> Add branches. Needs the
+            matching plugin library.
     """
     start_time = time.time()
     # Load ONNX model
@@ -834,6 +891,7 @@ def insert_lora_and_save(onnx_dir: str,
             "LoRA insertion found no eligible linear layers in model.onnx; "
             "expected a supported MatMul, Gemm, or quantized GEMM node")
 
+    group_members = []
     # Insert LoRA patterns for each GEMM
     for gemm_info in gemm_infos:
         input_tensor = gemm_info.input
@@ -851,6 +909,16 @@ def insert_lora_and_save(onnx_dir: str,
                              dtype=np.float16,
                              shape=[f"{gemm_name_for_lora}.rank", n])
         graph.inputs.extend([lora_a, lora_b])
+
+        if lora_group_plugin:
+            group_members.append({
+                "name": gemm_name,
+                "input": input_tensor,
+                "output": output_tensor,
+                "lora_a": lora_a,
+                "lora_b": lora_b
+            })
+            continue
 
         # First MatMul: input @ lora_A
         lora_mid = gs.Variable(f"{gemm_name}/lora_mid", dtype=np.float16)
@@ -884,8 +952,18 @@ def insert_lora_and_save(onnx_dir: str,
             for idx, inp in enumerate(out_node.inputs):
                 if inp is output_tensor:
                     out_node.inputs[idx] = final_output
+        # A GEMM output that is also a graph output must expose the sum as well.
+        graph.outputs = [
+            final_output if tensor is output_tensor else tensor
+            for tensor in graph.outputs
+        ]
         _check_lora_add_precedes_consumers(gemm_name, output_tensor,
                                            final_output, gemm_consumers)
+
+    if group_members:
+        logger.info("Emitted %d LoraGroupPlugin nodes for %d LoRA targets",
+                    _emit_lora_group_plugins(graph, group_members),
+                    len(group_members))
 
     graph.cleanup().toposort().fold_constants().cleanup()
 
