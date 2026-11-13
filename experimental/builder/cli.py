@@ -32,6 +32,15 @@ def _value_or_default(value, default):
     return default if value is None else value
 
 
+def _lora_targets(args: argparse.Namespace):
+    from tensorrt_edgellm.lora_targets import parse_lora_targets
+
+    targets = parse_lora_targets(getattr(args, "lora_targets", None))
+    if targets is not None and args.max_lora_rank <= 0:
+        raise ValueError("--lora-targets requires --max-lora-rank > 0")
+    return targets
+
+
 def _build_args(args: argparse.Namespace, component: str):
     from .core.builder import BuildArgs
 
@@ -46,6 +55,7 @@ def _build_args(args: argparse.Namespace, component: str):
         max_kv_cache_capacity=args.max_kv_cache_capacity,
         max_batch_size=args.max_batch_size,
         max_lora_rank=args.max_lora_rank,
+        lora_targets=_lora_targets(args),
         num_decoder_layers=args.num_decoder_layer,
         max_verify_tree_size=_value_or_default(args.max_verify_tree_size, 60),
         max_draft_tree_size=_value_or_default(args.max_draft_tree_size, 60),
@@ -185,6 +195,9 @@ def _speculative_build_plan(args: argparse.Namespace, bundle, components):
                                  "dspark") else None),
             target_model_dir=None,
         )
+        # The runtime binds LoRA inputs on the base engine only (one
+        # LoRAManager from the base config), so the draft is built without
+        # them; a draft with LoRA inputs could not be prepared.
         draft_args = _copy_args(
             args,
             model_dir=draft_model_dir,
@@ -192,6 +205,8 @@ def _speculative_build_plan(args: argparse.Namespace, bundle, components):
             tree_base=False,
             draft_model_dir=None,
             target_model_dir=args.model_dir,
+            max_lora_rank=0,
+            lora_targets=None,
         )
         plan.extend((
             ("spec-base", base_args, bundle, component),
@@ -386,6 +401,13 @@ def _add_build_args(parser: argparse.ArgumentParser) -> None:
         default=0,
         help=("Maximum supported LoRA rank. 0 disables LoRA (default: "
               "%(default)s)"))
+    parser.add_argument(
+        "--lora-targets",
+        type=str,
+        default=None,
+        help=("Comma-separated module names that get LoRA inputs, matched as "
+              "whole dot-separated segments of the module path (Gemma 4: "
+              "self_attn,mlp). Default: every eligible projection."))
     parser.add_argument(
         "--num-decoder-layer",
         type=int,

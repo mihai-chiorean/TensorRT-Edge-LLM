@@ -23,7 +23,7 @@ import shutil
 import time
 from collections import namedtuple
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import onnx
@@ -33,6 +33,8 @@ from safetensors import safe_open
 
 from tensorrt_edgellm._safetensors_io import save_file
 from tensorrt_edgellm.checkpoint import loader as checkpoint_loader
+from tensorrt_edgellm.lora_targets import (stem_matches_targets,
+                                           unmatched_targets)
 
 from .phi4mm_utils import load_phi4mm_model
 
@@ -739,13 +741,22 @@ def _check_lora_add_precedes_consumers(gemm_name: str,
 
 
 # Main functions for external use
-def insert_lora_and_save(onnx_dir: str):
+def _lora_stem(gemm_name: str) -> str:
+    """Module stem of a matched GEMM; also the prefix of its LoRA inputs."""
+    return gemm_name.replace("/", ".").rsplit(".", 1)[0][1:]
+
+
+def insert_lora_and_save(onnx_dir: str,
+                         lora_targets: Optional[Sequence[str]] = None):
     """
     Insert LoRA patterns into ONNX models.
 
     Args:
         onnx_dir (str): Directory containing model.onnx and config.json.
             The modified graph is written to lora_model.onnx in the same directory.
+        lora_targets: Module names selecting the GEMMs that get a LoRA branch
+            (see :mod:`tensorrt_edgellm.lora_targets`); ``None`` selects every
+            eligible GEMM. Each target must select at least one GEMM.
     """
     start_time = time.time()
     # Load ONNX model
@@ -759,10 +770,24 @@ def insert_lora_and_save(onnx_dir: str):
     # Insert dynamic LoRA patterns
     logger.info("Inserting dynamic LoRA patterns")
     # Track all GEMM nodes that need LoRA
-    gemm_infos = [
+    eligible = [
         gemm_info for gemm_info in _match_gemm_infos(graph)
         if "lm_head" not in gemm_info.name
     ]
+    if lora_targets is not None:
+        eligible_stems = [_lora_stem(info.name) for info in eligible]
+        missing = unmatched_targets(eligible_stems, lora_targets)
+        if missing:
+            raise ValueError(
+                f"--lora-targets {missing} match no eligible linear layer; "
+                f"eligible stems look like {sorted(eligible_stems)[:5]}")
+    gemm_infos = [
+        info for info in eligible
+        if stem_matches_targets(_lora_stem(info.name), lora_targets)
+    ]
+    logger.info("Inserting %d LoRA branches (%d eligible GEMMs skipped by "
+                "--lora-targets)", len(gemm_infos),
+                len(eligible) - len(gemm_infos))
     if not gemm_infos:
         raise ValueError(
             "LoRA insertion found no eligible linear layers in model.onnx; "
@@ -776,7 +801,7 @@ def insert_lora_and_save(onnx_dir: str):
         weight_shape = gemm_info.weight_shape
         k, n = weight_shape
         # Create dynamic input tensors for LoRA weights
-        gemm_name_for_lora = gemm_name.replace("/", ".").rsplit(".", 1)[0][1:]
+        gemm_name_for_lora = _lora_stem(gemm_name)
 
         lora_a = gs.Variable(f"{gemm_name_for_lora}.lora_A.weight",
                              dtype=np.float16,
@@ -828,6 +853,10 @@ def insert_lora_and_save(onnx_dir: str):
     logger.info("Saving modified ONNX model to %s", output_model_path)
 
     modified_onnx_model = gs.export_onnx(graph)
+    props = {prop.key: prop.value for prop in onnx_model.metadata_props}
+    props["edgellm_lora_targets"] = (",".join(lora_targets)
+                                     if lora_targets is not None else "all")
+    onnx.helper.set_model_props(modified_onnx_model, props)
     onnx.save_model(modified_onnx_model, output_model_path)
 
     end_time = time.time()

@@ -21,7 +21,7 @@ as the original model.onnx. The LoRA model will share the same data as the
 original model.
 
 Usage:
-    tensorrt-edgellm-insert-lora --onnx-dir /path/to/onnx_model
+    tensorrt-edgellm-insert-lora --onnx-dir /path/to/onnx_model [--lora-targets self_attn,mlp]
 """
 
 import argparse
@@ -48,14 +48,27 @@ def main(argv=None, *, prog="tensorrt-edgellm-insert-lora") -> None:
         required=True,
         help="Directory containing the ONNX model (model.onnx and config.json)"
     )
+    parser.add_argument(
+        "--lora-targets",
+        "--lora_targets",
+        type=str,
+        default=None,
+        help=("Comma-separated module names that get a LoRA branch, matched "
+              "as whole dot-separated segments of the module path (Gemma 4: "
+              "self_attn,mlp). Default: every eligible linear layer."))
 
     args = parser.parse_args(argv)
+    from tensorrt_edgellm.lora_targets import parse_lora_targets
+    try:
+        lora_targets = parse_lora_targets(args.lora_targets)
+    except ValueError as e:
+        parser.error(str(e))
 
     from tensorrt_edgellm.lora.lora import insert_lora_and_save
 
     try:
         # Insert LoRA patterns
-        insert_lora_and_save(onnx_dir=args.onnx_dir)
+        insert_lora_and_save(onnx_dir=args.onnx_dir, lora_targets=lora_targets)
 
         print("LoRA insertion completed successfully!")
 

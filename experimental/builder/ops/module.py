@@ -31,7 +31,7 @@ methods use symbolic tensors and free operations.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any, Iterator, Mapping, Sequence, Tuple
+from typing import Any, Iterator, Mapping, Optional, Sequence, Tuple
 
 from ..core.config import DeviceConfig
 from ..core.weights import Weights
@@ -50,6 +50,8 @@ class BuildOptions:
     sm12x: bool = False
     sm110: bool = False
     max_lora_rank: int = 0
+    #: Module names selecting LoRA projections; None selects every eligible one.
+    lora_targets: Optional[Tuple[str, ...]] = None
 
 
 @dataclass

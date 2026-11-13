@@ -452,3 +452,108 @@ def test_int4_lora_add_precedes_architectural_output_scale(tmp_path):
 def test_adapter_names_match_exported_llm_bindings(key):
     assert (_process_tensor_name(key) ==
             "model.layers.0.self_attn.q_proj.lora_A.weight")
+
+
+_THREE_STEMS = ("model.layers.0.self_attn.q_proj", "model.layers.0.mlp.up_proj",
+                "model.layers.0.per_layer_projection")
+
+
+def _three_gemm_model(onnx_dir):
+    """Three chained FP16 MatMuls whose weights carry real Gemma 4 stems."""
+    hidden = gs.Variable("hidden", dtype=np.float16, shape=["tokens", 16])
+    nodes, current = [], hidden
+    for index, stem in enumerate(_THREE_STEMS):
+        weight = gs.Constant(f"_model.{stem}.weight",
+                             values=np.zeros((16, 16), dtype=np.float16))
+        output = gs.Variable(f"out_{index}",
+                             dtype=np.float16,
+                             shape=["tokens", 16])
+        nodes.append(
+            gs.Node(op="MatMul",
+                    name=f"node_MatMul_{index}",
+                    inputs=[current, weight],
+                    outputs=[output]))
+        current = output
+    graph = gs.Graph(nodes=nodes, inputs=[hidden], outputs=[current])
+    onnx.save(gs.export_onnx(graph), onnx_dir / "model.onnx")
+
+
+def _lora_input_stems(onnx_dir):
+    model = onnx.load(onnx_dir / "lora_model.onnx")
+    stems = {
+        graph_input.name.rsplit(".lora_", 1)[0]
+        for graph_input in model.graph.input if ".lora_" in graph_input.name
+    }
+    props = {prop.key: prop.value for prop in model.metadata_props}
+    return stems, props
+
+
+def test_lora_targets_select_attention_and_mlp_only(tmp_path):
+    _three_gemm_model(tmp_path)
+
+    insert_lora_and_save(str(tmp_path), lora_targets=("mlp", "self_attn"))
+
+    stems, props = _lora_input_stems(tmp_path)
+    assert stems == {
+        "model.layers.0.self_attn.q_proj", "model.layers.0.mlp.up_proj"
+    }
+    assert props["edgellm_lora_targets"] == "mlp,self_attn"
+
+
+def test_no_lora_targets_inserts_every_eligible_gemm(tmp_path):
+    _three_gemm_model(tmp_path)
+
+    insert_lora_and_save(str(tmp_path))
+
+    stems, props = _lora_input_stems(tmp_path)
+    assert stems == set(_THREE_STEMS)
+    assert props["edgellm_lora_targets"] == "all"
+
+
+def test_lora_target_matching_nothing_is_refused_before_writing(tmp_path):
+    _three_gemm_model(tmp_path)
+
+    with pytest.raises(ValueError, match="attention"):
+        insert_lora_and_save(str(tmp_path),
+                             lora_targets=("attention", "self_attn"))
+    assert not (tmp_path / "lora_model.onnx").exists()
+
+
+def test_insert_lora_cli_passes_targets(tmp_path):
+    from tensorrt_edgellm.scripts.insert_lora import main
+    _three_gemm_model(tmp_path)
+
+    main(["--onnx-dir", str(tmp_path), "--lora-targets", "mlp"])
+
+    stems, _ = _lora_input_stems(tmp_path)
+    assert stems == {"model.layers.0.mlp.up_proj"}
+
+
+@pytest.mark.parametrize("value,expected", [
+    (" mlp, self_attn ,mlp", ("mlp", "self_attn")),
+    (None, None),
+    ("", None),
+])
+def test_parse_lora_targets(value, expected):
+    from tensorrt_edgellm.lora_targets import parse_lora_targets
+    assert parse_lora_targets(value) == expected
+
+
+@pytest.mark.parametrize("value", ["q_proj;k_proj", ",", "mlp..up"])
+def test_parse_lora_targets_rejects_malformed_values(value):
+    from tensorrt_edgellm.lora_targets import parse_lora_targets
+    with pytest.raises(ValueError):
+        parse_lora_targets(value)
+
+
+@pytest.mark.parametrize("target,selected", [
+    ("self_attn", True),
+    ("q_proj", True),
+    ("layers.0.self_attn", True),
+    ("proj", False),
+    ("layers.3.mlp", False),
+])
+def test_stem_matches_whole_segments(target, selected):
+    from tensorrt_edgellm.lora_targets import stem_matches_targets
+    assert stem_matches_targets("model.layers.0.self_attn.q_proj",
+                                (target, )) is selected
