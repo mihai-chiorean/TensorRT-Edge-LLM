@@ -24,6 +24,8 @@
 #include "common/trtUtils.h"
 #include "runtime/exec/registryBuilder.h"
 #include "runtime/exec/rtxRuntimeCache.h"
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <stdexcept>
 #include <string_view>
@@ -127,6 +129,7 @@ public:
         char const* name, int32_t profileIndex, nvinfer1::OptProfileSelector selector) const override;
     void setProfiler(nvinfer1::IProfiler* profiler) noexcept override;
     nvinfer1::ICudaEngine const& getEngine() const noexcept override;
+    std::map<int32_t, GraphCounters> graphCounters() const override;
 
 private:
     AuxStreamSet mAuxStreams{};
@@ -189,6 +192,24 @@ private:
     //! Cache of TensorMap-bound engine bindings (LoRA weights and a few others); unchanged entries
     //! skip the setter calls, and a profile switch invalidates the cache.
     MapBindingCache mMapBindingCache;
+
+    //! Lock-free counters for one optimization profile; read by graphCounters() from other threads.
+    struct AtomicGraphCounters
+    {
+        std::atomic<int64_t> graphLaunches{0};
+        std::atomic<int64_t> enqueueRuns{0};
+        std::atomic<int64_t> graphLaunchFailures{0};
+        std::atomic<int64_t> capturedGraphs{0};
+    };
+    std::unique_ptr<AtomicGraphCounters[]> mGraphCounters;
+    int32_t mNumProfiles{0};
+
+    AtomicGraphCounters* countersForCurrentProfile() noexcept
+    {
+        return (mCurrentProfileIndex >= 0 && mCurrentProfileIndex < mNumProfiles)
+            ? &mGraphCounters[static_cast<size_t>(mCurrentProfileIndex)]
+            : nullptr;
+    }
 };
 
 TrtEngineExecutor::TrtEngineExecutor(std::filesystem::path const& enginePath, TensorRegistry registry,
@@ -226,6 +247,8 @@ TrtEngineExecutor::TrtEngineExecutor(std::filesystem::path const& enginePath, Te
             mEngine->createExecutionContext(nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED));
     }
     ELLM_CHECK(mContext != nullptr, "failed to create execution context");
+    mNumProfiles = mEngine->getNbOptimizationProfiles();
+    mGraphCounters = std::make_unique<AtomicGraphCounters[]>(static_cast<size_t>(std::max(mNumProfiles, 1)));
 
     setNonBlockingAuxStreams(mContext.get(), mEngine.get(), mAuxStreams);
 
@@ -407,6 +430,7 @@ bool TrtEngineExecutor::execute(cudaStream_t stream)
     BindingSnapshot const current = snapshotBindings();
     size_t const hash
         = computeExecutionGraphKey(reinterpret_cast<uintptr_t>(mEngine.get()), mCurrentProfileIndex, current);
+    AtomicGraphCounters* const counters = countersForCurrentProfile();
     auto it = mGraphs.find(hash);
     if (it != mGraphs.end())
     {
@@ -415,12 +439,24 @@ bool TrtEngineExecutor::execute(cudaStream_t stream)
             cudaError_t const err = cudaGraphLaunch(it->second.exec, stream);
             if (err == cudaSuccess)
             {
+                if (counters != nullptr)
+                {
+                    counters->graphLaunches.fetch_add(1, std::memory_order_relaxed);
+                }
                 return true;
+            }
+            if (counters != nullptr)
+            {
+                counters->graphLaunchFailures.fetch_add(1, std::memory_order_relaxed);
             }
             LOG_WARNING("cudaGraphLaunch failed (%s), falling back to enqueueV3", cudaGetErrorString(err));
         }
     }
 
+    if (counters != nullptr)
+    {
+        counters->enqueueRuns.fetch_add(1, std::memory_order_relaxed);
+    }
     return mContext->enqueueV3(stream);
 }
 
@@ -464,8 +500,31 @@ bool TrtEngineExecutor::captureGraph(cudaStream_t stream)
     cg.snapshot = snap;
     mGraphs[hash] = cg;
 
+    if (AtomicGraphCounters* const counters = countersForCurrentProfile())
+    {
+        counters->capturedGraphs.fetch_add(1, std::memory_order_relaxed);
+    }
     LOG_INFO("captured graph (hash=0x%zx)", hash);
     return true;
+}
+
+std::map<int32_t, EngineExecutor::GraphCounters> TrtEngineExecutor::graphCounters() const
+{
+    std::map<int32_t, GraphCounters> result;
+    for (int32_t profile = 0; profile < mNumProfiles; ++profile)
+    {
+        AtomicGraphCounters const& counters = mGraphCounters[static_cast<size_t>(profile)];
+        GraphCounters const snapshot{counters.graphLaunches.load(std::memory_order_relaxed),
+            counters.enqueueRuns.load(std::memory_order_relaxed),
+            counters.graphLaunchFailures.load(std::memory_order_relaxed),
+            counters.capturedGraphs.load(std::memory_order_relaxed)};
+        if (snapshot.graphLaunches != 0 || snapshot.enqueueRuns != 0 || snapshot.graphLaunchFailures != 0
+            || snapshot.capturedGraphs != 0)
+        {
+            result.emplace(profile, snapshot);
+        }
+    }
+    return result;
 }
 
 int64_t TrtEngineExecutor::getRequiredContextMemorySize() const

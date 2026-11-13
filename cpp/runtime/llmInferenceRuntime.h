@@ -123,6 +123,9 @@ public:
     char const* getSpeculativeDecodingStrategyName() const;
     metrics::LLMGenerationMetrics const& getGenerationMetrics() const;
     std::optional<ContextCacheMetrics> getContextCacheMetrics() const;
+
+    //! Graph counters of the root rank, with the result of the last captureDecodingCUDAGraph() call.
+    CudaGraphStats getCudaGraphStats() const;
     metrics::MultimodalMetrics getMultimodalMetrics() const;
     rt::Tensor const& getEmbeddingTable() const;
     rt::Tensor const* getBaseModelHiddenStates(int32_t layerIdx) const;
@@ -167,6 +170,7 @@ private:
     LLMRankRuntime const& rootRuntime() const;
 
     std::unique_ptr<RuntimeCoordinator> mCoordinator;
+    std::optional<bool> mCaptureSucceeded; //!< Result of the last captureDecodingCUDAGraph(), on every path
 };
 
 } // namespace rt

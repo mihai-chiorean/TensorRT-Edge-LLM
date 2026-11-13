@@ -259,6 +259,7 @@ class ModelConfig:
     context_cache_config: ContextCacheConfig = field(
         default_factory=ContextCacheConfig)
     enable_in_flight_batching: bool = False
+    require_cuda_graphs: bool = False
     host_embedding_tables: bool = False
     host_ple_table: bool = False
     lora_adapters: Tuple[LoraAdapterConfig, ...] = ()
@@ -303,6 +304,7 @@ class ModelConfig:
             "speculative_config": self.speculative_config,
             "context_cache_config": self.context_cache_config,
             "enable_in_flight_batching": self.enable_in_flight_batching,
+            "require_cuda_graphs": self.require_cuda_graphs,
             "host_embedding_tables": self.host_embedding_tables,
             "host_ple_table": self.host_ple_table,
             "lora_adapters": list(self.lora_adapters),
@@ -536,6 +538,13 @@ def create_argument_parser(
               "Qwen3-Omni speech output is disabled."),
     )
     model.add_argument(
+        "--require-cuda-graphs",
+        action="store_true",
+        help=("Fail startup when decoding CUDA graph capture fails (base "
+              "model or any LoRA adapter). Without it the server starts and "
+              "/health lists the failure under degraded."),
+    )
+    model.add_argument(
         "--host-embedding-tables",
         action="store_true",
         help="Keep the INT8 token-embedding and PLE sidecar tables mapped in "
@@ -676,6 +685,7 @@ def parse_server_config(argv: Optional[Sequence[str]] = None,
         speculative_config=speculative,
         context_cache_config=context_cache,
         enable_in_flight_batching=args.enable_in_flight_batching,
+        require_cuda_graphs=args.require_cuda_graphs,
         host_embedding_tables=args.host_embedding_tables,
         host_ple_table=args.host_ple_table,
         lora_adapters=tuple(args.lora_adapter or ()),

@@ -1188,6 +1188,7 @@ class LLM:
         context_cache_config: Optional[Union[ContextCacheConfig,
                                              Mapping[str, Any]]] = None,
         enable_in_flight_batching: bool = False,
+        require_cuda_graphs: bool = False,
         host_embedding_tables: bool = False,
         host_ple_table: bool = False,
         lora_adapters: Optional[List[Any]] = None,
@@ -1226,6 +1227,15 @@ class LLM:
         self._context_cache_config = ContextCacheConfig.parse(
             context_cache_config)
         self._enable_in_flight_batching = enable_in_flight_batching
+        self._require_cuda_graphs = require_cuda_graphs
+        self._cuda_graphs_captured: Optional[bool] = None
+        if require_cuda_graphs and os.environ.get("EDGELLM_DISABLE_CUDA_GRAPH"):
+            raise ValueError("--require-cuda-graphs contradicts "
+                             "EDGELLM_DISABLE_CUDA_GRAPH, which skips capture")
+        if require_cuda_graphs and enable_in_flight_batching:
+            raise ValueError("--require-cuda-graphs is not supported with "
+                             "--enable-in-flight-batching: the engine path "
+                             "does not report graph capture")
         if host_embedding_tables and host_ple_table:
             raise ValueError(
                 "host_embedding_tables already keeps the PLE table in host "
@@ -1478,7 +1488,18 @@ class LLM:
                 **residency,
             )
         if getattr(self, "_runtime", None) is not None:
-            self._runtime.capture_decoding_cuda_graph()
+            self._cuda_graphs_captured = bool(
+                self._runtime.capture_decoding_cuda_graph())
+            if not self._cuda_graphs_captured:
+                message = ("decoding CUDA graph capture failed; decode will "
+                           "run without CUDA graphs")
+                adapters = getattr(self, "_lora_adapters", ())
+                if adapters:
+                    message += " (LoRA adapters: " + ", ".join(
+                        adapter.name for adapter in adapters) + ")"
+                if getattr(self, "_require_cuda_graphs", False):
+                    raise RuntimeError(message)
+                logger.error(message)
             self._load_omni_runtime()
         logger.info("Engine loaded and ready.")
 
@@ -2568,6 +2589,22 @@ class LLM:
     def lora_names(self) -> List[str]:
         """Registered adapter names, sorted."""
         return [adapter.name for adapter in self._lora_adapters]
+
+    def cuda_graph_info(self) -> Optional[Dict[str, Any]]:
+        """Decoding CUDA graph readiness and per-profile counters, or None.
+
+        The native counters are atomics, so this never waits for a running
+        request.
+        """
+        runtime = getattr(self, "_runtime", None)
+        if runtime is None:
+            return None
+        getter = getattr(runtime, "get_cuda_graph_stats", None)
+        return {
+            "required": bool(getattr(self, "_require_cuda_graphs", False)),
+            "captured": getattr(self, "_cuda_graphs_captured", None),
+            "counters": getter() if getter is not None else None,
+        }
 
     def lora_adapter_info(self) -> List[Dict[str, Any]]:
         """Per-adapter health report: rank and binding coverage.

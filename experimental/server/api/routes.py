@@ -50,6 +50,11 @@ async def health(request: Request):
     if getter is not None:
         scheduling = getter()
     lora_info = getattr(client.llm, "lora_adapter_info", None)
+    graph_info = getattr(client.llm, "cuda_graph_info", None)
+    cuda_graphs = graph_info() if graph_info is not None else None
+    degraded = []
+    if cuda_graphs is not None and cuda_graphs.get("captured") is False:
+        degraded.append("cuda_graph_capture_failed")
     return {
         "status": "healthy",
         "model": client.model_name,
@@ -77,6 +82,8 @@ async def health(request: Request):
             "in_flight_batching": caps.in_flight_batching,
         },
         "context_cache": await client.context_cache_metrics(),
+        "cuda_graphs": cuda_graphs,
+        "degraded": degraded,
     }
 
 

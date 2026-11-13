@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -159,6 +160,21 @@ public:
     //! @brief Access the underlying TRT engine for generic introspection.
     virtual nvinfer1::ICudaEngine const& getEngine() const noexcept = 0;
 
+    //! Per optimization-profile execution counters since construction.
+    struct GraphCounters
+    {
+        int64_t graphLaunches{0};       //!< execute() calls served by a cached CUDA graph
+        int64_t enqueueRuns{0};         //!< execute() calls served by enqueueV3 (no matching graph, or launch failed)
+        int64_t graphLaunchFailures{0}; //!< cudaGraphLaunch errors (each also counts as an enqueueRun)
+        int64_t capturedGraphs{0};      //!< successful captureGraph() calls
+    };
+
+    //! @brief Counters per profile index (only profiles with a non-zero counter). Safe to call from another thread.
+    virtual std::map<int32_t, GraphCounters> graphCounters() const
+    {
+        return {};
+    }
+
     //! @brief Snapshot of binding addresses and shapes — used for graph-cache verification.
     struct BindingSnapshot
     {
@@ -169,6 +185,14 @@ public:
 
 protected:
     EngineExecutor() = default;
+};
+
+//! CUDA graph execution counters of a runtime's base and draft engines.
+struct CudaGraphStats
+{
+    std::optional<bool> captureSucceeded; //!< Result of the last decoding graph capture; unset before one ran
+    std::map<int32_t, EngineExecutor::GraphCounters> base;
+    std::map<int32_t, EngineExecutor::GraphCounters> draft;
 };
 
 size_t computeExecutionGraphKey(

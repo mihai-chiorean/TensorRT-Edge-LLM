@@ -135,20 +135,21 @@ bool LLMInferenceRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
     try
     {
         ELLM_CHECK(mCoordinator != nullptr, "Runtime coordinator is not initialized.");
-        return mCoordinator->captureDecodingCUDAGraph(stream);
+        mCaptureSucceeded = mCoordinator->captureDecodingCUDAGraph(stream);
     }
     catch (std::exception const& e)
     {
         LOG_WARNING("CUDA graph capture failed with exception: %s", e.what());
         static_cast<void>(cudaGetLastError());
-        return false;
+        mCaptureSucceeded = false;
     }
     catch (...)
     {
         LOG_WARNING("CUDA graph capture failed with an unknown exception.");
         static_cast<void>(cudaGetLastError());
-        return false;
+        mCaptureSucceeded = false;
     }
+    return *mCaptureSucceeded;
 }
 
 bool LLMInferenceRuntime::supportsBoundaryScheduling() const noexcept
@@ -234,6 +235,13 @@ char const* LLMInferenceRuntime::getSpeculativeDecodingStrategyName() const
 metrics::LLMGenerationMetrics const& LLMInferenceRuntime::getGenerationMetrics() const
 {
     return rootRuntime().getGenerationMetrics();
+}
+
+CudaGraphStats LLMInferenceRuntime::getCudaGraphStats() const
+{
+    CudaGraphStats stats = rootRuntime().getCudaGraphStats();
+    stats.captureSucceeded = mCaptureSucceeded;
+    return stats;
 }
 
 std::optional<ContextCacheMetrics> LLMInferenceRuntime::getContextCacheMetrics() const

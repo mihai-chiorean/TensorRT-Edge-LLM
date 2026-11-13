@@ -328,6 +328,24 @@ For encoder-cache behavior and server configuration limits, see
 
 For tenant isolation, follow the [cache-domain requirements](../features/kv-cache-reuse.md#cache-domain).
 
+## Decoding CUDA graphs
+
+At startup the server captures decoding CUDA graphs for the base model and for
+every LoRA adapter. A failed capture does not stop the server by default: decode
+then runs through `enqueueV3` on every step, which on a LoRA engine costs a large
+part of its speed. `--require-cuda-graphs` makes a failed capture a startup error
+instead (it cannot be combined with `EDGELLM_DISABLE_CUDA_GRAPH` or
+`--enable-in-flight-batching`).
+
+`/health` reports `cuda_graphs`: `required`, `captured` (the capture result, or
+`null` when nothing was captured) and `counters`, the native per-profile counters
+of the base and draft engines (`graph_launches`, `enqueue_runs`,
+`graph_launch_failures`, `captured_graphs`, keyed by optimization-profile index).
+`degraded` lists `cuda_graph_capture_failed` when capture failed; `status` stays
+`healthy`. A decode profile whose `enqueue_runs` keeps growing while
+`graph_launches` stays flat is running without graphs (prefill profiles always
+run through `enqueueV3`).
+
 ## LoRA Adapters
 
 Serve LoRA adapters alongside the base engine and select one per request. The
