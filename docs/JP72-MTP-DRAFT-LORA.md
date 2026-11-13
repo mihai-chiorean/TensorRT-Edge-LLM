@@ -7,11 +7,13 @@ implementation issues in section 8 are filed after this document is reviewed.
 
 Gemma 4 MTP serving pairs the base engine (`spec_base.engine`, LoRA-capable
 since MIT-1715) with the assistant draft engine (`spec_draft.engine`, about
-0.16 GB), which has no LoRA inputs. With the tool adapter active the target's
-distribution moves and the draft's does not, so fewer draft tokens are
-accepted: measured on the AGX, a 129-token story takes 71 verify rounds with
-the adapter against 65 without it, about 5% slower on long replies. Kernel
-work cannot recover this; only a draft that follows the adapted target can.
+0.16 GB), which has no LoRA inputs. The assistant already reads the adapted
+target's hidden state and shared KV cache, so its predictions do move with the
+adapter, but its own weights do not. Measured on the AGX on 2026-11-12 with
+the tool adapter: a 129-token story takes 71 verify rounds with the adapter
+against 65 without it, about 5% slower on long replies. Kernel work cannot
+recover this; an adapted draft may. Section 7 separates the two effects before
+training anything.
 
 Output does not change: every draft token is verified against the adapted
 target (`Gemma4MTPDecoder::acceptAndCommit`). This is a speed problem only.
@@ -35,11 +37,13 @@ target (`Gemma4MTPDecoder::acceptAndCommit`). This is a speed problem only.
 Build the draft with `--max-lora-rank 16 --lora-targets
 q_proj,o_proj,mlp,pre_projection,post_projection`. That selects exactly the 22
 projections the assistant's forward pass calls (section 4) and leaves out the
-ordered-embedding `masked_embedding.centroids` projection and the LM head
-borrowed from the target. `self_attn` is not used as a target because the
-shared-KV attention constructs `k_proj` / `v_proj` it never calls; naming them
-would be harmless (no inputs are created for uncalled projections) but
-misleading.
+ordered-embedding `masked_embedding.centroids` projection and the LM head (the
+assistant's own head when its checkpoint has one, otherwise the target's; the
+builder never adapts an `lm_head` prefix). The shared-KV attention constructs
+`k_proj` / `v_proj` but never calls them, so they get no inputs: naming them
+as targets fails the build (`_check_lora_targets` refuses a target that
+selects no input), while `self_attn` would work and select only `q_proj` and
+`o_proj`. The explicit names are used for clarity.
 
 The builder change is small: `_speculative_build_plan` takes separate draft
 LoRA settings (`--draft-max-lora-rank`, `--draft-lora-targets`) instead of
@@ -129,9 +133,12 @@ assistant module tree with the geometry of `google/gemma-4-E4B-it-assistant`
 (`config.json`: `hidden_size` 256, `backbone_hidden_size` 2560, 4 layers,
 4 query heads, `head_dim` 256, `global_head_dim` 512 on the full-attention
 layer 3, `intermediate_size` 2048, `num_kv_shared_layers` 4, ordered
-embeddings with 2048 centroids) and checks which projections
-`Linear._uses_lora` selects with the targets above: exactly these 22, and with
-no targets also `masked_embedding.centroids` (the LM head is never selected).
+embeddings with 2048 centroids), runs `Gemma4AssistantForCausalLM.forward`
+over mocked graph operations, and records every projection the forward pass
+calls: the 22 below plus the LM head and `masked_embedding.centroids`, and no
+`k_proj` / `v_proj`. With the targets above `Linear._uses_lora` selects exactly
+the 22; with no targets it also selects `masked_embedding.centroids` (the LM
+head is never selected).
 
 | Binding stem | k (in) | n (out) |
 |---|---:|---:|
@@ -166,10 +173,16 @@ Distil the draft adapter from the adapted target:
 
 1. On the base adapter's training prompts, run the target with the base
    adapter and record its greedy continuation tokens (optionally the top-k
-   logits) and the per-position target hidden states the assistant consumes.
-2. Train the draft adapter (rank 16, the targets in 3.1) so the assistant
-   predicts those tokens from those hidden states and the shared target KV,
-   exactly as it is fed at inference.
+   logits), the target hidden state that seeds each draft chain, and the
+   target KV the assistant attends to.
+2. Train the draft adapter (rank 16, the targets in 3.1) on the drafting chain
+   as it runs at inference (`Gemma4MTPDecoder`): the first step reads the
+   target hidden state; each later step reads the assistant's own
+   `post_projection` feedback from the previous step, with the target KV fixed.
+   Unroll the chain to the deployed drafting depth and supervise the token at
+   every depth against the adapted target's greedy tokens; teacher-forcing
+   each step on target hidden states would never train the feedback path
+   (`post_projection`).
 3. Target: acceptance with the adapter on equal to base-level acceptance with
    the adapter off (65 verify rounds per 129-token story).
 
@@ -192,9 +205,10 @@ that matters for the base adapter; the assistant itself is small and BF16.
 - **Draft LoRA overhead exceeds the acceptance gain.** Measured in (D); if it
   does, keep (a).
 - **The distilled draft adapter does not recover acceptance.** The assistant
-  sees the adapted target's hidden states and KV already; the gain may come
-  mostly from them. Measure acceptance with an untrained (zero) draft adapter
-  on the LoRA-capable draft first, to separate the two.
+  sees the adapted target's hidden states and KV already, so part of the
+  adaptation reaches the draft without draft weights. First measure acceptance
+  on the LoRA-capable draft with zero draft factors (it must equal today's
+  draft), then with the distilled adapter; only the difference is the gain.
 - **Memory.** A second set of adapter weights is about 1.5 MB per adapter;
   draft graphs double per adapter (small engine).
 - **Naming.** The assistant's PEFT module names must map onto the builder's
