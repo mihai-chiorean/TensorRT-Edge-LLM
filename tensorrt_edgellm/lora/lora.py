@@ -369,6 +369,10 @@ def _match_nvfp4_a16_gemm(graph: gs.Graph):
 def _match_mxfp8_gemm(graph: gs.Graph):
     """
     Match MXFP8 GEMM nodes in the graph.
+
+    The dynamo exporter names the MatMul ``node_MatMul_N``, so like the FP8
+    and FP16 matchers the LoRA name comes from the weight initializer's module
+    path; the raw node name is only the fallback when that is unrecoverable.
     """
     mxfp8_gemm_infos = []
     mxfp8_quantize_linear_nodes = [
@@ -378,9 +382,10 @@ def _match_mxfp8_gemm(graph: gs.Graph):
         input_node = node.inputs[0]
         matmul_node = _find_matmul_node(node)
         weight_shape = _find_weight_shape(matmul_node)
+        stem = _stem_from_weight_init(matmul_node)
         gemm_info = GEMMInfo(input=input_node,
                              output=matmul_node.outputs[0],
-                             name=matmul_node.name,
+                             name=_synth_gemm_name(stem, matmul_node.name),
                              weight_shape=weight_shape)
         mxfp8_gemm_infos.append(gemm_info)
     return mxfp8_gemm_infos
