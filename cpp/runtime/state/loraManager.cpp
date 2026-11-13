@@ -29,10 +29,14 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cuda_fp16.h>
+#include <memory>
 #include <set>
 #include <stdexcept>
+#include <string_view>
 
 namespace trt_edgellm
 {
@@ -198,6 +202,111 @@ void validateAdaptersAgainstBindings(std::string const& contextLabel, std::map<s
     }
 }
 
+//! One adapter factor as FP16 host bytes: either the file mapping itself or a dequantized copy.
+struct HostFactor
+{
+    safetensors::TensorMetadata meta; //!< dataType is the stored type for FP16 files, kHALF after dequantization
+    void const* data{nullptr};
+    std::shared_ptr<std::vector<uint16_t>> storage; //!< Owns dequantized bytes; empty for FP16 files
+};
+
+constexpr char const* kScaleSuffix = "_scale";
+
+bool isScaleName(std::string const& name)
+{
+    std::string_view const suffix{kScaleSuffix};
+    return name.size() > suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+//! Collect the adapter's factors as FP16 host data. An INT8 transport file holds I8 factors and one FP16 scale per
+//! factor column (`<factor>_scale`, shape [columns]); it is dequantized as float(code) * float(scale) rounded to FP16.
+//! Every malformed combination (mixed FP16/I8 factors, a missing, misshaped, non-FP16, non-finite or non-positive
+//! scale, a scale without its factor) throws before any GPU allocation.
+template <typename PayloadFn>
+std::vector<HostFactor> readHostFactors(
+    std::string const& adapterName, safetensors::FileMetadata const& metadata, PayloadFn const& payloadOf)
+{
+    std::map<std::string, safetensors::TensorMetadata const*> scales;
+    std::vector<safetensors::TensorMetadata const*> factorEntries;
+    for (auto const& entry : metadata.tensors)
+    {
+        if (isScaleName(entry.name))
+        {
+            scales[entry.name] = &entry;
+        }
+        else
+        {
+            factorEntries.push_back(&entry);
+        }
+    }
+    bool const anyInt8 = std::any_of(factorEntries.begin(), factorEntries.end(),
+        [](auto const* entry) { return entry->dataType == nvinfer1::DataType::kINT8; });
+    if (!anyInt8)
+    {
+        ELLM_CHECK(scales.empty(),
+            "LoRAManager: adapter '" + adapterName + "' has scale tensor '" + scales.begin()->first
+                + "' but no INT8 factors");
+        std::vector<HostFactor> factors;
+        for (auto const* entry : factorEntries)
+        {
+            factors.push_back(HostFactor{*entry, payloadOf(*entry), nullptr});
+        }
+        return factors;
+    }
+
+    std::vector<HostFactor> factors;
+    for (auto const* entry : factorEntries)
+    {
+        std::string const& name = entry->name;
+        ELLM_CHECK(entry->dataType == nvinfer1::DataType::kINT8,
+            "LoRAManager: adapter '" + adapterName + "' mixes FP16 and INT8 factors (tensor '" + name + "')");
+        ELLM_CHECK(entry->shape.getNumDims() == 2,
+            "LoRAManager: adapter '" + adapterName + "' tensor '" + name + "' must be 2-D");
+        auto const scaleIt = scales.find(name + kScaleSuffix);
+        ELLM_CHECK(scaleIt != scales.end(),
+            "LoRAManager: adapter '" + adapterName + "' INT8 tensor '" + name + "' has no '" + name + kScaleSuffix
+                + "'");
+        safetensors::TensorMetadata const& scale = *scaleIt->second;
+        int64_t const rows = entry->shape[0];
+        int64_t const columns = entry->shape[1];
+        ELLM_CHECK(scale.dataType == nvinfer1::DataType::kHALF && scale.shape.getNumDims() == 1
+                && scale.shape[0] == columns,
+            "LoRAManager: adapter '" + adapterName + "' scale '" + scale.name + "' must be FP16 with "
+                + std::to_string(columns) + " elements");
+        auto const* codes = static_cast<int8_t const*>(static_cast<void const*>(payloadOf(*entry)));
+        auto const* scaleBytes = static_cast<unsigned char const*>(static_cast<void const*>(payloadOf(scale)));
+        std::vector<float> scaleValues(static_cast<size_t>(columns));
+        for (int64_t c = 0; c < columns; ++c)
+        {
+            __half_raw raw{};
+            std::memcpy(&raw.x, scaleBytes + c * sizeof(uint16_t), sizeof(uint16_t));
+            float const value = __half2float(__half(raw));
+            ELLM_CHECK(std::isfinite(value) && value > 0.0F,
+                "LoRAManager: adapter '" + adapterName + "' scale '" + scale.name + "' element " + std::to_string(c)
+                    + " is not a positive finite value");
+            scaleValues[static_cast<size_t>(c)] = value;
+        }
+        auto storage = std::make_shared<std::vector<uint16_t>>(static_cast<size_t>(rows * columns));
+        for (int64_t r = 0; r < rows; ++r)
+        {
+            for (int64_t c = 0; c < columns; ++c)
+            {
+                size_t const i = static_cast<size_t>(r * columns + c);
+                __half_raw const value
+                    = __half_raw(__float2half_rn(static_cast<float>(codes[i]) * scaleValues[static_cast<size_t>(c)]));
+                (*storage)[i] = value.x;
+            }
+        }
+        safetensors::TensorMetadata meta{name, nvinfer1::DataType::kHALF, entry->shape, 0, storage->size() * sizeof(uint16_t)};
+        factors.push_back(HostFactor{meta, storage->data(), storage});
+        scales.erase(scaleIt);
+    }
+    ELLM_CHECK(scales.empty(),
+        "LoRAManager: adapter '" + adapterName + "' scale '" + (scales.empty() ? std::string() : scales.begin()->first)
+            + "' has no INT8 factor");
+    return factors;
+}
+
 //! Accumulates the per-tensor lines that define an adapter's content identity.
 //! Tensors must be added in ascending name order.
 class AdapterIdentityBuilder
@@ -260,43 +369,51 @@ void LoRAManager::loadWeights(std::string const& name, std::filesystem::path con
     file_io::MmapReader reader(path);
     safetensors::FileMetadata const metadata
         = safetensors::parseMetadata(reader.getData(), reader.getSize(), path.string());
+    auto const payloadOf = [&](safetensors::TensorMetadata const& entry) {
+        return reader.getByteData() + metadata.dataOffset + entry.offset;
+    };
+
+    // FP16 factors are used as stored; an INT8 transport file (factors I8 plus one FP16 scale per column,
+    // named <factor>_scale) is dequantized here so the registered adapter is FP16 either way.
+    std::vector<HostFactor> const factors = readHostFactors(name, metadata, payloadOf);
 
     std::map<std::string, int64_t> ranksOf;
-    for (auto const& entry : metadata.tensors)
+    for (auto const& factor : factors)
     {
-        ELLM_CHECK(ranksOf.emplace(entry.name, validateAdapterTensorHeader(name, entry.name, entry.shape)).second,
-            "LoRAManager: adapter '" + name + "' contains duplicate tensor '" + entry.name + "'");
+        ELLM_CHECK(ranksOf.emplace(factor.meta.name, validateAdapterTensorHeader(name, factor.meta.name, factor.meta.shape))
+                       .second,
+            "LoRAManager: adapter '" + name + "' contains duplicate tensor '" + factor.meta.name + "'");
     }
-    for (auto const& entry : metadata.tensors)
+    for (auto const& factor : factors)
     {
-        validateAdapterTensorMetadata(name, entry, ranksOf, mMaxSupportedLoraRank);
-        validateFiniteOnHost(name, entry.name, reader.getByteData() + metadata.dataOffset + entry.offset, entry.bytes);
+        validateAdapterTensorMetadata(name, factor.meta, ranksOf, mMaxSupportedLoraRank);
+        validateFiniteOnHost(name, factor.meta.name, factor.data, factor.meta.bytes);
     }
 
-    std::vector<safetensors::TensorMetadata const*> byName;
-    byName.reserve(metadata.tensors.size());
-    for (auto const& entry : metadata.tensors)
+    std::vector<HostFactor const*> byName;
+    byName.reserve(factors.size());
+    for (auto const& factor : factors)
     {
-        byName.push_back(&entry);
+        byName.push_back(&factor);
     }
-    std::sort(byName.begin(), byName.end(), [](auto const* a, auto const* b) { return a->name < b->name; });
+    std::sort(byName.begin(), byName.end(), [](auto const* a, auto const* b) { return a->meta.name < b->meta.name; });
     AdapterIdentityBuilder identity;
-    for (auto const* entry : byName)
+    for (auto const* factor : byName)
     {
-        identity.add(entry->name, entry->dataType, entry->shape,
-            reader.getByteData() + metadata.dataOffset + entry->offset, entry->bytes);
+        identity.add(factor->meta.name, factor->meta.dataType, factor->meta.shape, factor->data, factor->meta.bytes);
     }
 
     // Metadata and values are valid; allocate and copy the payloads (the loop from safetensors::loadSafetensors).
     WeightMap weights;
-    for (auto const& entry : metadata.tensors)
+    for (auto const& factor : factors)
     {
-        Tensor tensor(entry.shape, DeviceType::kGPU, entry.dataType, entry.name);
-        ELLM_CHECK(static_cast<size_t>(tensor.getMemoryCapacity()) == entry.bytes,
-            "LoRAManager: adapter '" + name + "' tensor '" + entry.name + "' byte count does not match its metadata");
-        int8_t const* tensorData = reader.getByteData() + metadata.dataOffset + entry.offset;
-        CUDA_CHECK(cudaMemcpyAsync(tensor.rawPointer(), tensorData, entry.bytes, cudaMemcpyHostToDevice, stream));
-        weights.emplace(entry.name, std::move(tensor));
+        Tensor tensor(factor.meta.shape, DeviceType::kGPU, factor.meta.dataType, factor.meta.name);
+        ELLM_CHECK(static_cast<size_t>(tensor.getMemoryCapacity()) == factor.meta.bytes,
+            "LoRAManager: adapter '" + name + "' tensor '" + factor.meta.name
+                + "' byte count does not match its metadata");
+        CUDA_CHECK(
+            cudaMemcpyAsync(tensor.rawPointer(), factor.data, factor.meta.bytes, cudaMemcpyHostToDevice, stream));
+        weights.emplace(factor.meta.name, std::move(tensor));
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
 

@@ -20,10 +20,12 @@
 #include "common/checkMacros.h"
 #include "substituteEngine.h"
 
+#include <cuda_fp16.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 using namespace trt_edgellm;
@@ -529,6 +531,180 @@ TEST_F(LoRAManagerTest, AdapterIdentityOfUnknownAdapterThrows)
 {
     LoRAManager mgr(kMaxLoraRank);
     EXPECT_THROW(mgr.getAdapterIdentity("missing"), std::runtime_error);
+}
+
+//! A GPU tensor holding @p bytes of host data, for writing adapter files of any dtype.
+rt::Tensor makeTensorFromHost(rt::Coords const& shape, nvinfer1::DataType dtype, std::string const& name,
+    void const* bytes, size_t size)
+{
+    rt::Tensor tensor(shape, DeviceType::kGPU, dtype, name);
+    CUDA_CHECK(cudaMemcpy(tensor.rawPointer(), bytes, size, cudaMemcpyHostToDevice));
+    return tensor;
+}
+
+uint16_t halfBits(float value)
+{
+    return __half_raw(__float2half_rn(value)).x;
+}
+
+//! INT8 transport adapter: one module, A [64, 4] and B [4, 64] with codes c(i) and per-column scales.
+struct Int8Adapter
+{
+    int64_t rank{4};
+    std::vector<int8_t> aCodes, bCodes;
+    std::vector<uint16_t> aScale, bScale;
+
+    Int8Adapter()
+    {
+        aCodes.resize(static_cast<size_t>(kHiddenSize * rank));
+        bCodes.resize(static_cast<size_t>(rank * kHiddenSize));
+        for (size_t i = 0; i < aCodes.size(); ++i)
+        {
+            aCodes[i] = static_cast<int8_t>(static_cast<int>(i % 255) - 127);
+        }
+        for (size_t i = 0; i < bCodes.size(); ++i)
+        {
+            bCodes[i] = static_cast<int8_t>(static_cast<int>((i * 7) % 255) - 127);
+        }
+        for (int64_t c = 0; c < rank; ++c)
+        {
+            aScale.push_back(halfBits(0.01F * static_cast<float>(c + 1)));
+        }
+        for (int64_t c = 0; c < kHiddenSize; ++c)
+        {
+            bScale.push_back(halfBits(0.002F * static_cast<float>(c + 1)));
+        }
+    }
+
+    //! The FP16 bits the loader must produce for factor A or B.
+    std::vector<uint16_t> dequantized(bool a) const
+    {
+        auto const& codes = a ? aCodes : bCodes;
+        auto const& scale = a ? aScale : bScale;
+        int64_t const columns = a ? rank : kHiddenSize;
+        std::vector<uint16_t> out(codes.size());
+        for (size_t i = 0; i < codes.size(); ++i)
+        {
+            __half_raw s{};
+            s.x = scale[i % static_cast<size_t>(columns)];
+            out[i] = halfBits(static_cast<float>(codes[i]) * __half2float(__half(s)));
+        }
+        return out;
+    }
+
+    std::vector<rt::Tensor> tensors(bool withAScale = true) const
+    {
+        std::vector<rt::Tensor> out;
+        out.push_back(makeTensorFromHost(
+            {kHiddenSize, rank}, nvinfer1::DataType::kINT8, "lora_A_layer_0", aCodes.data(), aCodes.size()));
+        out.push_back(makeTensorFromHost(
+            {rank, kHiddenSize}, nvinfer1::DataType::kINT8, "lora_B_layer_0", bCodes.data(), bCodes.size()));
+        if (withAScale)
+        {
+            out.push_back(makeTensorFromHost({static_cast<int64_t>(aScale.size())}, nvinfer1::DataType::kHALF,
+                "lora_A_layer_0_scale", aScale.data(), aScale.size() * sizeof(uint16_t)));
+        }
+        out.push_back(makeTensorFromHost({static_cast<int64_t>(bScale.size())}, nvinfer1::DataType::kHALF,
+            "lora_B_layer_0_scale", bScale.data(), bScale.size() * sizeof(uint16_t)));
+        return out;
+    }
+};
+
+std::vector<uint16_t> readBack(rt::Tensor const& tensor)
+{
+    std::vector<uint16_t> host(static_cast<size_t>(tensor.getShape().volume()));
+    CUDA_CHECK(cudaMemcpy(host.data(), tensor.rawPointer(), host.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    return host;
+}
+
+//! An INT8 transport file registers FP16 factors equal to float(code) * float(scale) rounded to FP16.
+TEST_F(LoRAManagerTest, Int8AdapterIsDequantizedToFp16AtLoad)
+{
+    auto const dir = makeScratchDir("loraManagerTest");
+    Int8Adapter const adapter;
+    ASSERT_TRUE(safetensors::saveSafetensors(dir / "int8.safetensors", adapter.tensors(), mStream));
+
+    LoRAManager mgr(kMaxLoraRank);
+    mgr.loadWeights("int8", dir / "int8.safetensors", mStream);
+    mgr.switchWeights("int8");
+
+    rt::Tensor& a = mgr.getActiveWeight("lora_A_layer_0");
+    rt::Tensor& b = mgr.getActiveWeight("lora_B_layer_0");
+    EXPECT_EQ(a.getDataType(), nvinfer1::DataType::kHALF);
+    EXPECT_EQ(readBack(a), adapter.dequantized(true));
+    EXPECT_EQ(readBack(b), adapter.dequantized(false));
+    EXPECT_EQ(mgr.getBindingNames().size(), 2u);
+    std::filesystem::remove_all(dir);
+}
+
+//! The transport format does not change what the adapter is: its identity equals the FP16 file of its values.
+TEST_F(LoRAManagerTest, Int8AdapterIdentityMatchesItsDequantizedFp16File)
+{
+    auto const dir = makeScratchDir("loraManagerTest");
+    Int8Adapter const adapter;
+    ASSERT_TRUE(safetensors::saveSafetensors(dir / "int8.safetensors", adapter.tensors(), mStream));
+    auto const aHost = adapter.dequantized(true);
+    auto const bHost = adapter.dequantized(false);
+    std::vector<rt::Tensor> fp16;
+    fp16.push_back(makeTensorFromHost({kHiddenSize, adapter.rank}, nvinfer1::DataType::kHALF, "lora_A_layer_0",
+        aHost.data(), aHost.size() * sizeof(uint16_t)));
+    fp16.push_back(makeTensorFromHost({adapter.rank, kHiddenSize}, nvinfer1::DataType::kHALF, "lora_B_layer_0",
+        bHost.data(), bHost.size() * sizeof(uint16_t)));
+    ASSERT_TRUE(safetensors::saveSafetensors(dir / "fp16.safetensors", fp16, mStream));
+
+    LoRAManager mgr(kMaxLoraRank);
+    mgr.loadWeights("int8", dir / "int8.safetensors", mStream);
+    mgr.loadWeights("fp16", dir / "fp16.safetensors", mStream);
+
+    EXPECT_EQ(mgr.getAdapterIdentity("int8"), mgr.getAdapterIdentity("fp16"));
+    std::filesystem::remove_all(dir);
+}
+
+//! Each malformed INT8 file is refused at load.
+TEST_F(LoRAManagerTest, MalformedInt8AdaptersThrow)
+{
+    auto const dir = makeScratchDir("loraManagerTest");
+    Int8Adapter const good;
+    auto const expectThrow = [&](std::vector<rt::Tensor> const& tensors, char const* label) {
+        auto const file = dir / (std::string(label) + ".safetensors");
+        ASSERT_TRUE(safetensors::saveSafetensors(file, tensors, mStream));
+        LoRAManager mgr(kMaxLoraRank);
+        EXPECT_THROW(mgr.loadWeights(label, file, mStream), std::runtime_error) << label;
+    };
+
+    // The well-formed file loads, so each refusal below is about its one defect.
+    ASSERT_TRUE(safetensors::saveSafetensors(dir / "good.safetensors", good.tensors(), mStream));
+    LoRAManager goodManager(kMaxLoraRank);
+    EXPECT_NO_THROW(goodManager.loadWeights("good", dir / "good.safetensors", mStream));
+
+    expectThrow(good.tensors(/*withAScale=*/false), "missingScale");
+
+    Int8Adapter shortScale;
+    shortScale.aScale.pop_back();
+    expectThrow(shortScale.tensors(), "wrongScaleLength");
+
+    Int8Adapter zeroScale;
+    zeroScale.bScale[3] = halfBits(0.0F);
+    expectThrow(zeroScale.tensors(), "zeroScale");
+
+    Int8Adapter nanScale;
+    nanScale.bScale[5] = 0x7E00;
+    expectThrow(nanScale.tensors(), "nanScale");
+
+    auto f32Scale = good.tensors();
+    std::vector<float> f32(static_cast<size_t>(good.rank), 0.01F);
+    f32Scale[2] = makeTensorFromHost(
+        {good.rank}, nvinfer1::DataType::kFLOAT, "lora_A_layer_0_scale", f32.data(), f32.size() * sizeof(float));
+    expectThrow(f32Scale, "f32Scale");
+
+    auto mixed = good.tensors();
+    std::vector<uint16_t> bFp16(static_cast<size_t>(good.rank * kHiddenSize), 0x3800);
+    mixed[1] = makeTensorFromHost({good.rank, kHiddenSize}, nvinfer1::DataType::kHALF, "lora_B_layer_0",
+        bFp16.data(), bFp16.size() * sizeof(uint16_t));
+    mixed.pop_back(); // the B scale
+    expectThrow(mixed, "mixedFp16Int8");
+
+    std::filesystem::remove_all(dir);
 }
 
 } // namespace

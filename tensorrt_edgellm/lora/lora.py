@@ -728,6 +728,29 @@ def _process_tensor(tensor: torch.Tensor, key: str, lora_alpha: float,
     return tensor
 
 
+INT8_LORA_FORMAT = "int8_per_channel_v1"
+_WEIGHT_FORMATS = ("fp16", "int8")
+
+
+def _quantize_int8_per_column(tensor: torch.Tensor):
+    """Symmetric INT8 with one FP16 scale per column (last axis) of an FP16
+    factor; a zero column gets scale 1 and zero codes. Returns
+    ``(codes, scales, relative Frobenius error of the dequantized factor)``."""
+    weights = tensor.float()
+    scale = weights.abs().amax(dim=0) / 127.0
+    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+    scale16 = scale.to(torch.float16)
+    if not torch.isfinite(scale16).all() or not (scale16 > 0).all():
+        raise ValueError("INT8 scale is not a positive finite FP16 value")
+    codes = torch.clamp(torch.round(weights / scale16.float()), -127,
+                        127).to(torch.int8)
+    dequant = codes.float() * scale16.float()
+    norm = torch.linalg.norm(weights)
+    error = float(torch.linalg.norm(dequant - weights) /
+                  norm) if norm > 0 else 0.0
+    return codes.contiguous(), scale16.contiguous(), error
+
+
 def _check_lora_add_precedes_consumers(gemm_name: str,
                                        output_tensor: gs.Tensor,
                                        final_output: gs.Tensor,
@@ -987,7 +1010,8 @@ def process_lora_weights_and_save(
         input_dir: str,
         output_dir: str,
         onnx_dir: Optional[str] = None,
-        max_lora_rank: Optional[int] = None) -> LoraProcessingReport:
+        max_lora_rank: Optional[int] = None,
+        weight_format: str = "fp16") -> LoraProcessingReport:
     """Convert a PEFT LoRA adapter into the runtime's binding layout.
 
     Every tensor must be a ``lora_A`` / ``lora_B`` weight pair of one module;
@@ -1015,10 +1039,17 @@ def process_lora_weights_and_save(
         onnx_dir: Optional directory with ``lora_model.onnx``.
         max_lora_rank: Optional engine ``--maxLoraRank``; the adapter rank
             must not exceed it.
+        weight_format: ``"fp16"`` (default) or ``"int8"``: symmetric INT8
+            factors with one FP16 scale per column, stored as
+            ``<stem>.lora_{A,B}.weight`` (I8) plus ``...weight_scale`` (F16).
+            A transport format only: the runtime dequantizes to FP16 at load.
 
     Returns:
         LoraProcessingReport: bound, unused and unbound module lists.
     """
+    if weight_format not in _WEIGHT_FORMATS:
+        raise ValueError(f"weight_format must be one of {_WEIGHT_FORMATS}, "
+                         f"got {weight_format!r}")
     config_path = os.path.join(input_dir, 'adapter_config.json')
     config = _read_adapter_config(config_path)
     lora_alpha, r = _check_adapter_config(config)
@@ -1116,8 +1147,21 @@ def process_lora_weights_and_save(
             processed_tensors[f"{stem}.lora_A.weight"] = tensors["A"]
             processed_tensors[f"{stem}.lora_B.weight"] = tensors["B"]
 
+    max_relative_error = None
+    if weight_format == "int8":
+        quantized = {}
+        max_relative_error = 0.0
+        for name, tensor in processed_tensors.items():
+            codes, scales, error = _quantize_int8_per_column(tensor)
+            quantized[name] = codes
+            quantized[name + "_scale"] = scales
+            max_relative_error = max(max_relative_error, error)
+        processed_tensors = quantized
+
     provenance = {
         "processing_schema_version": 1,
+        "weight_format":
+        INT8_LORA_FORMAT if weight_format == "int8" else "fp16",
         "source_adapter_dir": os.path.abspath(input_dir),
         "adapter_model_sha256": _sha256(safetensor_path),
         "base_model_name_or_path": config.get("base_model_name_or_path"),
@@ -1132,6 +1176,8 @@ def process_lora_weights_and_save(
         "unused_adapter_modules": unused,
         "unbound_untargeted_bindings": sorted(unbound_untargeted),
     }
+    if max_relative_error is not None:
+        provenance["max_relative_error"] = max_relative_error
     if onnx_dir is not None:
         provenance["engine"] = _engine_provenance(onnx_dir)
     output_config = dict(config)
@@ -1140,7 +1186,10 @@ def process_lora_weights_and_save(
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir,
                                'processed_adapter_model.safetensors')
-    save_file(processed_tensors, output_path)
+    save_file(processed_tensors,
+              output_path,
+              metadata={"edgellm_lora_format": INT8_LORA_FORMAT}
+              if weight_format == "int8" else None)
     with open(os.path.join(output_dir, 'config.json'), 'w') as out:
         json.dump(output_config, out, indent=2)
 
