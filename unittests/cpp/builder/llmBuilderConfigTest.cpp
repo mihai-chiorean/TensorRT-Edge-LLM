@@ -39,6 +39,22 @@ LLMBuilderConfig makeConfig()
 
 } // namespace
 
+TEST(LLMBuilderConfigTest, LoraInactiveRankRoundTripsForLoraEngines)
+{
+    LLMBuilderConfig config = makeConfig();
+    config.maxLoraRank = 16;
+    config.loraInactiveRank = 0;
+    Json const json = config.toJson();
+    EXPECT_EQ(json.at("lora_inactive_rank"), 0);
+    EXPECT_EQ(LLMBuilderConfig::fromJson(json).loraInactiveRank, 0);
+
+    // Engines without LoRA do not record it; configs written before the field default to 1.
+    EXPECT_FALSE(makeConfig().toJson().contains("lora_inactive_rank"));
+    Json legacy = json;
+    legacy.erase("lora_inactive_rank");
+    EXPECT_EQ(LLMBuilderConfig::fromJson(legacy).loraInactiveRank, 1);
+}
+
 TEST(LLMBuilderConfigTest, DefaultPoolPagesResolveToMinimumActivePages)
 {
     LLMBuilderConfig const config = makeConfig();

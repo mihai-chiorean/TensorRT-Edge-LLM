@@ -438,9 +438,12 @@ bool LLMBuilder::build()
 
     // LoraGroupPlugin adds the LoRA residual in place (aliased plugin I/O).
     bool const loraGroupPlugin = mBuilderConfig.maxLoraRank > 0 && allLoraBranchesGrouped(*network);
+    // Record it so the runtime binds LoRA inputs no adapter covers at rank 0 (the plugin
+    // launches nothing for them) instead of rank-1 zero dummies.
+    mBuilderConfig.loraInactiveRank = loraGroupPlugin ? 0 : 1;
     if (loraGroupPlugin)
     {
-        LOG_INFO("LoRA branches are LoraGroupPlugin nodes: aliased plugin I/O enabled");
+        LOG_INFO("LoRA branches are LoraGroupPlugin nodes: aliased plugin I/O enabled, inactive LoRA rank 0");
     }
 
     // Create builder config

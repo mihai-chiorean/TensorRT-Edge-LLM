@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <vector>
@@ -737,6 +738,87 @@ TEST_F(LoRAManagerTest, Int8PayloadShorterThanItsShapeThrows)
     LoRAManager mgr(kMaxLoraRank);
     EXPECT_THROW(mgr.loadWeights("short", dir / "short.safetensors", mStream), std::runtime_error);
     std::filesystem::remove_all(dir);
+}
+
+//! Engines whose LoRA branches are LoraGroupPlugin nodes record inactive rank 0: LoRA inputs
+//! no adapter covers must then be bound with a zero rank dimension (the plugin launches
+//! nothing for them), on a valid allocation. Legacy engines keep the rank-1 zero dummies.
+TEST_F(LoRAManagerTest, InactiveRankFromEngineConfigShapesTheBoundDummies)
+{
+    unsetenv("EDGELLM_LORA_EMPTY_RANK");
+    for (int32_t const inactive : {0, 1})
+    {
+        LoRAManager mgr(kMaxLoraRank, inactive);
+        auto engine = makeLoraEngine();
+        mgr.initializeEngineBindings(*engine);
+        TensorMap map;
+        mgr.refreshTensorMap(map);
+        rt::Tensor* const a = map.get("lora_A_layer_0");
+        rt::Tensor* const b = map.get("lora_B_layer_0");
+        ASSERT_NE(a, nullptr);
+        ASSERT_NE(b, nullptr);
+        EXPECT_EQ(a->getShape()[1], inactive);
+        EXPECT_EQ(b->getShape()[0], inactive);
+        EXPECT_EQ(a->getShape()[0], kHiddenSize);
+        EXPECT_EQ(b->getShape()[1], kHiddenSize);
+        EXPECT_NE(a->rawPointer(), nullptr);
+        EXPECT_NE(b->rawPointer(), nullptr);
+    }
+}
+
+TEST_F(LoRAManagerTest, LegacyConstructorBindsRankOneDummies)
+{
+    unsetenv("EDGELLM_LORA_EMPTY_RANK");
+    LoRAManager mgr(kMaxLoraRank);
+    auto engine = makeLoraEngine();
+    mgr.initializeEngineBindings(*engine);
+    TensorMap map;
+    mgr.refreshTensorMap(map);
+    ASSERT_NE(map.get("lora_A_layer_0"), nullptr);
+    EXPECT_EQ(map.get("lora_A_layer_0")->getShape()[1], 1);
+}
+
+//! The override may raise an engine's inactive rank to 1, never lower it: MatMul LoRA
+//! branches need rank-1 inactive bindings. Anything but exactly "0" or "1" is ignored.
+TEST_F(LoRAManagerTest, EmptyRankOverrideCanOnlyRaiseTheEngineRank)
+{
+    struct Case
+    {
+        char const* value;
+        int32_t engineRank;
+        int64_t expected;
+    };
+    for (Case const c : {Case{"1", 0, 1}, Case{"0", 1, 1}, Case{"0", 0, 0}, Case{"0junk", 0, 0}, Case{"2", 1, 1}})
+    {
+        setenv("EDGELLM_LORA_EMPTY_RANK", c.value, 1);
+        LoRAManager mgr(kMaxLoraRank, c.engineRank);
+        auto engine = makeLoraEngine();
+        mgr.initializeEngineBindings(*engine);
+        TensorMap map;
+        mgr.refreshTensorMap(map);
+        ASSERT_NE(map.get("lora_A_layer_0"), nullptr);
+        EXPECT_EQ(map.get("lora_A_layer_0")->getShape()[1], c.expected)
+            << "value " << c.value << " engine rank " << c.engineRank;
+    }
+    unsetenv("EDGELLM_LORA_EMPTY_RANK");
+}
+
+//! After an adapter is selected and then reset, the binding returns to the inactive rank.
+TEST_F(LoRAManagerTest, ResetReturnsToInactiveRankDummies)
+{
+    unsetenv("EDGELLM_LORA_EMPTY_RANK");
+    LoRAManager mgr(kMaxLoraRank, 0);
+    mgr.addWeights("adapter1", buildTestWeights("a1"));
+    auto engine = makeLoraEngine();
+    mgr.initializeEngineBindings(*engine);
+    mgr.switchWeights("adapter1");
+    TensorMap map;
+    mgr.refreshTensorMap(map);
+    ASSERT_NE(map.get("lora_A_layer_0"), nullptr);
+    EXPECT_GT(map.get("lora_A_layer_0")->getShape()[1], 0);
+    mgr.resetWeights();
+    mgr.refreshTensorMap(map);
+    EXPECT_EQ(map.get("lora_A_layer_0")->getShape()[1], 0);
 }
 
 } // namespace
