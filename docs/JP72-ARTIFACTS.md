@@ -302,7 +302,15 @@ tensorrt-edgellm-lora-package verify --engine-dir $E/llm --full
 ```
 
 The server refuses an adapter without a manifest for the deployed base
-identity; see the LoRA section of the experimental server guide. Rebuilding or
+identity; see the LoRA section of the experimental server guide. The robot runs
+the default `--lora-verify full`: every engine, table and tokenizer file is
+hashed against the identity at startup, and files unchanged since their last
+successful hash (same inode stamp, recorded under the server's cache directory)
+are skipped. Measured on the Spark (GB10) for a 6.7 GB Gemma 4 MTP `llm/`
+directory: 4.8 s for the first start after files change, 3 ms afterwards; an
+Orin is expected to take roughly twice the first-start time (not measured).
+`--lora-verify sizes` would miss a same-size engine rebuild with new weights,
+so it is not used on the robot. Rebuilding or
 re-exporting the engine changes the identity, so every adapter must be
 packaged again.
 

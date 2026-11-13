@@ -22,6 +22,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -855,11 +856,11 @@ def test_checkpoint_backed_bundle_is_not_covered_by_the_base_identity(tmp_path):
 
 def test_cli_parses_lora_verification_flags():
     config = parse_server_config(
-        ["m", "--lora-verify", "full", "--allow-unverified-lora-adapters"])
-    assert config.model.lora_verify == "full"
+        ["m", "--lora-verify", "sizes", "--allow-unverified-lora-adapters"])
+    assert config.model.lora_verify == "sizes"
     assert config.model.allow_unverified_lora_adapters is True
     defaults = parse_server_config(["m"])
-    assert defaults.model.lora_verify == "sizes"
+    assert defaults.model.lora_verify == "full"
     assert defaults.model.allow_unverified_lora_adapters is False
 
 
@@ -1059,3 +1060,42 @@ def test_tts_dispatch_accepts_the_default_server_options(tmp_path, monkeypatch):
 def test_tts_dispatch_refuses_required_cuda_graphs(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="require-cuda-graphs"):
         _tts_load(tmp_path, monkeypatch, require_cuda_graphs=True)
+
+
+def test_health_reports_how_the_base_identity_was_verified(
+        tmp_path, _fake_runtime, monkeypatch):
+    pytest.importorskip("fastapi")
+    monkeypatch.setattr(lora_package, "_STAMP_SETTLE_NS", -10**12)
+    bundle = _engine_tree(tmp_path, max_lora_rank=16)
+    _adapter(bundle / "llm", "tool", rank=4)
+
+    first = LLM(model=str(bundle), cache_dir=str(tmp_path / "cache"))
+    client, _ = _client_with(first)
+    report = client.get("/health").json()["lora"]["base_identity"]
+    assert report["mode"] == "full"
+    assert report["verified"] is True
+    assert report["hashed_files"] == 2  # llm.engine and config.json
+    assert report["trusted_files"] == 0
+
+    again = LLM(model=str(bundle), cache_dir=str(tmp_path / "cache"))
+    report = again.lora_base_verification()
+    assert (report["hashed_files"], report["trusted_files"]) == (0, 2)
+
+
+def test_same_size_engine_swap_is_caught_by_the_default_verification(
+        tmp_path, _fake_runtime):
+    bundle = _engine_tree(tmp_path, max_lora_rank=16)
+    (bundle / "llm" / "llm.engine").write_bytes(b"engine-v1")
+    lora_package.write_base_identity(str(bundle / "llm"))
+    _adapter(bundle / "llm", "tool", rank=4)
+    LLM(model=str(bundle), cache_dir=str(tmp_path / "cache"))
+
+    swapped = bundle / "llm" / "llm.engine.new"
+    swapped.write_bytes(b"engine-v2")
+    os.replace(swapped, bundle / "llm" / "llm.engine")
+
+    with pytest.raises(ValueError, match="llm.engine sha256 differs"):
+        LLM(model=str(bundle), cache_dir=str(tmp_path / "cache"))
+    LLM(model=str(bundle),
+        cache_dir=str(tmp_path / "cache2"),
+        lora_verify="sizes")

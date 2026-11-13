@@ -64,6 +64,8 @@ async def health(request: Request):
         "lora": {
             "adapters": lora_info() if lora_info is not None else [],
             "max_lora_rank": getattr(client.llm, "max_lora_rank", 0),
+            "base_identity": (client.llm.lora_base_verification() if hasattr(
+                client.llm, "lora_base_verification") else None),
         },
         "capabilities": {
             "chat": caps.chat,

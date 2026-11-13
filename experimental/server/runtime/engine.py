@@ -34,6 +34,7 @@ Example::
     llm.serve(port=8000)
 """
 
+import hashlib
 import importlib.util
 import json
 import logging
@@ -1051,9 +1052,12 @@ def _read_lora_provenance(adapter: LoraAdapter) -> LoraAdapter:
 def _resolve_lora_adapters(engine_dir: str,
                            configured: Optional[List[Any]] = None,
                            *,
-                           verify_mode: str = "sizes",
+                           verify_mode: str = "full",
                            allow_unverified: bool = False,
-                           checkpoint_dir: str = "") -> List[LoraAdapter]:
+                           checkpoint_dir: str = "",
+                           stamp_path: Optional[str] = None,
+                           report: Optional[Dict[str, Any]] = None
+                           ) -> List[LoraAdapter]:
     """Merge configured and discovered adapters and validate the set.
 
     The engine's ``builder_config.max_lora_rank`` gates everything: adapters
@@ -1098,19 +1102,25 @@ def _resolve_lora_adapters(engine_dir: str,
             f": {', '.join(over_rank)}")
     adapters = _verify_lora_adapters(adapters, engine_dir, max_lora_rank,
                                      verify_mode, allow_unverified,
-                                     checkpoint_dir)
+                                     checkpoint_dir, stamp_path, report)
     return [adapters[name] for name in sorted(adapters)]
 
 
 def _verify_lora_adapters(adapters: Dict[str, LoraAdapter], engine_dir: str,
                           max_lora_rank: int, verify_mode: str,
                           allow_unverified: bool,
-                          checkpoint_dir: str) -> Dict[str, LoraAdapter]:
+                          checkpoint_dir: str,
+                          stamp_path: Optional[str] = None,
+                          report: Optional[Dict[str, Any]] = None
+                          ) -> Dict[str, LoraAdapter]:
     """Bind every adapter to the deployed base through its manifest.
 
     A failure refuses startup unless ``allow_unverified``, which keeps the
-    adapter with ``verified=False`` and a warning.
+    adapter with ``verified=False`` and a warning. ``report`` receives how the
+    base identity was checked (served in /health).
     """
+    if report is not None:
+        report.update({"mode": verify_mode, "digest": None, "verified": False})
     from tensorrt_edgellm import lora_package
 
     def refuse(name: str, reason: str) -> None:
@@ -1124,16 +1134,24 @@ def _verify_lora_adapters(adapters: Dict[str, LoraAdapter], engine_dir: str,
             refuse(name, "checkpoint-backed bundles are not covered by the "
                    "base identity")
         return adapters
-    started = time.monotonic()
     try:
-        base = lora_package.read_base_identity(engine_dir, verify=verify_mode)
+        base = lora_package.read_base_identity(engine_dir,
+                                               verify=verify_mode,
+                                               stamp_path=stamp_path)
     except (OSError, ValueError) as error:
         for name in adapters:
             refuse(name, str(error))
         return adapters
-    logger.info("Base identity %s verified (%s) in %.1f s",
-                base["digest"][:12], verify_mode,
-                time.monotonic() - started)
+    check = base["verification"]
+    logger.info(
+        "Base identity %s verified with --lora-verify %s in %.1f s (%d files "
+        "hashed, %d unchanged since their last hash)%s", base["digest"][:12],
+        verify_mode, check["seconds"], check["hashed_files"],
+        check["trusted_files"],
+        "; sizes mode does not detect a same-size engine swap"
+        if verify_mode == "sizes" else "")
+    if report is not None:
+        report.update({"digest": base["digest"][:12], "verified": True, **check})
     verified = {}
     for name, adapter in adapters.items():
         try:
@@ -1192,7 +1210,7 @@ class LLM:
         host_embedding_tables: bool = False,
         host_ple_table: bool = False,
         lora_adapters: Optional[List[Any]] = None,
-        lora_verify: str = "sizes",
+        lora_verify: str = "full",
         allow_unverified_lora_adapters: bool = False,
         on_progress: Optional[Callable[[str], None]] = None,
     ):
@@ -1244,6 +1262,7 @@ class LLM:
         self._host_ple_table = host_ple_table
         self._configured_lora_adapters = list(lora_adapters or ())
         self._lora_verify = lora_verify
+        self._lora_base_verification: Dict[str, Any] = {}
         self._allow_unverified_lora_adapters = allow_unverified_lora_adapters
         self._admission_sem = threading.Semaphore(1)
         self._infer_lock = threading.Lock()
@@ -1345,10 +1364,15 @@ class LLM:
         self._lora_adapters = _resolve_lora_adapters(
             self._engine_dir,
             self._configured_lora_adapters,
-            verify_mode=getattr(self, "_lora_verify", "sizes"),
+            verify_mode=getattr(self, "_lora_verify", "full"),
             allow_unverified=getattr(self, "_allow_unverified_lora_adapters",
                                      False),
-            checkpoint_dir=self._checkpoint_dir)
+            checkpoint_dir=self._checkpoint_dir,
+            stamp_path=os.path.join(
+                self._cache_dir, "lora-base-identity",
+                hashlib.sha256(os.path.realpath(
+                    self._engine_dir).encode()).hexdigest()[:32] + ".json"),
+            report=self._lora_base_verification)
         if self._lora_adapters:
             logger.info(
                 "LoRA adapters registered (%d): %s (engine max_lora_rank=%d)",
@@ -2605,6 +2629,12 @@ class LLM:
             "captured": getattr(self, "_cuda_graphs_captured", None),
             "counters": getter() if getter is not None else None,
         }
+
+    def lora_base_verification(self) -> Optional[Dict[str, Any]]:
+        """How the engine directory was checked against its base identity at
+        startup, or None when no adapter is served."""
+        report = getattr(self, "_lora_base_verification", None)
+        return dict(report) if report else None
 
     def lora_adapter_info(self) -> List[Dict[str, Any]]:
         """Per-adapter health report: rank and binding coverage.
