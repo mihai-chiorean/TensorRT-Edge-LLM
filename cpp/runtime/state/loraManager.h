@@ -119,6 +119,12 @@ public:
     //! Return all loaded adapter names.
     std::vector<std::string> getAdapterNames() const;
 
+    //! Content identity of a registered adapter: 32 lowercase hex characters
+    //! derived only from its tensor names, dtypes, shapes and bytes (never its
+    //! name), computed once at registration. Keys every adapter-dependent cache.
+    //! @throws std::runtime_error if @p name is not registered.
+    std::string const& getAdapterIdentity(std::string const& name) const;
+
     //! Check whether any adapter is currently active.
     bool hasActiveAdapter() const noexcept;
 
@@ -171,6 +177,9 @@ private:
 
     //! All loaded adapters: adapterName -> WeightMap.
     std::map<std::string, WeightMap> mAdapters{};
+
+    //! Content identity per adapter name (see getAdapterIdentity).
+    std::map<std::string, std::string> mAdapterIdentities{};
 
     //! Name of the active adapter (empty when none active).
     std::string mActiveAdapterName{};

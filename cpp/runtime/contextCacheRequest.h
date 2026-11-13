@@ -149,7 +149,7 @@ public:
     //! positions key on them the same way begin() keys the first sequences'.
     //! @p lookupPolicy and @p commitPolicy are the sequence's own; the caller has already applied
     //! whatever forces bypass (see lookupPolicyFor).
-    AdmitSequenceStatus admitSequence(std::vector<int32_t> const& tokenIds, std::string const& loraWeightsName,
+    AdmitSequenceStatus admitSequence(std::vector<int32_t> const& tokenIds, std::string const& loraCacheIdentity,
         DecodingKvHeadroom const& headroom, int32_t& prefillStart, ResidentRef resident, cudaStream_t stream,
         ContextCacheLookupPolicy lookupPolicy, ContextCacheCommitPolicy commitPolicy,
         std::vector<int32_t> const& mediaTokenIds = {}, std::vector<Hash128> const& imageContentDigests = {},

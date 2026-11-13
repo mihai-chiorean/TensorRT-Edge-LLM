@@ -219,16 +219,17 @@ std::vector<Hash128> buildPerPositionMediaHash(std::vector<int32_t> const& token
 }
 
 ContextCacheSequenceAdmission makeContextCacheSequenceAdmission(std::vector<int32_t> const& tokenIds,
-    std::string const& loraWeightsName, std::vector<int32_t> const& mediaTokenIds,
+    std::string const& loraCacheIdentity, std::vector<int32_t> const& mediaTokenIds,
     std::vector<Hash128> const& imageContentDigests, std::vector<audioUtils::AudioData> const& audioBuffers,
     cudaStream_t stream, bool allowCombinedImageKey)
 {
     ContextCacheSequenceAdmission admission;
     admission.tokenIds = tokenIds;
-    if (!loraWeightsName.empty())
+    if (!loraCacheIdentity.empty())
     {
-        // The runtime-local adapter registry is immutable after construction, so its generation remains zero.
-        AdapterKey const adapter{hashOpaqueIdentity(loraWeightsName), 0};
+        // The identity is derived from the adapter's content (LoRAManager::getAdapterIdentity), so replacing an
+        // adapter under the same name changes the key and the generation can stay zero.
+        AdapterKey const adapter{hashOpaqueIdentity(loraCacheIdentity), 0};
         admission.keyExtras.adapter = adapter;
     }
     admission.perPositionMediaHash = buildPerPositionMediaHash(
@@ -280,6 +281,10 @@ std::optional<ContextCacheRequest> ContextCacheRequest::begin(ContextCacheCoordi
     static std::vector<audioUtils::AudioData> const kEmptyAudioBuffers;
     static std::vector<int32_t> const kEmptyMediaTokenIds;
 
+    ELLM_CHECK(context.loraWeightsName.empty() || !context.loraCacheIdentity.empty(),
+        "Context-cache admission for LoRA adapter '" + context.loraWeightsName
+            + "' requires its content identity (DecodingInferenceContext::loraCacheIdentity)");
+
     ContextCacheBatchAdmission admission;
     admission.speculativeRequest = speculativeRequest;
     admission.tokenStateContract = tokenStateContract;
@@ -300,7 +305,7 @@ std::optional<ContextCacheRequest> ContextCacheRequest::begin(ContextCacheCoordi
         std::vector<audioUtils::AudioData> const& audio
             = (seqIdx < request.requests.size()) ? request.requests[seqIdx].audioBuffers : kEmptyAudioBuffers;
         ContextCacheSequenceAdmission sequence
-            = makeContextCacheSequenceAdmission(context.rawBatchedInputIds[seqIdx], context.loraWeightsName,
+            = makeContextCacheSequenceAdmission(context.rawBatchedInputIds[seqIdx], context.loraCacheIdentity,
                 effectiveLookupPolicy == ContextCacheLookupPolicy::kUseCache ? mediaTokenIds : kEmptyMediaTokenIds,
                 imageContentDigests, audio, context.stream, /*allowCombinedImageKey=*/true);
         sequence.resident = context.residentRefs[seqIdx];
@@ -333,16 +338,16 @@ int32_t ContextCacheRequest::reuseTokenLength(int32_t slot) const noexcept
 }
 
 ContextCacheRequest::AdmitSequenceStatus ContextCacheRequest::admitSequence(std::vector<int32_t> const& tokenIds,
-    std::string const& loraWeightsName, DecodingKvHeadroom const& headroom, int32_t& prefillStart, ResidentRef resident,
-    cudaStream_t stream, ContextCacheLookupPolicy lookupPolicy, ContextCacheCommitPolicy commitPolicy,
-    std::vector<int32_t> const& mediaTokenIds, std::vector<Hash128> const& imageContentDigests,
-    std::vector<audioUtils::AudioData> const& audioBuffers)
+    std::string const& loraCacheIdentity, DecodingKvHeadroom const& headroom, int32_t& prefillStart,
+    ResidentRef resident, cudaStream_t stream, ContextCacheLookupPolicy lookupPolicy,
+    ContextCacheCommitPolicy commitPolicy, std::vector<int32_t> const& mediaTokenIds,
+    std::vector<Hash128> const& imageContentDigests, std::vector<audioUtils::AudioData> const& audioBuffers)
 {
     mPrefillStarts.reserve(mPrefillStarts.size() + 1);
     // A bypassed lookup hashes no media: the pages are private, so keying them costs only host time.
     bool const hashesMedia = lookupPolicy != ContextCacheLookupPolicy::kBypass;
     static std::vector<int32_t> const kNoMediaTokenIds;
-    ContextCacheSequenceAdmission admission = makeContextCacheSequenceAdmission(tokenIds, loraWeightsName,
+    ContextCacheSequenceAdmission admission = makeContextCacheSequenceAdmission(tokenIds, loraCacheIdentity,
         hashesMedia ? mediaTokenIds : kNoMediaTokenIds, imageContentDigests, audioBuffers, stream,
         /*allowCombinedImageKey=*/false);
     admission.resident = resident;

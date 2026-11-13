@@ -1415,7 +1415,7 @@ AdmitDecision LLMRankRuntime::GenerationSession::reserveAdmission(AdmissionInten
             // travels into the admission so its per-position hash keys the pages: a media prefix
             // must not be reachable from a text lookup over the same token ids, and every sequence
             // keys media runs by the same deployment-derived placeholder list.
-            status = mManagedRequest->admitSequence(seed.promptTokenIds, mContext.loraWeightsName, mKvHeadroom,
+            status = mManagedRequest->admitSequence(seed.promptTokenIds, mContext.loraCacheIdentity, mKvHeadroom,
                 prefillStart, *intent.resident, mContext.stream, intent.lookupPolicy, intent.commitPolicy,
                 mRuntime.mediaTokenIds(), seed.imageContentDigests, seed.audioBuffers);
         }
@@ -3099,6 +3099,15 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
     DecodingInferenceContext& context = generation->context;
     context.initialize(activeBatchSize, maxGenerateLength, std::nullopt, rt::OptionalInputTensors{}, loraWeightsName,
         stream, mDeployment.base.recurrentPoolRows);
+    try
+    {
+        context.loraCacheIdentity = resolveLoraCacheIdentity(loraWeightsName);
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("Failed to resolve LoRA adapter '%s': %s", loraWeightsName.c_str(), e.what());
+        return nullptr;
+    }
     context.initializeRaggedScratch(RaggedEngineContract{TokenLayoutBackend::kEntryPaddedCompatibility,
         mDeployment.base.maxNumSequences, mDeployment.base.maxQueryLength, mDeployment.base.maxPhysicalTokens,
         mDeployment.base.recurrentPoolRows, /* mixedStepSupported = */ false});
@@ -5356,6 +5365,17 @@ bool LLMRankRuntime::runBaseModelPrefill(DecodingInferenceContext& context,
 
     emitTokenCallbacks(context);
     return true;
+}
+
+std::string LLMRankRuntime::resolveLoraCacheIdentity(std::string const& loraWeightsName) const
+{
+    if (loraWeightsName.empty())
+    {
+        return {};
+    }
+    ELLM_CHECK(mSharedResources->loraManager != nullptr,
+        "LoRA adapter '" + loraWeightsName + "' was requested, but the runtime has no LoRA manager");
+    return mSharedResources->loraManager->getAdapterIdentity(loraWeightsName);
 }
 
 bool LLMRankRuntime::captureBaseGraphWithLoraFanout(InferenceDims const& dims, cudaStream_t stream)

@@ -356,16 +356,16 @@ bool ManagedKVCacheRequest::completeBatchCompaction(std::vector<int32_t> const& 
 }
 
 ContextCacheRequest::AdmitSequenceStatus ManagedKVCacheRequest::admitSequence(std::vector<int32_t> const& tokenIds,
-    std::string const& loraWeightsName, DecodingKvHeadroom const& headroom, int32_t& prefillStart, ResidentRef resident,
-    cudaStream_t stream, ContextCacheLookupPolicy lookupPolicy, ContextCacheCommitPolicy commitPolicy,
-    std::vector<int32_t> const& mediaTokenIds, std::vector<Hash128> const& imageContentDigests,
-    std::vector<audioUtils::AudioData> const& audioBuffers)
+    std::string const& loraCacheIdentity, DecodingKvHeadroom const& headroom, int32_t& prefillStart,
+    ResidentRef resident, cudaStream_t stream, ContextCacheLookupPolicy lookupPolicy,
+    ContextCacheCommitPolicy commitPolicy, std::vector<int32_t> const& mediaTokenIds,
+    std::vector<Hash128> const& imageContentDigests, std::vector<audioUtils::AudioData> const& audioBuffers)
 {
     if (!hasContextReuse())
     {
         return ContextCacheRequest::AdmitSequenceStatus::kFailed;
     }
-    return contextRequest().admitSequence(tokenIds, loraWeightsName, headroom, prefillStart, resident, stream,
+    return contextRequest().admitSequence(tokenIds, loraCacheIdentity, headroom, prefillStart, resident, stream,
         lookupPolicy, commitPolicy, mediaTokenIds, imageContentDigests, audioBuffers);
 }
 

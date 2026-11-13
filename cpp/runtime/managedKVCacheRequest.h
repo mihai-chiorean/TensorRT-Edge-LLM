@@ -90,7 +90,7 @@ public:
     //! would call these is ever constructed; the kFailed/false returns here are the backstop.
     //! @{
     ContextCacheRequest::AdmitSequenceStatus admitSequence(std::vector<int32_t> const& tokenIds,
-        std::string const& loraWeightsName, DecodingKvHeadroom const& headroom, int32_t& prefillStart,
+        std::string const& loraCacheIdentity, DecodingKvHeadroom const& headroom, int32_t& prefillStart,
         ResidentRef resident, cudaStream_t stream, ContextCacheLookupPolicy lookupPolicy,
         ContextCacheCommitPolicy commitPolicy, std::vector<int32_t> const& mediaTokenIds = {},
         std::vector<Hash128> const& imageContentDigests = {},
