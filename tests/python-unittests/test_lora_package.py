@@ -369,3 +369,29 @@ def test_unwritable_stamp_cache_does_not_fail_verification(tmp_path, _settled):
         str(llm), stamp_path=str(blocked / "stamps.json"))
 
     assert record["verification"]["hashed_files"] == 3
+
+
+
+
+def _int8_weights(path, with_scales=True):
+    tensors = {}
+    for stem in _STEMS:
+        tensors[f"{stem}.lora_A.weight"] = np.ones((8, 4), np.int8)
+        tensors[f"{stem}.lora_B.weight"] = np.ones((4, 8), np.int8)
+        if with_scales:
+            tensors[f"{stem}.lora_A.weight_scale"] = np.ones((4, ), np.float16)
+            tensors[f"{stem}.lora_B.weight_scale"] = np.ones((8, ), np.float16)
+    save_file(tensors, str(path))
+
+
+def test_int8_transport_file_yields_module_targets(tmp_path):
+    _int8_weights(tmp_path / "w.safetensors")
+    targets, ranks = lora_package._adapter_targets(str(tmp_path / "w.safetensors"))
+    assert targets == sorted(_STEMS)
+    assert ranks == {4}
+
+
+def test_int8_factor_without_scale_is_refused(tmp_path):
+    _int8_weights(tmp_path / "w.safetensors", with_scales=False)
+    with pytest.raises(ValueError, match="no scale"):
+        lora_package._adapter_targets(str(tmp_path / "w.safetensors"))
