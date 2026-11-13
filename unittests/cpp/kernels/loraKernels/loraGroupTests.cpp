@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
@@ -813,6 +814,189 @@ TEST(LoraGroupLauncher, DecodeAndShortPrefillShareOneStateAcrossReplays)
     }
     cudaFree(workspace);
     cudaFree(state);
+    cudaStreamDestroy(stream);
+}
+
+//! Per-column symmetric INT8 as process-lora --weight-format int8 writes it, and the FP16 factor
+//! the runtime registers for it on an FP16 engine: fp16(float(code) * float(scale)).
+void quantizeInt8PerColumn(std::vector<float> const& w, int32_t rows, int32_t cols, std::vector<int8_t>& codes,
+    std::vector<__half>& scales, std::vector<__half>& dequantized)
+{
+    codes.assign(static_cast<size_t>(rows) * cols, 0);
+    scales.assign(cols, __float2half(1.f));
+    dequantized.assign(static_cast<size_t>(rows) * cols, __float2half(0.f));
+    for (int32_t c = 0; c < cols; ++c)
+    {
+        float amax = 0.f;
+        for (int32_t r = 0; r < rows; ++r)
+        {
+            amax = std::max(amax, std::fabs(w[static_cast<size_t>(r) * cols + c]));
+        }
+        scales[c] = __float2half(amax > 0.f ? std::min(std::max(amax / 127.f, 5.96e-8f), 515.5f) : 1.f);
+        float const s = __half2float(scales[c]);
+        for (int32_t r = 0; r < rows; ++r)
+        {
+            size_t const i = static_cast<size_t>(r) * cols + c;
+            codes[i] = static_cast<int8_t>(std::min(127.f, std::max(-127.f, std::nearbyint(w[i] / s))));
+            dequantized[i] = __float2half_rn(static_cast<float>(codes[i]) * s);
+        }
+    }
+}
+
+//! INT8-resident factors give bit-identical output to the FP16 path fed the same factors
+//! dequantized on the host, on every route: decode (M <= 16), short prefill, long prefill, the
+//! per-target fallback (rank not a multiple of 8), on the device's grid and on an emulated 8-SM
+//! grid with rounds.
+TEST(LoraGroupInt8, MatchesFp16WithHostDequantizedFactors)
+{
+    struct Case
+    {
+        int32_t M;
+        int32_t K;
+        std::vector<int32_t> N;
+        std::vector<int32_t> r;
+        bool fused;       //!< expected single cooperative launch on the device's own grid
+        float scale{1.f}; //!< factor magnitude; tiny values give subnormal FP16 scales
+    };
+    std::vector<Case> const cases{{1, 2560, {2048, 512, 512}, {16, 16, 16}, true},
+        {1, 2560, {10240, 10240}, {16, 16}, true}, {12, 10240, {2560}, {16}, true},
+        {28, 2560, {2048, 512, 512}, {8, 32, 16}, true}, {64, 2560, {10240, 10240}, {16, 16}, true},
+        {183, 2560, {2048, 512, 512}, {16, 16, 16}, false}, {4, 2560, {2048, 512}, {12, 16}, false},
+        {40, 2560, {2048}, {12}, false},
+        // N not a multiple of 16: B rows are copied as two 8-byte halves.
+        {12, 2560, {2056, 520}, {16, 16}, true}, {28, 2560, {2056}, {16}, true},
+        // Long prefill with rank above 16: the generic expand reads B through L1.
+        {183, 2560, {2048}, {32}, false},
+        // Subnormal FP16 scales.
+        {1, 2560, {2048, 512, 512}, {16, 16, 16}, true, 1e-3f}};
+    int dev = 0;
+    int sms = 0;
+    CUDA_OK(cudaGetDevice(&dev));
+    CUDA_OK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+    std::mt19937 gen(2024);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    cudaStream_t stream{};
+    CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    auto upload = [&](void const* h, size_t bytes) {
+        void* d = nullptr;
+        EXPECT_EQ(cudaMalloc(&d, bytes + 64), cudaSuccess);
+        EXPECT_EQ(cudaMemcpy(d, h, bytes, cudaMemcpyHostToDevice), cudaSuccess);
+        return d;
+    };
+    for (Case const& c : cases)
+    {
+        int32_t const n = static_cast<int32_t>(c.N.size());
+        std::vector<__half> x(static_cast<size_t>(c.M) * c.K);
+        for (auto& v : x)
+        {
+            v = __float2half(nd(gen));
+        }
+        void* dx = upload(x.data(), x.size() * 2);
+        std::vector<void*> owned{dx};
+        std::vector<LoraTarget> fp16(n), int8(n);
+        std::vector<std::vector<__half>> base(n);
+        std::vector<void*> base16(n), base8(n);
+        int32_t maxRank = 1;
+        int32_t maxN = 1;
+        for (int32_t i = 0; i < n; ++i)
+        {
+            int32_t const r = c.r[i];
+            int32_t const N = c.N[i];
+            maxRank = std::max(maxRank, r);
+            maxN = std::max(maxN, N);
+            std::vector<float> A(static_cast<size_t>(c.K) * r), B(static_cast<size_t>(r) * N);
+            for (auto& v : A)
+            {
+                v = nd(gen) * 0.02f * c.scale;
+            }
+            for (auto& v : B)
+            {
+                v = nd(gen) * 0.05f / c.scale;
+            }
+            std::vector<int8_t> aq, bq;
+            std::vector<__half> as, bs, ad, bd;
+            quantizeInt8PerColumn(A, c.K, r, aq, as, ad);
+            quantizeInt8PerColumn(B, r, N, bq, bs, bd);
+            base[i].resize(static_cast<size_t>(c.M) * N);
+            for (auto& v : base[i])
+            {
+                v = __float2half(nd(gen));
+            }
+            base16[i] = upload(base[i].data(), base[i].size() * 2);
+            base8[i] = upload(base[i].data(), base[i].size() * 2);
+            fp16[i].A = upload(ad.data(), ad.size() * 2);
+            fp16[i].B = upload(bd.data(), bd.size() * 2);
+            int8[i].A = upload(aq.data(), aq.size());
+            int8[i].B = upload(bq.data(), bq.size());
+            int8[i].aScale = upload(as.data(), as.size() * 2);
+            int8[i].bScale = upload(bs.data(), bs.size() * 2);
+            for (LoraTarget* t : {&fp16[i], &int8[i]})
+            {
+                t->r = r;
+                t->N = N;
+            }
+            fp16[i].base = fp16[i].out = base16[i];
+            int8[i].base = int8[i].out = base8[i];
+            for (void const* p : {fp16[i].A, fp16[i].B, int8[i].A, int8[i].B, int8[i].aScale, int8[i].bScale})
+            {
+                owned.push_back(const_cast<void*>(p));
+            }
+            owned.push_back(base16[i]);
+            owned.push_back(base8[i]);
+        }
+        void* workspace = nullptr;
+        CUDA_OK(cudaMalloc(&workspace, loraGroupWorkspaceBytes(c.M, n, maxRank, true, c.K, maxN)));
+        for (int32_t const grid : {std::min(sms, 32), 8})
+        {
+            if (grid > sms)
+            {
+                continue;
+            }
+            size_t const budget = grid == 8 ? size_t{96 * 1024} : size_t{160 * 1024};
+            LoraGroupPlan const p16 = planLoraGroup(c.M, c.K, fp16.data(), n, grid, budget);
+            LoraGroupPlan const p8 = planLoraGroup(c.M, c.K, int8.data(), n, grid, budget);
+            EXPECT_EQ(p16.fused, p8.fused) << "M " << c.M << " grid " << grid;
+            EXPECT_EQ(p16.rowTiles, p8.rowTiles);
+            if (grid == std::min(sms, 32) && grid >= 16)
+            {
+                EXPECT_EQ(p8.fused, c.fused) << "M " << c.M << " N0 " << c.N[0];
+            }
+            void* state = nullptr;
+            CUDA_OK(cudaMalloc(&state, kLoraGroupStateBytes));
+            CUDA_OK(cudaMemset(state, 0, kLoraGroupStateBytes));
+            for (int32_t i = 0; i < n; ++i)
+            {
+                CUDA_OK(cudaMemcpy(base16[i], base[i].data(), base[i].size() * 2, cudaMemcpyHostToDevice));
+                CUDA_OK(cudaMemcpy(base8[i], base[i].data(), base[i].size() * 2, cudaMemcpyHostToDevice));
+            }
+            CUDA_OK(cudaDeviceSynchronize());
+            ASSERT_EQ(
+                launchLoraGroupWithLimits(dx, c.M, c.K, fp16.data(), n, workspace, state, stream, grid, budget), 0);
+            ASSERT_EQ(
+                launchLoraGroupWithLimits(dx, c.M, c.K, int8.data(), n, workspace, state, stream, grid, budget), 0);
+            CUDA_OK(cudaStreamSynchronize(stream));
+            for (int32_t i = 0; i < n; ++i)
+            {
+                std::vector<uint16_t> a(base[i].size()), b(base[i].size()), orig(base[i].size());
+                CUDA_OK(cudaMemcpy(a.data(), base16[i], a.size() * 2, cudaMemcpyDeviceToHost));
+                CUDA_OK(cudaMemcpy(b.data(), base8[i], b.size() * 2, cudaMemcpyDeviceToHost));
+                std::memcpy(orig.data(), base[i].data(), orig.size() * 2);
+                size_t changed = 0;
+                for (size_t e = 0; e < a.size(); ++e)
+                {
+                    ASSERT_EQ(a[e], b[e]) << "M " << c.M << " grid " << grid << " target " << i << " element " << e;
+                    changed += a[e] != orig[e];
+                }
+                EXPECT_GT(changed, a.size() / 4) << "the delta was not applied";
+            }
+            cudaFree(state);
+        }
+        cudaFree(workspace);
+        for (void* p : owned)
+        {
+            cudaFree(p);
+        }
+    }
     cudaStreamDestroy(stream);
 }
 

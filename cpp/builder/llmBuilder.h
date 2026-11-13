@@ -196,8 +196,9 @@ struct LLMBuilderConfig
     HardwareCompatibility hardwareCompatibility{HardwareCompatibility::kNONE};
     //! Rank the runtime binds for LoRA inputs no adapter covers: 0 when every LoRA branch is a
     //! LoraGroupPlugin node (skipped at rank 0), 1 for MatMul branches (rank-1 zero dummies).
-    //! Kept last so existing positional initializers remain source-compatible.
     int32_t loraInactiveRank{1};
+    //! Factor storage format. Appended to preserve existing positional initializers.
+    std::string loraFactorFormat{"fp16"};
 
     //! Resolve and store the positive SWA page budget once SWA capability markers are known.
     //! A zero configured value selects the bounded builder default; runtime config does not use this auto mode.
@@ -252,6 +253,7 @@ struct LLMBuilderConfig
         if (maxLoraRank > 0)
         {
             json["lora_inactive_rank"] = loraInactiveRank;
+            json["lora_factor_format"] = loraFactorFormat;
         }
         json["max_kv_cache_capacity"] = maxKVCacheCapacity;
         json["max_kv_pool_pages"] = resolvedKVPoolPages();
@@ -315,6 +317,10 @@ struct LLMBuilderConfig
         if (json.contains("lora_inactive_rank"))
         {
             config.loraInactiveRank = json["lora_inactive_rank"];
+        }
+        if (json.contains("lora_factor_format"))
+        {
+            config.loraFactorFormat = json["lora_factor_format"];
         }
         if (json.contains("max_kv_cache_capacity"))
         {

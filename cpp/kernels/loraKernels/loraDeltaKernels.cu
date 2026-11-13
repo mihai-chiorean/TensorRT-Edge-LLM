@@ -46,6 +46,57 @@ __device__ __forceinline__ float roundHalf(float v)
     return __half2float(__float2half_rn(v));
 }
 
+//! float(code) for an int8 code without the conversion unit: the low mantissa bits of 2^23 hold
+//! code + 128 exactly, so the subtraction is exact.
+__device__ __forceinline__ float codeToFloat(int32_t code)
+{
+    return __int_as_float(0x4B000080 + code) - 8388736.f;
+}
+
+//! int8_per_channel_v1 dequantization, bit-identical to the runtime's host path
+//! fp16(float(code) * float(scale)): one IEEE single multiply, rounded to nearest.
+__device__ __forceinline__ half dequant(int8_t code, float scale)
+{
+    return __float2half_rn(__fmul_rn(codeToFloat(code), scale));
+}
+
+//! Eight consecutive codes times eight float column scales to eight halves (one uint4).
+__device__ __forceinline__ uint4 dequant8(uint2 codes, float const* scales)
+{
+    int8_t const* c = reinterpret_cast<int8_t const*>(&codes);
+    uint4 out;
+    half2* o = reinterpret_cast<half2*>(&out);
+#pragma unroll
+    for (int e = 0; e < 4; ++e)
+    {
+        o[e] = __floats2half2_rn(
+            __fmul_rn(codeToFloat(c[2 * e]), scales[2 * e]), __fmul_rn(codeToFloat(c[2 * e + 1]), scales[2 * e + 1]));
+    }
+    return out;
+}
+
+//! Eight FP16 scales (16-byte aligned) to float.
+__device__ __forceinline__ void scales8(half const* src, float* dst)
+{
+    uint4 const v = *reinterpret_cast<uint4 const*>(src);
+    half const* h = reinterpret_cast<half const*>(&v);
+#pragma unroll
+    for (int e = 0; e < 8; ++e)
+    {
+        dst[e] = __half2float(h[e]);
+    }
+}
+
+__global__ void loraDequantInt8Kernel(
+    int8_t const* __restrict__ codes, half const* __restrict__ scale, half* __restrict__ out, int64_t n, int32_t cols)
+{
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<int64_t>(gridDim.x) * blockDim.x)
+    {
+        out[i] = dequant(codes[i], __half2float(scale[i % cols]));
+    }
+}
+
 __device__ __forceinline__ unsigned long long loadAcquire(unsigned long long const* p)
 {
     unsigned long long v;
@@ -390,6 +441,7 @@ __global__ void __launch_bounds__(kSmallThreads) loraAddSmallTcKernel(half const
 // once and accumulates all column tiles from it, so siblings sharing x read it once.
 // Grid (ceil(M/64), S); 4 warps, each warp owns 16 rows; blockIdx.y owns K range
 // [y*kPer, (y+1)*kPer).
+template <bool Q>
 __global__ void __launch_bounds__(128) loraShrinkWmmaKernel(
     half const* __restrict__ x, PrefillTargets const t, float* __restrict__ p, int64_t M, int32_t K, int32_t kPer)
 {
@@ -406,7 +458,8 @@ __global__ void __launch_bounds__(128) loraShrinkWmmaKernel(
     int32_t const kBeg = blockIdx.y * kPer;
     int32_t const kEnd = min(K, kBeg + kPer);
     bool const vecX = (K % 8) == 0;
-    __shared__ half const* chA[kPrefillMaxCols / 8];
+    __shared__ void const* chA[kPrefillMaxCols / 8];
+    __shared__ half const* chS[kPrefillMaxCols / 8];
     __shared__ int32_t chR[kPrefillMaxCols / 8];
     __shared__ int32_t chC[kPrefillMaxCols / 8];
     int32_t const nCh = cols / 8;
@@ -423,22 +476,26 @@ __global__ void __launch_bounds__(128) loraShrinkWmmaKernel(
             }
         }
         // Select through a constant-index chain so the parameter struct is never indexed dynamically.
-        half const* a = t.A[0];
+        void const* a = t.A[0];
+        half const* sc = t.aScale[0];
         int32_t rr = t.r[0];
         int32_t off = t.colOff[0];
         if (ti == 1)
         {
             a = t.A[1];
+            sc = t.aScale[1];
             rr = t.r[1];
             off = t.colOff[1];
         }
         if (ti == 2)
         {
             a = t.A[2];
+            sc = t.aScale[2];
             rr = t.r[2];
             off = t.colOff[2];
         }
         chA[threadIdx.x] = a;
+        chS[threadIdx.x] = sc;
         chR[threadIdx.x] = rr;
         chC[threadIdx.x] = cc - off;
     }
@@ -484,18 +541,45 @@ __global__ void __launch_bounds__(128) loraShrinkWmmaKernel(
             int32_t const gk = k0 + kk;
             int32_t const rr = chR[ch];
             int32_t const c = chC[ch];
-            half const* a = chA[ch];
             half* dst = &as[kk][ch * 8];
-            if (gk < kEnd && (rr % 8) == 0 && c < rr)
+            if (Q)
             {
-                *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<uint4 const*>(&a[static_cast<size_t>(gk) * rr + c]);
+                int8_t const* a = static_cast<int8_t const*>(chA[ch]);
+                half const* sc = chS[ch];
+                if (gk < kEnd && (rr % 8) == 0 && c < rr)
+                {
+                    float s8[8];
+                    scales8(&sc[c], s8);
+                    *reinterpret_cast<uint4*>(dst)
+                        = dequant8(*reinterpret_cast<uint2 const*>(&a[static_cast<size_t>(gk) * rr + c]), s8);
+                }
+                else
+                {
+#pragma unroll
+                    for (int e = 0; e < 8; ++e)
+                    {
+                        dst[e] = (gk < kEnd && c + e < rr)
+                            ? dequant(a[static_cast<size_t>(gk) * rr + c + e], __half2float(sc[c + e]))
+                            : __float2half(0.f);
+                    }
+                }
             }
             else
             {
-#pragma unroll
-                for (int e = 0; e < 8; ++e)
+                half const* a = static_cast<half const*>(chA[ch]);
+                if (gk < kEnd && (rr % 8) == 0 && c < rr)
                 {
-                    dst[e] = (gk < kEnd && c + e < rr) ? a[static_cast<size_t>(gk) * rr + c + e] : __float2half(0.f);
+                    *reinterpret_cast<uint4*>(dst)
+                        = *reinterpret_cast<uint4 const*>(&a[static_cast<size_t>(gk) * rr + c]);
+                }
+                else
+                {
+#pragma unroll
+                    for (int e = 0; e < 8; ++e)
+                    {
+                        dst[e]
+                            = (gk < kEnd && c + e < rr) ? a[static_cast<size_t>(gk) * rr + c + e] : __float2half(0.f);
+                    }
                 }
             }
         }
@@ -547,10 +631,13 @@ __global__ void __launch_bounds__(128) loraShrinkWmmaKernel(
 // 16-byte accesses. t for the CTA's rows is reduced from the split-K partials once.
 constexpr int32_t kStreamThreads{128};
 constexpr int32_t kStreamRowsPer{16};
-__global__ void __launch_bounds__(kStreamThreads)
-    loraExpandStreamKernel(half const* __restrict__ base, float const* __restrict__ p, int32_t S, int32_t pStride,
-        int32_t pOff, half const* __restrict__ B, half* __restrict__ out, int64_t M, int32_t N, int32_t r)
+template <bool Q>
+__global__ void __launch_bounds__(kStreamThreads) loraExpandStreamKernel(half const* __restrict__ base,
+    float const* __restrict__ p, int32_t S, int32_t pStride, int32_t pOff, void const* __restrict__ Bv,
+    half const* __restrict__ bScale, half* __restrict__ out, int64_t M, int32_t N, int32_t r)
 {
+    half const* B = static_cast<half const*>(Bv);
+    int8_t const* Bq = static_cast<int8_t const*>(Bv);
     __shared__ float tS[kStreamRowsPer][kLoraMaxRank];
     int64_t const row0 = static_cast<int64_t>(blockIdx.y) * kStreamRowsPer;
     int32_t const rows = static_cast<int32_t>(M - row0 < kStreamRowsPer ? M - row0 : kStreamRowsPer);
@@ -575,11 +662,25 @@ __global__ void __launch_bounds__(kStreamThreads)
     if (vec && r <= 16)
     {
         uint4 bReg[16];
-#pragma unroll
-        for (int c = 0; c < 16; ++c)
+        if (Q)
         {
-            bReg[c]
-                = c < r ? *reinterpret_cast<uint4 const*>(&B[static_cast<size_t>(c) * N + c0]) : make_uint4(0, 0, 0, 0);
+            float sc[8];
+            scales8(&bScale[c0], sc);
+#pragma unroll
+            for (int c = 0; c < 16; ++c)
+            {
+                bReg[c] = c < r ? dequant8(*reinterpret_cast<uint2 const*>(&Bq[static_cast<size_t>(c) * N + c0]), sc)
+                                : make_uint4(0, 0, 0, 0);
+            }
+        }
+        else
+        {
+#pragma unroll
+            for (int c = 0; c < 16; ++c)
+            {
+                bReg[c] = c < r ? *reinterpret_cast<uint4 const*>(&B[static_cast<size_t>(c) * N + c0])
+                                : make_uint4(0, 0, 0, 0);
+            }
         }
         // Four rows per step: the four base loads are issued before any of them is used.
         constexpr int kU = 4;
@@ -651,7 +752,9 @@ __global__ void __launch_bounds__(kStreamThreads)
             float acc = 0.f;
             for (int32_t c = 0; c < r; ++c)
             {
-                acc += tS[m][c] * __half2float(B[static_cast<size_t>(c) * N + n]);
+                half const b = Q ? dequant(Bq[static_cast<size_t>(c) * N + n], __half2float(bScale[n]))
+                                 : B[static_cast<size_t>(c) * N + n];
+                acc += tS[m][c] * __half2float(b);
             }
             size_t const idx = static_cast<size_t>(row0 + m) * N + n;
             out[idx] = __float2half_rn(__half2float(base[idx]) + roundHalf(acc));
@@ -749,10 +852,29 @@ size_t loraPrefillWorkspaceBytes(int64_t maxM, int32_t cols) noexcept
     return alignUp(static_cast<size_t>(std::max<int64_t>(maxM, 128 * 64)) * std::max(cols, 16) * sizeof(float), 256);
 }
 
-int32_t launchLoraPrefill(void const* x, int64_t M, int32_t K, int32_t n, void const* const* A, void const* const* B,
-    void const* const* base, void* const* out, int32_t const* r, int32_t const* N, void* workspace,
-    cudaStream_t stream) noexcept
+int32_t launchLoraDequantInt8(
+    void const* codes, void const* scale, void* out, int64_t rows, int32_t cols, cudaStream_t stream) noexcept
 {
+    int64_t const n = rows * cols;
+    if (n <= 0)
+    {
+        return 0;
+    }
+    int32_t const blocks = static_cast<int32_t>(std::min<int64_t>((n + 255) / 256, 1024));
+    loraDequantInt8Kernel<<<blocks, 256, 0, stream>>>(
+        static_cast<int8_t const*>(codes), static_cast<half const*>(scale), static_cast<half*>(out), n, cols);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+int32_t launchLoraPrefill(void const* x, int64_t M, int32_t K, int32_t n, void const* const* A, void const* const* B,
+    void const* const* base, void* const* out, int32_t const* r, int32_t const* N, void* workspace, cudaStream_t stream,
+    void const* const* aScale, void const* const* bScale) noexcept
+{
+    bool const q = aScale != nullptr;
+    if (q != (bScale != nullptr))
+    {
+        return -1;
+    }
     if (M <= 0 || n <= 0)
     {
         return 0;
@@ -770,7 +892,8 @@ int32_t launchLoraPrefill(void const* x, int64_t M, int32_t K, int32_t n, void c
         {
             return -1;
         }
-        t.A[i] = static_cast<__half const*>(A[i]);
+        t.A[i] = A[i];
+        t.aScale[i] = q ? static_cast<__half const*>(aScale[i]) : nullptr;
         t.r[i] = r[i];
         t.colOff[i] = cols;
         cols += (r[i] + 15) / 16 * 16;
@@ -780,7 +903,9 @@ int32_t launchLoraPrefill(void const* x, int64_t M, int32_t K, int32_t n, void c
     {
         for (int32_t i = 0; i < n; ++i)
         {
-            if (launchLoraPrefill(x, M, K, 1, &A[i], &B[i], &base[i], &out[i], &r[i], &N[i], workspace, stream) != 0)
+            if (launchLoraPrefill(x, M, K, 1, &A[i], &B[i], &base[i], &out[i], &r[i], &N[i], workspace, stream,
+                    q ? &aScale[i] : nullptr, q ? &bScale[i] : nullptr)
+                != 0)
             {
                 return -1;
             }
@@ -793,13 +918,29 @@ int32_t launchLoraPrefill(void const* x, int64_t M, int32_t K, int32_t n, void c
     kPer = (kPer + 63) / 64 * 64;
     int32_t const sUsed = (K + kPer - 1) / kPer;
     dim3 const gridShrink(static_cast<uint32_t>((M + 63) / 64), static_cast<uint32_t>(sUsed));
-    loraShrinkWmmaKernel<<<gridShrink, 128, 0, stream>>>(static_cast<half const*>(x), t, p, M, K, kPer);
+    if (q)
+    {
+        loraShrinkWmmaKernel<true><<<gridShrink, 128, 0, stream>>>(static_cast<half const*>(x), t, p, M, K, kPer);
+    }
+    else
+    {
+        loraShrinkWmmaKernel<false><<<gridShrink, 128, 0, stream>>>(static_cast<half const*>(x), t, p, M, K, kPer);
+    }
     for (int32_t i = 0; i < n; ++i)
     {
         dim3 const gridExpand(static_cast<uint32_t>((N[i] + 8 * kStreamThreads - 1) / (8 * kStreamThreads)),
             static_cast<uint32_t>((M + kStreamRowsPer - 1) / kStreamRowsPer));
-        loraExpandStreamKernel<<<gridExpand, kStreamThreads, 0, stream>>>(static_cast<half const*>(base[i]), p, sUsed,
-            cols, t.colOff[i], static_cast<half const*>(B[i]), static_cast<half*>(out[i]), M, N[i], r[i]);
+        auto const* sb = q ? static_cast<half const*>(bScale[i]) : nullptr;
+        if (q)
+        {
+            loraExpandStreamKernel<true><<<gridExpand, kStreamThreads, 0, stream>>>(static_cast<half const*>(base[i]),
+                p, sUsed, cols, t.colOff[i], B[i], sb, static_cast<half*>(out[i]), M, N[i], r[i]);
+        }
+        else
+        {
+            loraExpandStreamKernel<false><<<gridExpand, kStreamThreads, 0, stream>>>(static_cast<half const*>(base[i]),
+                p, sUsed, cols, t.colOff[i], B[i], sb, static_cast<half*>(out[i]), M, N[i], r[i]);
+        }
     }
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }

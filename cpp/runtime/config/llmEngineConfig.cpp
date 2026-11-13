@@ -912,6 +912,11 @@ LLMEngineConfig parseEngineConfig(
     auto const& bc = configJson["builder_config"];
     cfg.maxSupportedLoraRank = bc.value("max_lora_rank", 0);
     cfg.loraInactiveRank = bc.value("lora_inactive_rank", 1) == 0 ? 0 : 1;
+    std::string const loraFactorFormat = bc.value("lora_factor_format", std::string{"fp16"});
+    ELLM_CHECK(loraFactorFormat == "fp16" || loraFactorFormat == "int8_per_channel_v1",
+        "parseEngineConfig: invalid lora_factor_format '" + loraFactorFormat
+            + "'; expected 'fp16' or 'int8_per_channel_v1'.");
+    cfg.loraInt8Factors = loraFactorFormat == "int8_per_channel_v1";
 
     // Recurrent / conv state dtypes are only meaningful for hybrid engines
     // (Mamba / Nemotron-H / GDN). Mirror the Python export gating exactly:

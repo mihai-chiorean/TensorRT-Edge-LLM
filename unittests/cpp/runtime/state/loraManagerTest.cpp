@@ -18,8 +18,10 @@
 #include "runtime/state/loraManager.h"
 
 #include "common/checkMacros.h"
+#include "common/logger.h"
 #include "substituteEngine.h"
 
+#include <NvInfer.h>
 #include <cuda_fp16.h>
 #include <gtest/gtest.h>
 
@@ -113,6 +115,7 @@ protected:
         bShape.d[1] = kHiddenSize;
 
         auto engine = std::make_unique<::testing::NiceMock<MockEngineExecutor>>();
+        ON_CALL(*engine, getBindingDataType(_)).WillByDefault(Return(nvinfer1::DataType::kHALF));
         ON_CALL(*engine, getNumIOTensors()).WillByDefault(Return(2));
         ON_CALL(*engine, getIOTensorName(0)).WillByDefault(Return("lora_A_layer_0"));
         ON_CALL(*engine, getIOTensorName(1)).WillByDefault(Return("lora_B_layer_0"));
@@ -610,6 +613,17 @@ struct Int8Adapter
             "lora_B_layer_0_scale", bScale.data(), bScale.size() * sizeof(uint16_t)));
         return out;
     }
+
+    std::map<std::string, rt::Tensor> weights(bool withAScale = true) const
+    {
+        std::map<std::string, rt::Tensor> out;
+        for (auto& tensor : tensors(withAScale))
+        {
+            std::string const name = tensor.getName();
+            out.emplace(name, std::move(tensor));
+        }
+        return out;
+    }
 };
 
 std::vector<uint16_t> readBack(rt::Tensor const& tensor)
@@ -662,6 +676,181 @@ TEST_F(LoRAManagerTest, Int8AdapterIdentityMatchesItsDequantizedFp16File)
     std::filesystem::remove_all(dir);
 }
 
+TEST_F(LoRAManagerTest, Int8ResidentFilePreservesCodesAndScales)
+{
+    auto const dir = makeScratchDir("loraManagerTest");
+    Int8Adapter const adapter;
+    ASSERT_TRUE(safetensors::saveSafetensors(dir / "int8.safetensors", adapter.tensors(), mStream));
+
+    LoRAManager mgr(kMaxLoraRank, 0, true);
+    mgr.loadWeights("int8", dir / "int8.safetensors", mStream);
+    mgr.switchWeights("int8");
+    for (bool const isA : {true, false})
+    {
+        std::string const name = isA ? "lora_A_layer_0" : "lora_B_layer_0";
+        auto const& expectedCodes = isA ? adapter.aCodes : adapter.bCodes;
+        rt::Tensor const& factor = mgr.getActiveWeight(name);
+        EXPECT_EQ(factor.getDataType(), nvinfer1::DataType::kINT8);
+        EXPECT_EQ(
+            factor.getShape(), (isA ? rt::Coords{kHiddenSize, adapter.rank} : rt::Coords{adapter.rank, kHiddenSize}));
+        std::vector<int8_t> codes(expectedCodes.size());
+        CUDA_CHECK(cudaMemcpyAsync(codes.data(), factor.rawPointer(), codes.size(), cudaMemcpyDeviceToHost, mStream));
+        CUDA_CHECK(cudaStreamSynchronize(mStream));
+        EXPECT_EQ(codes, expectedCodes);
+
+        rt::Tensor const& scale = mgr.getActiveWeight(name + "_scale");
+        EXPECT_EQ(scale.getDataType(), nvinfer1::DataType::kHALF);
+        EXPECT_EQ(scale.getShape(), rt::Coords{isA ? adapter.rank : kHiddenSize});
+        EXPECT_EQ(readBack(scale), isA ? adapter.aScale : adapter.bScale);
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST_F(LoRAManagerTest, Int8ResidentIdentityMatchesHostDequantizationAndDirectRegistration)
+{
+    auto const dir = makeScratchDir("loraManagerTest");
+    Int8Adapter const adapter;
+    ASSERT_TRUE(safetensors::saveSafetensors(dir / "int8.safetensors", adapter.tensors(), mStream));
+
+    LoRAManager fp16(kMaxLoraRank);
+    fp16.loadWeights("host", dir / "int8.safetensors", mStream);
+    LoRAManager int8(kMaxLoraRank, 0, true);
+    int8.loadWeights("resident", dir / "int8.safetensors", mStream);
+    int8.addWeights("direct", adapter.weights());
+    EXPECT_EQ(int8.getAdapterIdentity("resident"), fp16.getAdapterIdentity("host"));
+    EXPECT_EQ(int8.getAdapterIdentity("direct"), fp16.getAdapterIdentity("host"));
+    int8.switchWeights("direct");
+    EXPECT_EQ(int8.getActiveWeight("lora_A_layer_0").getDataType(), nvinfer1::DataType::kINT8);
+    EXPECT_EQ(readBack(int8.getActiveWeight("lora_B_layer_0_scale")), adapter.bScale);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_F(LoRAManagerTest, Int8ResidentEngineRefusesFp16FileWithProcessingHint)
+{
+    auto const dir = makeScratchDir("loraManagerTest");
+    writeAdapterFile(dir / "fp16.safetensors", 4);
+    LoRAManager mgr(kMaxLoraRank, 0, true);
+    try
+    {
+        mgr.loadWeights("fp16", dir / "fp16.safetensors", mStream);
+        FAIL() << "An INT8-resident engine accepted FP16 adapter factors";
+    }
+    catch (std::runtime_error const& error)
+    {
+        std::string const message = error.what();
+        EXPECT_NE(message.find("keeps LoRA factors in INT8"), std::string::npos);
+        EXPECT_NE(message.find("process-lora --weight-format int8"), std::string::npos);
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST_F(LoRAManagerTest, Int8ResidentDirectRegistrationValidatesFactorsAndScales)
+{
+    LoRAManager mgr(kMaxLoraRank, 0, true);
+    Int8Adapter const good;
+    EXPECT_THROW(mgr.addWeights("fp16", buildTestWeights("fp16")), std::runtime_error);
+    EXPECT_THROW(mgr.addWeights("missingScale", good.weights(false)), std::runtime_error);
+
+    Int8Adapter shortScale;
+    shortScale.aScale.pop_back();
+    EXPECT_THROW(mgr.addWeights("shortScale", shortScale.weights()), std::runtime_error);
+    Int8Adapter zeroScale;
+    zeroScale.bScale[0] = halfBits(0.0F);
+    EXPECT_THROW(mgr.addWeights("zeroScale", zeroScale.weights()), std::runtime_error);
+    Int8Adapter nanScale;
+    nanScale.aScale[0] = 0x7E00;
+    EXPECT_THROW(mgr.addWeights("nanScale", nanScale.weights()), std::runtime_error);
+
+    auto unpaired = good.weights();
+    unpaired.erase("lora_B_layer_0");
+    unpaired.erase("lora_B_layer_0_scale");
+    EXPECT_THROW(mgr.addWeights("unpaired", std::move(unpaired)), std::runtime_error);
+    auto mismatchedRank = good.weights();
+    ASSERT_TRUE(mismatchedRank.at("lora_B_layer_0").reshape({2, kHiddenSize}));
+    EXPECT_THROW(mgr.addWeights("mismatchedRank", std::move(mismatchedRank)), std::runtime_error);
+
+    LoRAManager smallerEngine(2, 0, true);
+    EXPECT_THROW(smallerEngine.addWeights("overRank", good.weights()), std::runtime_error);
+}
+
+TEST_F(LoRAManagerTest, Int8ResidentRefreshBindsRankZeroDummiesAndStaticBScale)
+{
+    unsetenv("EDGELLM_LORA_EMPTY_RANK");
+    using ::testing::_;
+    using ::testing::Return;
+    using ::testing::ReturnRef;
+    using ::testing::StrEq;
+
+    // ICudaEngine shape queries are nonvirtual; a one-layer engine supplies the static B scale shape.
+    auto builder = std::unique_ptr<nvinfer1::IBuilder>(nvinfer1::createInferBuilder(gLogger));
+    ASSERT_NE(builder, nullptr);
+    auto network = std::unique_ptr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(
+        1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED)));
+    ASSERT_NE(network, nullptr);
+    nvinfer1::Dims const bScaleShape{1, {kHiddenSize}};
+    auto* input = network->addInput("lora_B_layer_0_scale", nvinfer1::DataType::kHALF, bScaleShape);
+    ASSERT_NE(input, nullptr);
+    auto* identity = network->addIdentity(*input);
+    ASSERT_NE(identity, nullptr);
+    identity->getOutput(0)->setName("scale_output");
+    network->markOutput(*identity->getOutput(0));
+    auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
+    ASSERT_NE(config, nullptr);
+    auto plan = std::unique_ptr<nvinfer1::IHostMemory>(builder->buildSerializedNetwork(*network, *config));
+    ASSERT_NE(plan, nullptr);
+    auto runtime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
+    ASSERT_NE(runtime, nullptr);
+    auto staticEngine
+        = std::unique_ptr<nvinfer1::ICudaEngine>(runtime->deserializeCudaEngine(plan->data(), plan->size()));
+    ASSERT_NE(staticEngine, nullptr);
+
+    auto engine = makeLoraEngine();
+    ON_CALL(*engine, getEngine()).WillByDefault(ReturnRef(*staticEngine));
+    ON_CALL(*engine, getNumIOTensors()).WillByDefault(Return(4));
+    ON_CALL(*engine, getIOTensorName(2)).WillByDefault(Return("lora_A_layer_0_scale"));
+    ON_CALL(*engine, getIOTensorName(3)).WillByDefault(Return("lora_B_layer_0_scale"));
+    ON_CALL(*engine, getBindingDataType(StrEq("lora_A_layer_0"))).WillByDefault(Return(nvinfer1::DataType::kINT8));
+    ON_CALL(*engine, getBindingDataType(StrEq("lora_B_layer_0"))).WillByDefault(Return(nvinfer1::DataType::kINT8));
+    nvinfer1::Dims const aScaleMax{1, {kMaxLoraRank}};
+    ON_CALL(*engine, getProfileShape(StrEq("lora_A_layer_0_scale"), _, _)).WillByDefault(Return(aScaleMax));
+    nvinfer1::Dims invalidShape{};
+    invalidShape.nbDims = -1;
+    ON_CALL(*engine, getProfileShape(StrEq("lora_B_layer_0_scale"), _, _)).WillByDefault(Return(invalidShape));
+
+    LoRAManager mgr(kMaxLoraRank, 0, true);
+    mgr.initializeEngineBindings(*engine);
+    auto const checkDummies = [&] {
+        mgr.refreshTensorMap(mTensorMap);
+        for (auto const* name : {"lora_A_layer_0", "lora_B_layer_0", "lora_A_layer_0_scale", "lora_B_layer_0_scale"})
+        {
+            ASSERT_NE(mTensorMap.get(name), nullptr);
+            EXPECT_NE(mTensorMap.get(name)->rawPointer(), nullptr);
+        }
+        EXPECT_EQ(mTensorMap.get("lora_A_layer_0")->getShape(), (rt::Coords{kHiddenSize, 0}));
+        EXPECT_EQ(mTensorMap.get("lora_B_layer_0")->getShape(), (rt::Coords{0, kHiddenSize}));
+        EXPECT_EQ(mTensorMap.get("lora_A_layer_0_scale")->getShape(), rt::Coords{0});
+        EXPECT_EQ(mTensorMap.get("lora_B_layer_0_scale")->getShape(), rt::Coords{kHiddenSize});
+        EXPECT_EQ(mTensorMap.get("lora_A_layer_0")->getDataType(), nvinfer1::DataType::kINT8);
+        EXPECT_EQ(mTensorMap.get("lora_B_layer_0")->getDataType(), nvinfer1::DataType::kINT8);
+        EXPECT_EQ(mTensorMap.get("lora_A_layer_0_scale")->getDataType(), nvinfer1::DataType::kHALF);
+        EXPECT_EQ(mTensorMap.get("lora_B_layer_0_scale")->getDataType(), nvinfer1::DataType::kHALF);
+        EXPECT_EQ(readBack(*mTensorMap.get("lora_B_layer_0_scale")), std::vector<uint16_t>(kHiddenSize, 0));
+    };
+    checkDummies();
+
+    Int8Adapter const adapter;
+    mgr.addWeights("active", adapter.weights());
+    mgr.switchWeights("active");
+    mgr.refreshTensorMap(mTensorMap);
+    EXPECT_EQ(mTensorMap.get("lora_A_layer_0")->getShape(), (rt::Coords{kHiddenSize, adapter.rank}));
+    EXPECT_EQ(mTensorMap.get("lora_B_layer_0")->getShape(), (rt::Coords{adapter.rank, kHiddenSize}));
+    EXPECT_EQ(mTensorMap.get("lora_A_layer_0_scale")->getShape(), rt::Coords{adapter.rank});
+    EXPECT_EQ(readBack(*mTensorMap.get("lora_A_layer_0_scale")), adapter.aScale);
+    EXPECT_EQ(readBack(*mTensorMap.get("lora_B_layer_0_scale")), adapter.bScale);
+    mgr.resetWeights();
+    checkDummies();
+}
+
 //! Each malformed INT8 file is refused at load.
 TEST_F(LoRAManagerTest, MalformedInt8AdaptersThrow)
 {
@@ -670,8 +859,11 @@ TEST_F(LoRAManagerTest, MalformedInt8AdaptersThrow)
     auto const expectThrow = [&](std::vector<rt::Tensor> const& tensors, char const* label) {
         auto const file = dir / (std::string(label) + ".safetensors");
         ASSERT_TRUE(safetensors::saveSafetensors(file, tensors, mStream));
-        LoRAManager mgr(kMaxLoraRank);
-        EXPECT_THROW(mgr.loadWeights(label, file, mStream), std::runtime_error) << label;
+        for (bool const int8Factors : {false, true})
+        {
+            LoRAManager mgr(kMaxLoraRank, 0, int8Factors);
+            EXPECT_THROW(mgr.loadWeights(label, file, mStream), std::runtime_error) << label;
+        }
     };
 
     // The well-formed file loads, so each refusal below is about its one defect.

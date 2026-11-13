@@ -22,6 +22,7 @@
 #include "common/logger.h"
 #include "common/mmapReader.h"
 #include "common/safetensorsUtils.h"
+#include "common/trtUtils.h"
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/state/contextCache/blockHash.h"
 
@@ -47,6 +48,14 @@ namespace rt
 
 namespace
 {
+
+constexpr char const* kScaleSuffix = "_scale";
+
+bool isScaleName(std::string const& name)
+{
+    std::string_view const suffix{kScaleSuffix};
+    return name.size() > suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
 
 //! Enumerate LoRA weight tensor names from an engine's I/O bindings.
 std::vector<std::string> collectLoraWeightsTensorNames(EngineExecutor const& runner)
@@ -167,7 +176,8 @@ void validateFiniteOnHost(
 //! dimensions disagree with the binding's max profile shape, cannot bind and
 //! would silently fall back to the rank-1 dummy at every refresh.
 void validateAdaptersAgainstBindings(std::string const& contextLabel, std::map<std::string, rt::Tensor> const& weights,
-    std::string const& adapterName, std::map<std::string, nvinfer1::Dims> const& maxShapes)
+    std::string const& adapterName, std::map<std::string, nvinfer1::Dims> const& maxShapes,
+    std::map<std::string, nvinfer1::DataType> const& bindingDataTypes, bool int8Factors)
 {
     for (auto const& [tensorName, tensor] : weights)
     {
@@ -175,6 +185,9 @@ void validateAdaptersAgainstBindings(std::string const& contextLabel, std::map<s
         ELLM_CHECK(bindingIt != maxShapes.end(),
             contextLabel + ": adapter '" + adapterName + "' tensor '" + tensorName
                 + "' does not name an engine LoRA binding");
+        ELLM_CHECK(!int8Factors || tensor.getDataType() == bindingDataTypes.at(tensorName),
+            contextLabel + ": adapter '" + adapterName + "' tensor '" + tensorName
+                + "' dtype does not match its engine binding");
 
         nvinfer1::Dims const bindingShape = bindingIt->second;
         nvinfer1::Dims const tensorShape = tensor.getShape().getTRTDims();
@@ -183,7 +196,7 @@ void validateAdaptersAgainstBindings(std::string const& contextLabel, std::map<s
                 + std::to_string(tensorShape.nbDims) + " but its engine binding is rank "
                 + std::to_string(bindingShape.nbDims));
         bool const tensorIsA = isLoraAName(tensorName);
-        int32_t const rankDim = tensorIsA ? tensorShape.nbDims - 1 : 0;
+        int32_t const rankDim = tensorIsA ? tensorShape.nbDims - 1 : (isScaleName(tensorName) ? -1 : 0);
         for (int32_t d = 0; d < tensorShape.nbDims; ++d)
         {
             if (d == rankDim)
@@ -211,14 +224,6 @@ struct HostFactor
     void const* data{nullptr};
     std::shared_ptr<std::vector<uint16_t>> storage; //!< Owns dequantized bytes; empty for FP16 files
 };
-
-constexpr char const* kScaleSuffix = "_scale";
-
-bool isScaleName(std::string const& name)
-{
-    std::string_view const suffix{kScaleSuffix};
-    return name.size() > suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
-}
 
 //! Collect the adapter's factors as FP16 host data. An INT8 transport file holds I8 factors and one FP16 scale per
 //! factor column (`<factor>_scale`, shape [columns]); it is dequantized as float(code) * float(scale) rounded to FP16.
@@ -303,7 +308,8 @@ std::vector<HostFactor> readHostFactors(
                 (*storage)[i] = value.x;
             }
         }
-        safetensors::TensorMetadata meta{name, nvinfer1::DataType::kHALF, entry->shape, 0, storage->size() * sizeof(uint16_t)};
+        safetensors::TensorMetadata meta{
+            name, nvinfer1::DataType::kHALF, entry->shape, 0, storage->size() * sizeof(uint16_t)};
         factors.push_back(HostFactor{meta, storage->data(), storage});
         scales.erase(scaleIt);
     }
@@ -357,9 +363,10 @@ private:
 
 } // namespace
 
-LoRAManager::LoRAManager(int32_t maxSupportedLoraRank, int32_t inactiveRank) noexcept
+LoRAManager::LoRAManager(int32_t maxSupportedLoraRank, int32_t inactiveRank, bool int8Factors) noexcept
     : mMaxSupportedLoraRank(maxSupportedLoraRank)
     , mInactiveRank(inactiveRank == 0 ? 0 : 1)
+    , mInt8Factors(int8Factors)
 {
 }
 
@@ -380,15 +387,24 @@ void LoRAManager::loadWeights(std::string const& name, std::filesystem::path con
         return reader.getByteData() + metadata.dataOffset + entry.offset;
     };
 
-    // FP16 factors are used as stored; an INT8 transport file (factors I8 plus one FP16 scale per column,
-    // named <factor>_scale) is dequantized here so the registered adapter is FP16 either way.
+    ELLM_CHECK(!mInt8Factors
+            || std::any_of(metadata.tensors.begin(), metadata.tensors.end(),
+                [](auto const& entry) {
+                    return !isScaleName(entry.name) && entry.dataType == nvinfer1::DataType::kINT8;
+                }),
+        "LoRAManager: adapter '" + name
+            + "' has FP16 factors, but this engine keeps LoRA factors in INT8 (int8_per_channel_v1); "
+              "process the adapter with process-lora --weight-format int8");
+
+    // Identity and validation use the same FP16 values regardless of the engine's resident format.
     std::vector<HostFactor> const factors = readHostFactors(name, metadata, payloadOf);
 
     std::map<std::string, int64_t> ranksOf;
     for (auto const& factor : factors)
     {
-        ELLM_CHECK(ranksOf.emplace(factor.meta.name, validateAdapterTensorHeader(name, factor.meta.name, factor.meta.shape))
-                       .second,
+        ELLM_CHECK(
+            ranksOf.emplace(factor.meta.name, validateAdapterTensorHeader(name, factor.meta.name, factor.meta.shape))
+                .second,
             "LoRAManager: adapter '" + name + "' contains duplicate tensor '" + factor.meta.name + "'");
     }
     for (auto const& factor : factors)
@@ -412,21 +428,33 @@ void LoRAManager::loadWeights(std::string const& name, std::filesystem::path con
 
     // Metadata and values are valid; allocate and copy the payloads (the loop from safetensors::loadSafetensors).
     WeightMap weights;
-    for (auto const& factor : factors)
+    auto const copyTensor = [&](safetensors::TensorMetadata const& meta, void const* payload) {
+        Tensor tensor(meta.shape, DeviceType::kGPU, meta.dataType, meta.name);
+        ELLM_CHECK(static_cast<size_t>(tensor.getMemoryCapacity()) == meta.bytes,
+            "LoRAManager: adapter '" + name + "' tensor '" + meta.name + "' byte count does not match its metadata");
+        CUDA_CHECK(cudaMemcpyAsync(tensor.rawPointer(), payload, meta.bytes, cudaMemcpyHostToDevice, stream));
+        weights.emplace(meta.name, std::move(tensor));
+    };
+    if (mInt8Factors)
     {
-        Tensor tensor(factor.meta.shape, DeviceType::kGPU, factor.meta.dataType, factor.meta.name);
-        ELLM_CHECK(static_cast<size_t>(tensor.getMemoryCapacity()) == factor.meta.bytes,
-            "LoRAManager: adapter '" + name + "' tensor '" + factor.meta.name
-                + "' byte count does not match its metadata");
-        CUDA_CHECK(
-            cudaMemcpyAsync(tensor.rawPointer(), factor.data, factor.meta.bytes, cudaMemcpyHostToDevice, stream));
-        weights.emplace(factor.meta.name, std::move(tensor));
+        for (auto const& entry : metadata.tensors)
+        {
+            copyTensor(entry, payloadOf(entry));
+        }
+    }
+    else
+    {
+        for (auto const& factor : factors)
+        {
+            copyTensor(factor.meta, factor.data);
+        }
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     if (!mEngineBindingNames.empty())
     {
-        validateAdaptersAgainstBindings("LoRAManager", weights, name, mEngineMaxBindingShapes);
+        validateAdaptersAgainstBindings(
+            "LoRAManager", weights, name, mEngineMaxBindingShapes, mEngineBindingDataTypes, mInt8Factors);
     }
 
     LOG_INFO("LoRAManager: adapter '%s' loaded with %zu binding(s)", name.c_str(), weights.size());
@@ -441,6 +469,59 @@ void LoRAManager::addWeights(std::string const& name, std::map<std::string, rt::
         "LoRAManager: adapter '" + name + "' is already registered; adapters are immutable for the runtime's lifetime");
 
     LOG_INFO("LoRAManager: adding adapter '%s' with %zu binding(s)", name.c_str(), weights.size());
+
+    if (mInt8Factors)
+    {
+        safetensors::FileMetadata metadata;
+        WeightMap hostWeights;
+        AuxStreamSet streams;
+        cudaStream_t stream{};
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        streams.add(stream);
+        for (auto const& [tensorName, tensor] : weights)
+        {
+            bool const scale = isScaleName(tensorName);
+            ELLM_CHECK(tensor.getDataType() == (scale ? nvinfer1::DataType::kHALF : nvinfer1::DataType::kINT8),
+                "LoRAManager: adapter '" + name + "' tensor '" + tensorName
+                    + (scale ? "' must be FP16" : "' must be INT8 for an INT8-resident engine"));
+            size_t const bytes = static_cast<size_t>(tensor.getShape().volume()) * (scale ? sizeof(uint16_t) : 1);
+            metadata.tensors.push_back({tensorName, tensor.getDataType(), tensor.getShape(), 0, bytes});
+            if (tensor.getDeviceType() == DeviceType::kGPU)
+            {
+                Tensor host(tensor.getShape(), DeviceType::kCPU, tensor.getDataType(), tensorName);
+                CUDA_CHECK(
+                    cudaMemcpyAsync(host.rawPointer(), tensor.rawPointer(), bytes, cudaMemcpyDeviceToHost, stream));
+                // Validation and identity read these bytes on the CPU.
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                hostWeights.emplace(tensorName, std::move(host));
+            }
+        }
+        auto const payloadOf = [&](safetensors::TensorMetadata const& entry) {
+            auto const host = hostWeights.find(entry.name);
+            return host != hostWeights.end() ? host->second.rawPointer() : weights.at(entry.name).rawPointer();
+        };
+        std::vector<HostFactor> const factors = readHostFactors(name, metadata, payloadOf);
+        std::map<std::string, int64_t> ranksOf;
+        for (auto const& factor : factors)
+        {
+            ranksOf.emplace(factor.meta.name, validateAdapterTensorHeader(name, factor.meta.name, factor.meta.shape));
+        }
+        AdapterIdentityBuilder identity;
+        for (auto const& factor : factors)
+        {
+            validateAdapterTensorMetadata(name, factor.meta, ranksOf, mMaxSupportedLoraRank);
+            validateFiniteOnHost(name, factor.meta.name, factor.data, factor.meta.bytes);
+            identity.add(factor.meta.name, factor.meta.dataType, factor.meta.shape, factor.data, factor.meta.bytes);
+        }
+        if (!mEngineBindingNames.empty())
+        {
+            validateAdaptersAgainstBindings(
+                "LoRAManager", weights, name, mEngineMaxBindingShapes, mEngineBindingDataTypes, mInt8Factors);
+        }
+        mAdapterIdentities[name] = identity.finish();
+        mAdapters[name] = std::move(weights);
+        return;
+    }
 
     std::map<std::string, int64_t> ranksOf;
     for (auto const& [tensorName, tensor] : weights)
@@ -472,7 +553,8 @@ void LoRAManager::addWeights(std::string const& name, std::map<std::string, rt::
 
     if (!mEngineBindingNames.empty())
     {
-        validateAdaptersAgainstBindings("LoRAManager", weights, name, mEngineMaxBindingShapes);
+        validateAdaptersAgainstBindings(
+            "LoRAManager", weights, name, mEngineMaxBindingShapes, mEngineBindingDataTypes, mInt8Factors);
     }
 
     mAdapterIdentities[name] = identity.finish();
@@ -589,8 +671,9 @@ void LoRAManager::initializeEngineBindings(EngineExecutor const& runner)
         }
         else if (std::strcmp(v, "0") != 0 || mInactiveRank != 0)
         {
-            LOG_WARNING("LoRAManager: ignoring EDGELLM_LORA_EMPTY_RANK=%s (this engine binds unused LoRA inputs "
-                        "at rank %d; only 1 may override it)",
+            LOG_WARNING(
+                "LoRAManager: ignoring EDGELLM_LORA_EMPTY_RANK=%s (this engine binds unused LoRA inputs "
+                "at rank %d; only 1 may override it)",
                 v, mInactiveRank);
         }
     }
@@ -600,18 +683,27 @@ void LoRAManager::initializeEngineBindings(EngineExecutor const& runner)
     std::vector<std::string> names = collectLoraWeightsTensorNames(runner);
     std::map<std::string, rt::Tensor> dummyTensors;
     std::map<std::string, nvinfer1::Dims> maxShapes;
+    std::map<std::string, nvinfer1::DataType> bindingDataTypes;
 
     for (auto const& name : names)
     {
-        nvinfer1::Dims const maxShape
+        bool const scale = isScaleName(name);
+        bool const isA = isLoraAName(name);
+        bool const staticScale = scale && !isA;
+        nvinfer1::Dims maxShape
             = runner.getProfileShape(name.c_str(), /*profileIndex=*/0, nvinfer1::OptProfileSelector::kMAX);
+        if (staticScale || maxShape.nbDims < 0)
+        {
+            maxShape = runner.getEngine().getTensorShape(name.c_str());
+        }
+        ELLM_CHECK(maxShape.nbDims == (scale ? 1 : 2), "LoRAManager: invalid binding shape for '" + name + "'");
         nvinfer1::Dims dummyShape = maxShape;
-        if (name.find(binding_names::kLoraAPrefix) != std::string::npos)
+        if (isA)
         {
             // LoRA A: [k, rank] → set rank (last dim) to 1
             dummyShape.d[dummyShape.nbDims - 1] = kEmptyLoraRank;
         }
-        else if (name.find(binding_names::kLoraBPrefix) != std::string::npos)
+        else if (!scale)
         {
             // LoRA B: [rank, n] → set rank (first dim) to 1
             dummyShape.d[0] = kEmptyLoraRank;
@@ -624,14 +716,16 @@ void LoRAManager::initializeEngineBindings(EngineExecutor const& runner)
         // Zero-fill: when no adapter is active these dummies are bound directly
         // to the engine's lora_A_*/lora_B_* inputs, so the rank-1 contraction
         // must read deterministic zeros, not uninitialized cudaMalloc memory.
-        auto [it, inserted] = dummyTensors.emplace(
-            name, rt::Tensor(shape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "loraDummy_" + name));
+        nvinfer1::DataType const bindingType = runner.getBindingDataType(name.c_str());
+        auto [it, inserted] = dummyTensors.emplace(name,
+            rt::Tensor(
+                shape, rt::DeviceType::kGPU, scale ? nvinfer1::DataType::kHALF : bindingType, "loraDummy_" + name));
         CUDA_CHECK(cudaMemset(it->second.rawPointer(), 0, it->second.getMemoryCapacity()));
-        if (emptyRank == 0)
+        if (emptyRank == 0 && !staticScale)
         {
             // Zero-volume binding on a valid allocation.
             rt::Coords zeroRank = it->second.getShape();
-            if (name.find(binding_names::kLoraAPrefix) != std::string::npos)
+            if (isA)
             {
                 zeroRank[zeroRank.getNumDims() - 1] = 0;
             }
@@ -642,18 +736,21 @@ void LoRAManager::initializeEngineBindings(EngineExecutor const& runner)
             check::check(it->second.reshape(zeroRank), "LoRA dummy reshape to rank 0 failed");
         }
         maxShapes.emplace(name, maxShape);
+        bindingDataTypes.emplace(name, bindingType);
     }
 
     mEngineBindingNames = std::move(names);
     mEngineDummyTensors = std::move(dummyTensors);
     mEngineMaxBindingShapes = std::move(maxShapes);
+    mEngineBindingDataTypes = std::move(bindingDataTypes);
     LOG_INFO("LoRAManager: registered %zu engine LoRA binding name(s)", mEngineBindingNames.size());
 
     // Adapters are loaded before the bindings are known (step 6 vs step 8 of
     // runtime initialization). Reconcile them now, before any graph capture.
     for (auto const& [adapterName, weights] : mAdapters)
     {
-        validateAdaptersAgainstBindings("LoRAManager", weights, adapterName, mEngineMaxBindingShapes);
+        validateAdaptersAgainstBindings(
+            "LoRAManager", weights, adapterName, mEngineMaxBindingShapes, mEngineBindingDataTypes, mInt8Factors);
     }
 }
 

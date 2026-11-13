@@ -39,7 +39,8 @@ constexpr int32_t kPrefillMaxCols{128};
 //! Targets of one grouped prefill shrink (shared x): A_i [K, r_i], columns colOff[i]..colOff[i+1].
 struct PrefillTargets
 {
-    __half const* A[kPrefillMaxTargets]{};
+    void const* A[kPrefillMaxTargets]{};        //!< fp16, or int8 codes when aScale is set
+    __half const* aScale[kPrefillMaxTargets]{}; //!< int8_per_channel_v1: one FP16 scale per A column
     int32_t r[kPrefillMaxTargets]{};
     int32_t colOff[kPrefillMaxTargets + 1]{};
     int32_t n{0};
@@ -50,9 +51,16 @@ struct PrefillTargets
  * over [A_0 | A_1 | ...] that reads x once, then one streaming expand + add per target.
  * out_i may equal base_i. Workspace: loraPrefillWorkspaceBytes(maxM, n * roundup16(maxRank)).
  */
+//! aScale/bScale (both or neither): INT8 factors (int8_per_channel_v1) with one FP16 scale per
+//! column ([r_i] for A_i, [N_i] for B_i), dequantized in the kernels as fp16(float(code) * float(scale)).
 int32_t launchLoraPrefill(void const* x, int64_t M, int32_t K, int32_t n, void const* const* A, void const* const* B,
-    void const* const* base, void* const* out, int32_t const* r, int32_t const* N, void* workspace,
-    cudaStream_t stream) noexcept;
+    void const* const* base, void* const* out, int32_t const* r, int32_t const* N, void* workspace, cudaStream_t stream,
+    void const* const* aScale = nullptr, void const* const* bScale = nullptr) noexcept;
+
+//! out[rows, cols] = fp16(float(codes[i]) * float(scale[i % cols])): an int8_per_channel_v1 factor
+//! dequantized on the device exactly as the runtime does on the host.
+int32_t launchLoraDequantInt8(
+    void const* codes, void const* scale, void* out, int64_t rows, int32_t cols, cudaStream_t stream) noexcept;
 
 //! Workspace bytes for launchLoraPrefill with up to maxM rows and `cols` padded rank columns.
 size_t loraPrefillWorkspaceBytes(int64_t maxM, int32_t cols) noexcept;

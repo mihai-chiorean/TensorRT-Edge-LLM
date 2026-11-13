@@ -64,7 +64,8 @@ public:
     //! @param maxSupportedLoraRank The engine's `max_lora_rank` build setting.
     //! @param inactiveRank Rank bound for LoRA inputs no adapter covers: 0 for engines whose
     //!        LoRA branches are LoraGroupPlugin nodes (recorded by the builder), else 1.
-    explicit LoRAManager(int32_t maxSupportedLoraRank, int32_t inactiveRank = 1) noexcept;
+    //! @param int8Factors Keep INT8 codes and per-column FP16 scales resident on the GPU.
+    explicit LoRAManager(int32_t maxSupportedLoraRank, int32_t inactiveRank = 1, bool int8Factors = false) noexcept;
 
     //! Deleted copy to prevent accidental duplication of GPU resources.
     LoRAManager(LoRAManager const&) = delete;
@@ -122,8 +123,8 @@ public:
     std::vector<std::string> getAdapterNames() const;
 
     //! Content identity of a registered adapter: 32 lowercase hex characters
-    //! derived only from its tensor names, dtypes, shapes and bytes (never its
-    //! name), computed once at registration. Keys every adapter-dependent cache.
+    //! derived from factor names, shapes and dequantized FP16 bytes (never its
+    //! adapter name), computed once at registration. Keys every adapter-dependent cache.
     //! @throws std::runtime_error if @p name is not registered.
     std::string const& getAdapterIdentity(std::string const& name) const;
 
@@ -141,7 +142,7 @@ public:
     //! Returns false when no adapter is active.
     bool hasWeightFor(std::string const& bindingName) const noexcept;
 
-    //! Register the engine's LoRA I/O bindings and create rank=1 dummy tensors
+    //! Register the engine's LoRA I/O bindings and create inactive dummy tensors
     //! with the correct engine shapes.  Must be called once after the EngineExecutor
     //! is constructed so that `refreshTensorMap()` knows which names to
     //! populate.
@@ -152,8 +153,8 @@ public:
     //! binding's, and its rank must fit the binding's max rank dimension.
     //!
     //! Encapsulates the LoRA binding-shape convention:
-    //!   - `lora_A_*` weights have shape [k, rank]; dummy sets last dim to 1.
-    //!   - `lora_B_*` weights have shape [rank, n]; dummy sets first dim to 1.
+    //!   - A [k, rank], B [rank, n] and A scales [rank] use the inactive rank.
+    //!   - B scales [n] retain their static extent and are zero-filled.
     //!
     //! @param runner Source of the engine I/O list and per-binding max shapes.
     //! @throws std::runtime_error when a registered adapter cannot bind.
@@ -199,11 +200,13 @@ private:
     //! adapters are validated against (the dummies carry rank=1 in the rank
     //! dimension and cannot serve as the ceiling).
     std::map<std::string, nvinfer1::Dims> mEngineMaxBindingShapes{};
+    std::map<std::string, nvinfer1::DataType> mEngineBindingDataTypes{};
 
     //! The engine's `max_lora_rank` build setting; the rank ceiling every
     //! registered adapter is validated against.
     int32_t mMaxSupportedLoraRank{0};
     int32_t mInactiveRank{1};
+    bool mInt8Factors{false};
 
     //! Adapters whose unbound bindings have already been reported by
     //! `refreshTensorMap`, so each adapter is warned about at most once.
