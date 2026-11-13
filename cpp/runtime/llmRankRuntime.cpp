@@ -4041,7 +4041,16 @@ bool LLMRankRuntime::genAndSaveSystemPromptKVCache(
         LOG_DEBUG("The systemPrompt is empty. Skip saving system prompt KVCache.");
         return true;
     }
-    std::string const loraCacheIdentity = resolveLoraCacheIdentity(loraWeightsName);
+    std::string loraCacheIdentity;
+    try
+    {
+        loraCacheIdentity = resolveLoraCacheIdentity(loraWeightsName);
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("Failed to resolve LoRA adapter '%s': %s", loraWeightsName.c_str(), e.what());
+        return false;
+    }
     auto const promptKey = keySystemPromptWithLoraIdentity(prompt, loraCacheIdentity);
     DecodingStrategy& cacheStrategy = mDecoderRegistry->cachePrimingStrategy();
     if (mSystemPromptKVCacheBase.find(promptKey) != mSystemPromptKVCacheBase.end()
