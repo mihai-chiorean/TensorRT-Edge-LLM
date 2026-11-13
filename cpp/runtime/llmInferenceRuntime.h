@@ -28,6 +28,7 @@
 #include "runtime/state/contextCache/contextCacheConfig.h"
 #include "runtime/state/contextCache/contextCacheMetrics.h"
 
+#include <atomic>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -170,7 +171,9 @@ private:
     LLMRankRuntime const& rootRuntime() const;
 
     std::unique_ptr<RuntimeCoordinator> mCoordinator;
-    std::optional<bool> mCaptureSucceeded; //!< Result of the last captureDecodingCUDAGraph(), on every path
+    //! Result of the last captureDecodingCUDAGraph() on every path: -1 none yet, 0 failed, 1 succeeded.
+    //! Atomic because getCudaGraphStats() may read it from a monitoring thread during a capture.
+    std::atomic<int8_t> mCaptureResult{-1};
 };
 
 } // namespace rt

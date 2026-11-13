@@ -899,7 +899,6 @@ def test_configured_adapter_outside_lora_weights_is_verified(tmp_path,
               lora_adapters=[LoraAdapterConfig("tool", str(weights))])
 
     assert [entry["verified"] for entry in llm.lora_adapter_info()] == [True]
-||||||| parent of b5b878f (feat(server): gate startup on decoding CUDA graph capture and report graph hits)
 
 
 
@@ -1007,3 +1006,56 @@ def test_cli_parses_require_cuda_graphs():
     assert parse_server_config(["m", "--require-cuda-graphs"
                                 ]).model.require_cuda_graphs is True
     assert parse_server_config(["m"]).model.require_cuda_graphs is False
+
+
+def test_empty_disable_variable_still_contradicts_required_graphs(
+        tmp_path, monkeypatch):
+    # The native coordinator skips capture when the variable is present at all.
+    monkeypatch.setenv("EDGELLM_DISABLE_CUDA_GRAPH", "")
+    with pytest.raises(ValueError, match="EDGELLM_DISABLE_CUDA_GRAPH"):
+        LLM(model=str(_engine_tree(tmp_path)),
+            cache_dir=str(tmp_path / "cache"),
+            require_cuda_graphs=True)
+
+
+def _tts_load(tmp_path, monkeypatch, require_cuda_graphs=False):
+    """Run load_model for a standalone TTS checkpoint with the options this
+    server adds (at their CLI defaults unless overridden), binding the result
+    against the real TTS constructor signature."""
+    import inspect
+
+    from experimental.server.runtime import engine as engine_module
+    from experimental.server.runtime import engine_build
+    from experimental.server.runtime.engine_layout import runtime_config_path
+
+    model_dir = tmp_path / "tts"
+    model_dir.mkdir()
+    config_path = Path(runtime_config_path(str(model_dir)))
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(config_path, {"model_type": "qwen3_tts"})
+    monkeypatch.setattr(engine_build, "prebuilt_bundle_layout", lambda m: None)
+    monkeypatch.setattr(engine_build, "resolve_model_dir",
+                        lambda m, c: str(model_dir))
+    signature = inspect.signature(engine_module.TTS.__init__)
+
+    class BoundTTS:
+
+        def __init__(self, **kwargs):
+            signature.bind(None, **kwargs)
+
+    monkeypatch.setattr(engine_module, "TTS", BoundTTS)
+    model = parse_server_config([str(model_dir)]).model
+    return engine_module.load_model(model=str(model_dir),
+                                    lora_verify=model.lora_verify,
+                                    allow_unverified_lora_adapters=model.
+                                    allow_unverified_lora_adapters,
+                                    require_cuda_graphs=require_cuda_graphs)
+
+
+def test_tts_dispatch_accepts_the_default_server_options(tmp_path, monkeypatch):
+    assert _tts_load(tmp_path, monkeypatch) is not None
+
+
+def test_tts_dispatch_refuses_required_cuda_graphs(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="require-cuda-graphs"):
+        _tts_load(tmp_path, monkeypatch, require_cuda_graphs=True)

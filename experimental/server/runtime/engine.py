@@ -1229,7 +1229,7 @@ class LLM:
         self._enable_in_flight_batching = enable_in_flight_batching
         self._require_cuda_graphs = require_cuda_graphs
         self._cuda_graphs_captured: Optional[bool] = None
-        if require_cuda_graphs and os.environ.get("EDGELLM_DISABLE_CUDA_GRAPH"):
+        if require_cuda_graphs and "EDGELLM_DISABLE_CUDA_GRAPH" in os.environ:
             raise ValueError("--require-cuda-graphs contradicts "
                              "EDGELLM_DISABLE_CUDA_GRAPH, which skips capture")
         if require_cuda_graphs and enable_in_flight_batching:
@@ -2922,6 +2922,12 @@ def load_model(**kwargs):
         if kwargs.pop("lora_adapters", None):
             raise ValueError(
                 "standalone TTS models do not serve LoRA adapters")
+        # LoRA verification options only matter when adapters are served.
+        kwargs.pop("lora_verify", None)
+        kwargs.pop("allow_unverified_lora_adapters", None)
+        if kwargs.pop("require_cuda_graphs", False):
+            raise ValueError(
+                "standalone TTS models do not support --require-cuda-graphs")
         if kwargs.pop("enable_in_flight_batching", False):
             raise _ifb_unsupported_error(
                 ifb_unsupported_reason(None, model_type=model_type))
