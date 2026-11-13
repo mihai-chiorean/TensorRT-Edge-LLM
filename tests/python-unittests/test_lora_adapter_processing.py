@@ -536,3 +536,11 @@ def test_int8_quantization_stays_finite_and_keeps_tiny_columns():
     assert dequant[1, 1] != 0
     assert dequant[2, 2] == 1.0
     assert error < 0.01
+
+
+@pytest.mark.parametrize("key,value", [("layers_to_transform", 0),
+                                       ("layers_pattern", "")])
+def test_layer_selection_is_refused_even_when_falsy(tmp_path, key, value):
+    adapter = _write_adapter(tmp_path / "adapter", **{key: value})
+    with pytest.raises(ValueError, match=key):
+        process_lora_weights_and_save(str(adapter), str(tmp_path / "out"))
