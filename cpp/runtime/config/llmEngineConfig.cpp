@@ -911,6 +911,7 @@ LLMEngineConfig parseEngineConfig(
 
     auto const& bc = configJson["builder_config"];
     cfg.maxSupportedLoraRank = bc.value("max_lora_rank", 0);
+    cfg.loraInactiveRank = bc.value("lora_inactive_rank", 1) == 0 ? 0 : 1;
 
     // Recurrent / conv state dtypes are only meaningful for hybrid engines
     // (Mamba / Nemotron-H / GDN). Mirror the Python export gating exactly:
