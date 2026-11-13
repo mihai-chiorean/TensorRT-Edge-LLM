@@ -85,6 +85,30 @@ class FakeRuntime:
                                output_texts=["out" * generated])
 
 
+class FakeContextCacheConfig:
+    """Mirror of the pybind ContextCacheConfig value type."""
+
+    def __init__(self):
+        self.enabled = False
+        self.max_records = 1024
+
+
+# Exact positional signatures of the two real pybind constructors
+# (experimental/pybind/edgellm_pybind.cpp): a call that does not match either
+# must raise TypeError, and context_cache_config must never be None.
+PLAIN_CTOR_PARAMS = [
+    "engine_dir", "multimodal_engine_dir", "lora_weights_map",
+    "checkpoint_dir", "context_cache_config", "host_embedding_tables",
+    "host_ple_table"
+]
+MTP_CTOR_PARAMS = [
+    "engine_dir", "multimodal_engine_dir", "lora_weights_map", "draft_top_k",
+    "draft_step", "verify_tree_size", "checkpoint_dir", "draft_checkpoint_dir",
+    "context_cache_config", "dflash_block_size", "host_embedding_tables",
+    "host_ple_table"
+]
+
+
 class FakeRtModule(types.ModuleType):
     """Stand-in for the _edgellm_runtime pybind module."""
 
@@ -92,6 +116,7 @@ class FakeRtModule(types.ModuleType):
         super().__init__("_edgellm_runtime")
         self._state = state
         self.profiling_enabled = False
+        self.ContextCacheConfig = FakeContextCacheConfig
 
         # Minimal request/response builders used by lora_bench.
         class ToolDefinition:
@@ -127,10 +152,31 @@ class FakeRtModule(types.ModuleType):
         self.create_generation_request = create_generation_request
         self.metrics = FakeMetrics(state)
 
+        def check_signature(got, params, kind):
+            if len(got) != len(params):
+                raise TypeError(
+                    f"{kind} __init__() takes exactly {len(params)} "
+                    f"positional arguments ({len(got)} given)")
+            if params.index("context_cache_config") >= len(got) or \
+                    got[params.index("context_cache_config")] is None:
+                raise TypeError(
+                    "context_cache_config: the pybind binding requires a "
+                    "ContextCacheConfig, not None")
+
         class LLMRuntime:
 
             def __init__(self, *args):
-                pass
+                state["ctor_calls"] = state.get("ctor_calls", [])
+                state["ctor_calls"].append(args)
+                if len(args) == len(PLAIN_CTOR_PARAMS):
+                    check_signature(args, PLAIN_CTOR_PARAMS, "plain")
+                elif len(args) == len(MTP_CTOR_PARAMS):
+                    check_signature(args, MTP_CTOR_PARAMS, "MTP")
+                else:
+                    raise TypeError(
+                        f"__init__(): incompatible constructor arguments "
+                        f"({len(args)} positional args; the pybind module "
+                        f"exposes a 7-arg plain and a 12-arg MTP constructor)")
 
             def handle_request(self, request):
                 return FakeRuntime(state).handle_request(request)
@@ -165,6 +211,7 @@ def bench_env(monkeypatch, tmp_path):
         "gen_per_run": 257,
         "prompt_tokens": 123,
         "handle_requests": [],
+        "ctor_calls": [],
     }
     monkeypatch.setenv("LORA_BENCH_SKIP_PLUGIN_LOAD", "1")
     rt_module = FakeRtModule(state)
@@ -187,6 +234,7 @@ def bench_env(monkeypatch, tmp_path):
     tok.save(str(tmp_path / "tokenizer.json"))
     engine_dir = tmp_path / "engine"
     (engine_dir / "llm").mkdir(parents=True)
+    (engine_dir / "visual").mkdir()
     (engine_dir / "llm" / "tokenizer.json").write_text(
         (tmp_path / "tokenizer.json").read_text(), encoding="utf-8")
 
@@ -208,6 +256,153 @@ def first_record(out):
         if line.startswith("{"):
             return json.loads(line)
     raise AssertionError(f"no JSON record line in stdout: {out!r}")
+
+
+def last_ctor_call(state):
+    """The single LLMRuntime constructor call the bench made, as a dict."""
+    calls = state["ctor_calls"]
+    assert len(calls) == 1, (
+        f"the bench must construct exactly one runtime, made {len(calls)}")
+    return calls[0]
+
+
+def ctor_args_dict(args, params):
+    return dict(zip(params, args))
+
+
+def test_mtp_constructor_matches_pybind_signature(bench_env):
+    """The MTP path must call the 12-arg pybind constructor with a real
+    ContextCacheConfig, <engine>/visual and the benchmarked 2/5/12 shape."""
+    module, run, state, engine_dir = bench_env
+    rc = run(["--engine", str(engine_dir), "--mtp"] + BASE_ARGS)
+    assert rc == 0
+
+    args = ctor_args_dict(last_ctor_call(state), MTP_CTOR_PARAMS)
+    assert args["engine_dir"] == str(engine_dir)
+    assert args["multimodal_engine_dir"] == str(engine_dir / "visual")
+    assert args["draft_top_k"] == module.DEFAULT_DRAFT_TOP_K == 2
+    assert args["draft_step"] == module.DEFAULT_DRAFT_STEP == 5
+    assert args["verify_tree_size"] == module.DEFAULT_VERIFY_TREE_SIZE == 12
+    assert args["checkpoint_dir"] == ""
+    assert args["draft_checkpoint_dir"] == ""
+    assert isinstance(args["context_cache_config"], FakeContextCacheConfig)
+    assert args["context_cache_config"].enabled is True
+    assert args["dflash_block_size"] == 0
+    assert args["host_embedding_tables"] is False
+    assert args["host_ple_table"] is False
+
+
+def test_plain_constructor_matches_pybind_signature(bench_env):
+    """The plain path must call the 7-arg pybind constructor."""
+    module, run, state, engine_dir = bench_env
+    state["mtp"] = False
+    rc = run(["--engine", str(engine_dir)] + BASE_ARGS)
+    assert rc == 0
+
+    args = ctor_args_dict(last_ctor_call(state), PLAIN_CTOR_PARAMS)
+    assert args["engine_dir"] == str(engine_dir)
+    assert args["multimodal_engine_dir"] == str(engine_dir / "visual")
+    assert args["checkpoint_dir"] == ""
+    assert isinstance(args["context_cache_config"], FakeContextCacheConfig)
+    assert args["context_cache_config"].enabled is True
+    assert args["host_embedding_tables"] is False
+    assert args["host_ple_table"] is False
+
+
+def test_visual_dir_falls_back_to_empty_when_missing(bench_env, tmp_path):
+    """No <engine>/visual directory: the pybind default '' must be passed."""
+    module, run, state, engine_dir = bench_env
+    (engine_dir / "visual").rmdir()
+    rc = run(["--engine", str(engine_dir), "--mtp"] + BASE_ARGS)
+    assert rc == 0
+    args = ctor_args_dict(last_ctor_call(state), MTP_CTOR_PARAMS)
+    assert args["multimodal_engine_dir"] == ""
+
+
+def test_no_reuse_disables_context_cache(bench_env):
+    """--no-reuse must construct the runtime with cc.enabled False."""
+    module, run, state, engine_dir = bench_env
+    rc = run(["--engine", str(engine_dir), "--mtp", "--no-reuse"] + BASE_ARGS)
+    assert rc == 0
+    args = ctor_args_dict(last_ctor_call(state), MTP_CTOR_PARAMS)
+    assert args["context_cache_config"].enabled is False
+
+
+def test_draft_shape_flags_reach_the_constructor(bench_env):
+    """--draft-top-k/--draft-step/--verify-tree-size override the defaults."""
+    module, run, state, engine_dir = bench_env
+    rc = run([
+        "--engine",
+        str(engine_dir), "--mtp", "--draft-top-k", "3", "--draft-step", "2",
+        "--verify-tree-size", "8"
+    ] + BASE_ARGS)
+    assert rc == 0
+    args = ctor_args_dict(last_ctor_call(state), MTP_CTOR_PARAMS)
+    assert args["draft_top_k"] == 3
+    assert args["draft_step"] == 2
+    assert args["verify_tree_size"] == 8
+
+
+def test_one_runtime_serves_base_and_adapter(bench_env, capsys):
+    """Base and every adapter must share one runtime: adapters load once into
+    lora_weights_map and requests select via lora_weights_name."""
+    module, run, state, engine_dir = bench_env
+    rc = run([
+        "--engine",
+        str(engine_dir), "--mtp", "--adapter", "alpha=/adapters/alpha",
+        "--adapter", "beta=/adapters/beta"
+    ] + BASE_ARGS)
+    assert rc == 0
+
+    calls = state["ctor_calls"]
+    assert len(calls) == 1, (
+        f"base + 2 adapters must construct exactly one runtime, "
+        f"made {len(calls)}")
+    args = ctor_args_dict(calls[0], MTP_CTOR_PARAMS)
+    assert args["lora_weights_map"] == {
+        "alpha": "/adapters/alpha",
+        "beta": "/adapters/beta"
+    }, "all adapters must be in the single runtime's lora_weights_map"
+
+    out = capsys.readouterr().out
+    tags = [
+        json.loads(line)["tag"] for line in out.splitlines()
+        if line.strip().startswith("{")
+    ]
+    assert tags == [
+        "base", "alpha", "beta"
+    ], (f"one shared runtime must still produce all variant records: {tags}")
+
+
+def test_adapter_requests_carry_lora_weights_name(bench_env, capsys):
+    """Adapter records must come from requests naming the adapter; base from
+    requests with an empty lora_weights_name (one shared runtime)."""
+    module, run, state, engine_dir = bench_env
+
+    names = []
+
+    original_handle = FakeRuntime.handle_request
+
+    def spy_handle(self, request):
+        names.append(request.lora_weights_name)
+        return original_handle(self, request)
+
+    monkey_target = FakeRuntime
+    monkey_target.handle_request = spy_handle
+    try:
+        rc = run([
+            "--engine",
+            str(engine_dir), "--mtp", "--adapter", "alpha=/adapters/alpha"
+        ] + BASE_ARGS)
+    finally:
+        monkey_target.handle_request = original_handle
+    assert rc == 0
+
+    assert len(state["ctor_calls"]) == 1
+    base_names = [n for n in names if n == ""]
+    adapter_names = [n for n in names if n == "alpha"]
+    assert base_names, "base variant must send lora_weights_name=''"
+    assert adapter_names, "adapter variant must send lora_weights_name='alpha'"
 
 
 def test_mtp_metrics_pass_yields_numeric_tokens_per_verify_step(

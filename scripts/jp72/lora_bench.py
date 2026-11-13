@@ -35,6 +35,15 @@ Usage
         --build-dir "$B" \
         --out /data/bench/$(date +%s).jsonl
 
+One ``LLMRuntime`` is constructed for the whole run: every adapter loads once
+into the runtime's ``lora_weights_map`` and each request selects its adapter
+via ``lora_weights_name`` (empty for base), so base and adapter share one
+context cache and one set of captured decode graphs. The multimodal engine
+dir is ``<engine>/visual`` when that directory exists. The MTP drafting shape
+defaults to the benchmarked top-2 / 5-step / verify-12 tree
+(``--draft-top-k``, ``--draft-step``, ``--verify-tree-size`` to override);
+``--no-reuse`` builds the runtime with the context cache disabled.
+
 Env: ``B`` (or ``--build-dir``) must point at the EdgeLLM build tree; the
 plugin lib and ``pybind`` module are loaded from there. Jetson-only: every run
 touches CUDA via the pybind runtime.
@@ -44,7 +53,9 @@ Record schema (one JSON line per record in ``--out``; see ``--out`` docs):
     mtp                     engine runs speculative decoding
     engine                  engine directory
     adapter                 adapter directory (null for base)
-    peak_host_rss_mb        peak RSS of this process after the runtime loads
+    peak_host_rss_mb        peak RSS of the process after the runtime loads
+                            (one runtime for the whole run, so it is monotone
+                            across records)
     prompt_tokens           measured prompt token count (see --ttft-lengths)
     ttft_ms_tool            TTFT of the original tool-prompt request
     ttft_sweep              list of {"target_tokens", "prompt_tokens", "ttft_ms"}
@@ -128,6 +139,12 @@ TTFT_MAX_TOKENS = 1
 DECODE_MAX_TOKENS = 256
 GREEDY_MAX_TOKENS = 64
 
+# MTP drafting shape the engines are built and benchmarked with (draft top-2,
+# 5 draft steps, verify tree 12; see the production MTP runtime config).
+DEFAULT_DRAFT_TOP_K = 2
+DEFAULT_DRAFT_STEP = 5
+DEFAULT_VERIFY_TREE_SIZE = 12
+
 RECORD_FIELDS = [
     "tag",
     "mtp",
@@ -191,9 +208,23 @@ def parse_args(argv=None):
     parser.add_argument(
         "--no-reuse",
         action="store_true",
-        help=
-        "Accepted for compatibility; unique time_ns prefixes always defeat context reuse."
-    )
+        help="Construct the runtime with the context cache disabled; unique "
+        "time_ns prefixes in the TTFT prompts defeat reuse regardless.")
+    parser.add_argument(
+        "--draft-top-k",
+        type=int,
+        default=DEFAULT_DRAFT_TOP_K,
+        help="MTP draft top-k (--mtp only; default: %(default)s).")
+    parser.add_argument(
+        "--draft-step",
+        type=int,
+        default=DEFAULT_DRAFT_STEP,
+        help="MTP draft step (--mtp only; default: %(default)s).")
+    parser.add_argument(
+        "--verify-tree-size",
+        type=int,
+        default=DEFAULT_VERIFY_TREE_SIZE,
+        help="MTP verify tree size (--mtp only; default: %(default)s).")
     parser.add_argument(
         "--out",
         metavar="FILE.jsonl",
@@ -336,7 +367,7 @@ def build_ttft_prompt(target_tokens, tokenizer=None, paragraph=TTFT_PARAGRAPH):
     return best, best_err
 
 
-def make_tool_request(rt, prompt):
+def make_tool_request(rt, prompt, lora=""):
     """Build a one-shot tool-call request via the pybind helpers."""
     tools = []
     for tool in TOOL_DEFINITIONS:
@@ -357,7 +388,7 @@ def make_tool_request(rt, prompt):
         apply_chat_template=True,
         add_generation_prompt=True,
         enable_thinking=False,
-        lora_weights_name="",
+        lora_weights_name=lora,
         save_system_prompt_kv_cache=False,
         disable_spec_decode=False)
     req.tools = tools
@@ -366,7 +397,7 @@ def make_tool_request(rt, prompt):
     return req
 
 
-def make_decode_request(rt, prompt, max_tokens=DECODE_MAX_TOKENS):
+def make_decode_request(rt, prompt, max_tokens=DECODE_MAX_TOKENS, lora=""):
     """Build a plain decode request."""
     return rt.create_generation_request(
         [[rt.create_text_message("user", prompt)]],
@@ -376,14 +407,14 @@ def make_decode_request(rt, prompt, max_tokens=DECODE_MAX_TOKENS):
         apply_chat_template=True,
         add_generation_prompt=True,
         enable_thinking=False,
-        lora_weights_name="",
+        lora_weights_name=lora,
         save_system_prompt_kv_cache=False,
         disable_spec_decode=False)
 
 
-def run_decode(rt, runtime, prompt, max_tokens=DECODE_MAX_TOKENS):
+def run_decode(rt, runtime, prompt, max_tokens=DECODE_MAX_TOKENS, lora=""):
     """Run one decode request; returns (prompt_tokens, generated, seconds, output_ids)."""
-    req = make_decode_request(rt, prompt, max_tokens)
+    req = make_decode_request(rt, prompt, max_tokens, lora=lora)
     t0 = time.perf_counter()
     resp = runtime.handle_request(req)
     seconds = time.perf_counter() - t0
@@ -456,7 +487,7 @@ def assemble_record(tag,
     return record
 
 
-def run_ttft_sweep(rt, runtime, lengths, reps, tokenizer):
+def run_ttft_sweep(rt, runtime, lengths, reps, tokenizer, lora=""):
     """For each target length build an uncached prompt, generate 1 token, take the median.
 
     Each rep gets its own time_ns-prefixed prompt, so engine context reuse
@@ -469,7 +500,7 @@ def run_ttft_sweep(rt, runtime, lengths, reps, tokenizer):
         prompt_tokens = None
         for _ in range(reps):
             prompt, measured = build_ttft_prompt(target, tokenizer)
-            req = make_tool_request(rt, prompt)
+            req = make_tool_request(rt, prompt, lora=lora)
             t0 = time.perf_counter()
             resp = runtime.handle_request(req)
             ttfts.append((time.perf_counter() - t0) * 1000.0)
@@ -506,18 +537,38 @@ def read_spec_metrics(runtime):
 
 
 def load_runtime(rt, args, lora_map):
-    """Construct LLMRuntime for a plain or MTP engine."""
+    """Construct LLMRuntime for a plain or MTP engine.
+
+    Mirrors the original probe and the production runtime wiring: the
+    multimodal dir is ``<engine>/visual`` when present (empty string
+    otherwise, the pybind default for text-only engines), the context cache
+    config is always a real ``rt.ContextCacheConfig`` (``None`` fails the
+    pybind constructor), and the MTP drafting shape defaults to the
+    benchmarked top-2 / 5-step / verify-12 tree, overridable by flags.
+    """
+    visual_dir = os.path.join(args.engine, "visual")
+    if not os.path.isdir(visual_dir):
+        visual_dir = ""
+    cc = rt.ContextCacheConfig()
+    cc.enabled = not args.no_reuse
     if args.mtp:
-        return rt.LLMRuntime(args.engine, "", lora_map, 1, 1, 1, "", "", None,
-                             0, False, False)
-    return rt.LLMRuntime(args.engine, "", lora_map, "", None, False, False)
+        return rt.LLMRuntime(args.engine, visual_dir, lora_map,
+                             args.draft_top_k, args.draft_step,
+                             args.verify_tree_size, "", "", cc, 0, False,
+                             False)
+    return rt.LLMRuntime(args.engine, visual_dir, lora_map, "", cc, False,
+                         False)
 
 
-def run_greedy_check(rt, runtime, base_outputs=None):
+def run_greedy_check(rt, runtime, base_outputs=None, lora=""):
     """Run the 9 greedy prompts; returns (token_id lists, match_fraction_vs_base)."""
     outputs = []
     for prompt in GREEDY_PROMPTS:
-        _, _, _, out_ids = run_decode(rt, runtime, prompt, GREEDY_MAX_TOKENS)
+        _, _, _, out_ids = run_decode(rt,
+                                      runtime,
+                                      prompt,
+                                      GREEDY_MAX_TOKENS,
+                                      lora=lora)
         outputs.append(out_ids)
     match = None
     if base_outputs is not None:
@@ -545,6 +596,116 @@ def load_rt_module(build_dir):
     return rt
 
 
+def measure_variant(rt,
+                    args,
+                    runtime,
+                    lengths,
+                    tokenizer,
+                    tag,
+                    adapter_path,
+                    base_outputs=None):
+    """Measure one variant (base or one adapter) on the shared runtime.
+
+    Every request carries ``lora_weights_name`` — empty for base, the adapter
+    name otherwise — so the runtime switches adapters per request, exactly as
+    the original probe did.
+    """
+    lora = tag if adapter_path else ""
+
+    peak_rss_mb = None
+    try:
+        import resource  # noqa: E402
+
+        peak_rss_mb = resource.getrusage(
+            resource.RUSAGE_SELF).ru_maxrss / 1024.0
+    except ImportError:
+        pass
+
+    # --- tool-prompt TTFT (original probe behavior) --------------------
+    req = make_tool_request(rt, TOOL_PROMPT, lora=lora)
+    t0 = time.perf_counter()
+    runtime.handle_request(req)
+    ttft_tool_ms = (time.perf_counter() - t0) * 1000.0
+
+    # --- decode ---------------------------------------------------------
+    decode_prompt = DECODE_PROMPTS[0]
+    prompt_tokens, generated, seconds, _ = run_decode(rt,
+                                                      runtime,
+                                                      decode_prompt,
+                                                      lora=lora)
+
+    # --- TTFT sweep -----------------------------------------------------
+    sweep = run_ttft_sweep(rt,
+                           runtime,
+                           lengths,
+                           args.reps,
+                           tokenizer,
+                           lora=lora)
+
+    # --- metrics pass: profiling ON only here ---------------------------
+    # recordRun() (cpp/profiling/metrics.h) is a no-op unless the
+    # thread-local profiling flag is set, and the flag must be off for
+    # the timed runs above; the counters therefore come from this extra
+    # run, which is why it exists.
+    spec_metrics = None
+    if args.mtp:
+        rt.set_profiling_enabled(True)
+        try:
+            _, metrics_generated, _, _ = run_decode(rt,
+                                                    runtime,
+                                                    decode_prompt,
+                                                    lora=lora)
+            spec_metrics = read_spec_metrics(runtime)
+        finally:
+            rt.set_profiling_enabled(False)
+        if spec_metrics is None or spec_metrics["total_iterations"] <= 0:
+            print(
+                "ERROR: MTP engine reported zero spec-decode iterations "
+                "(profiling was enabled for the metrics pass); "
+                "cannot compute tokens_per_verify_step",
+                file=sys.stderr)
+            return None
+        # Counters accumulate across every handle_request on this
+        # runtime; the timed runs ran with profiling off, so the deltas
+        # belong to this pass alone.
+        if metrics_generated > 0:
+            spec_metrics["total_generated_tokens"] = metrics_generated
+
+    # --- greedy check ---------------------------------------------------
+    outputs, match = run_greedy_check(rt,
+                                      runtime,
+                                      base_outputs=base_outputs,
+                                      lora=lora)
+
+    decode = {
+        "prompt_tokens": prompt_tokens,
+        "generated": generated,
+        "seconds": seconds,
+    }
+    record = assemble_record(tag=tag,
+                             mtp=args.mtp,
+                             engine_dir=args.engine,
+                             adapter_path=adapter_path,
+                             peak_rss_mb=peak_rss_mb,
+                             ttft_tool_ms=round(ttft_tool_ms, 3),
+                             ttft_sweep=sweep,
+                             decode=decode,
+                             spec_metrics=spec_metrics,
+                             greedy_match=match)
+    # --skip-outputs keeps generated texts out of the record; only the
+    # per-prompt token counts are retained for the greedy comparison.
+    record["outputs"] = None if args.skip_outputs else [
+        len(o) for o in outputs
+    ]
+
+    print(
+        f"[{tag}] ttft_tool={record['ttft_ms_tool']:.1f}ms "
+        f"decode={record['decode_tok_s']}tok/s "
+        f"tpv={record['tokens_per_verify_step']}",
+        flush=True)
+    return record, outputs
+
+
 def main(argv=None):
     """Entry point; imports the pybind runtime (and CUDA) only here."""
     args = parse_args(argv)
@@ -565,7 +726,12 @@ def main(argv=None):
             f"WARNING: no tokenizer at {engine_tokenizer}; prompt_tokens will be estimates",
             file=sys.stderr)
 
-    # lora_weights_map: adapter name -> adapter directory.
+    # One runtime serves every variant: all adapters load once into the
+    # lora_weights_map and each request selects its adapter via
+    # lora_weights_name (empty for base), matching the original probe.
+    lora_map = dict(adapters)
+    runtime = load_runtime(rt, args, lora_map)
+
     # Tag ordering: base first, then adapters in the order given.
     variants = [("base", None)]
     for name, path in adapters:
@@ -574,94 +740,20 @@ def main(argv=None):
     records = []
     base_outputs = None
     for tag, adapter_path in variants:
-        lora_map = {tag: adapter_path} if adapter_path else {}
-        runtime = load_runtime(rt, args, lora_map)
-
-        peak_rss_mb = None
-        try:
-            import resource  # noqa: E402
-
-            peak_rss_mb = resource.getrusage(
-                resource.RUSAGE_SELF).ru_maxrss / 1024.0
-        except ImportError:
-            pass
-
-        # --- tool-prompt TTFT (original probe behavior) --------------------
-        req = make_tool_request(rt, TOOL_PROMPT)
-        t0 = time.perf_counter()
-        runtime.handle_request(req)
-        ttft_tool_ms = (time.perf_counter() - t0) * 1000.0
-
-        # --- decode ---------------------------------------------------------
-        decode_prompt = DECODE_PROMPTS[0]
-        prompt_tokens, generated, seconds, _ = run_decode(
-            rt, runtime, decode_prompt)
-
-        # --- TTFT sweep -----------------------------------------------------
-        sweep = run_ttft_sweep(rt, runtime, lengths, args.reps, tokenizer)
-
-        # --- metrics pass: profiling ON only here ---------------------------
-        # recordRun() (cpp/profiling/metrics.h) is a no-op unless the
-        # thread-local profiling flag is set, and the flag must be off for
-        # the timed runs above; the counters therefore come from this extra
-        # run, which is why it exists.
-        spec_metrics = None
-        if args.mtp:
-            rt.set_profiling_enabled(True)
-            try:
-                _, metrics_generated, _, _ = run_decode(
-                    rt, runtime, decode_prompt)
-                spec_metrics = read_spec_metrics(runtime)
-            finally:
-                rt.set_profiling_enabled(False)
-            if spec_metrics is None or spec_metrics["total_iterations"] <= 0:
-                print(
-                    "ERROR: MTP engine reported zero spec-decode iterations "
-                    "(profiling was enabled for the metrics pass); "
-                    "cannot compute tokens_per_verify_step",
-                    file=sys.stderr)
-                return 2
-            # Counters accumulate across every handle_request on this
-            # runtime; the timed runs ran with profiling off, so the deltas
-            # belong to this pass alone.
-            if metrics_generated > 0:
-                spec_metrics["total_generated_tokens"] = metrics_generated
-
-        # --- greedy check ---------------------------------------------------
-        outputs, match = run_greedy_check(rt,
-                                          runtime,
-                                          base_outputs=base_outputs)
+        result = measure_variant(rt,
+                                 args,
+                                 runtime,
+                                 lengths,
+                                 tokenizer,
+                                 tag,
+                                 adapter_path,
+                                 base_outputs=base_outputs)
+        if result is None:
+            return 2
+        record, outputs = result
         if base_outputs is None:
             base_outputs = outputs
-
-        decode = {
-            "prompt_tokens": prompt_tokens,
-            "generated": generated,
-            "seconds": seconds,
-        }
-        record = assemble_record(tag=tag,
-                                 mtp=args.mtp,
-                                 engine_dir=args.engine,
-                                 adapter_path=adapter_path,
-                                 peak_rss_mb=peak_rss_mb,
-                                 ttft_tool_ms=round(ttft_tool_ms, 3),
-                                 ttft_sweep=sweep,
-                                 decode=decode,
-                                 spec_metrics=spec_metrics,
-                                 greedy_match=match)
-        # --skip-outputs keeps generated texts out of the record; only the
-        # per-prompt token counts are retained for the greedy comparison.
-        record["outputs"] = None if args.skip_outputs else [
-            len(o) for o in outputs
-        ]
         records.append(record)
-
-        print(
-            f"[{tag}] ttft_tool={record['ttft_ms_tool']:.1f}ms "
-            f"decode={record['decode_tok_s']}tok/s "
-            f"tpv={record['tokens_per_verify_step']}",
-            flush=True)
-        del runtime
 
     lines = "".join(json.dumps(r) + "\n" for r in records)
     if args.out:
