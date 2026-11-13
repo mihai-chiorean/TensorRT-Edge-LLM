@@ -57,6 +57,13 @@ def main(argv=None, *, prog="tensorrt-edgellm-insert-lora") -> None:
               "as whole dot-separated segments of the module path (Gemma 4: "
               "self_attn,mlp). Default: every eligible linear layer."))
 
+    parser.add_argument(
+        "--lora-group-plugin",
+        "--lora_group_plugin",
+        action="store_true",
+        help=("Emit grouped, in-place LoraGroupPlugin nodes instead of "
+              "MatMul/MatMul/Add branches (needs the matching plugin library)."))
+
     args = parser.parse_args(argv)
     from tensorrt_edgellm.lora_targets import parse_lora_targets
     try:
@@ -68,7 +75,9 @@ def main(argv=None, *, prog="tensorrt-edgellm-insert-lora") -> None:
 
     try:
         # Insert LoRA patterns
-        insert_lora_and_save(onnx_dir=args.onnx_dir, lora_targets=lora_targets)
+        insert_lora_and_save(onnx_dir=args.onnx_dir,
+                             lora_targets=lora_targets,
+                             lora_group_plugin=args.lora_group_plugin)
 
         print("LoRA insertion completed successfully!")
 
