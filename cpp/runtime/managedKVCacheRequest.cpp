@@ -208,7 +208,7 @@ bool ManagedKVCacheRequest::completeBatchCompaction(std::vector<int32_t> const& 
 }
 
 ContextCacheRequest::AdmitSequenceStatus ManagedKVCacheRequest::admitSequence(std::vector<int32_t> const& tokenIds,
-    std::string const& loraWeightsName, DecodingKvHeadroom const& headroom, int32_t& prefillStart, ResidentRef resident,
+    std::string const& loraCacheIdentity, DecodingKvHeadroom const& headroom, int32_t& prefillStart, ResidentRef resident,
     cudaStream_t stream, std::vector<int32_t> const& mediaTokenIds,
     std::vector<imageUtils::ImageData> const& imageBuffers, std::vector<audioUtils::AudioData> const& audioBuffers)
 {
@@ -217,7 +217,7 @@ ContextCacheRequest::AdmitSequenceStatus ManagedKVCacheRequest::admitSequence(st
         return ContextCacheRequest::AdmitSequenceStatus::kFailed;
     }
     return contextRequest().admitSequence(
-        tokenIds, loraWeightsName, headroom, prefillStart, resident, stream, mediaTokenIds, imageBuffers, audioBuffers);
+        tokenIds, loraCacheIdentity, headroom, prefillStart, resident, stream, mediaTokenIds, imageBuffers, audioBuffers);
 }
 
 bool ManagedKVCacheRequest::finalizeSequenceAdmission(

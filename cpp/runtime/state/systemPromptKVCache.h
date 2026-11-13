@@ -45,10 +45,12 @@ struct SystemPromptKVCache
     std::vector<rt::Tensor> convStateContents; //!< Cached conv states for hybrid layers (empty if not applicable)
 };
 
-inline SystemPromptCacheKey keySystemPromptWithLoraWeights(
-    std::string const& systemPrompt, std::string const& loraWeightsName)
+//! Key a cached system prompt by its text and the active adapter's content identity
+//! (LoRAManager::getAdapterIdentity; empty for the base model), never by adapter name.
+inline SystemPromptCacheKey keySystemPromptWithLoraIdentity(
+    std::string const& systemPrompt, std::string const& loraCacheIdentity)
 {
-    return std::make_tuple(systemPrompt, loraWeightsName);
+    return std::make_tuple(systemPrompt, loraCacheIdentity);
 }
 
 /*! \brief Result of reconciling a request's input tokens against a previously-captured system-prompt KV cache.

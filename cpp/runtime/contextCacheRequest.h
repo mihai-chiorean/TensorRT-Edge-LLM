@@ -72,7 +72,7 @@ public:
 
     //! Join one more text-only sequence to this live request: lookup, lease, and row binding.
     //! On kAdmitted, @p prefillStart receives the reused prefix length the seated prefill skips.
-    AdmitSequenceStatus admitSequence(std::vector<int32_t> const& tokenIds, std::string const& loraWeightsName,
+    AdmitSequenceStatus admitSequence(std::vector<int32_t> const& tokenIds, std::string const& loraCacheIdentity,
         DecodingKvHeadroom const& headroom, int32_t& prefillStart, ResidentRef resident, cudaStream_t stream,
         std::vector<int32_t> const& mediaTokenIds = {}, std::vector<imageUtils::ImageData> const& imageBuffers = {},
         std::vector<audioUtils::AudioData> const& audioBuffers = {});

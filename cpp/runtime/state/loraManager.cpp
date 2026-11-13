@@ -23,10 +23,13 @@
 #include "common/mmapReader.h"
 #include "common/safetensorsUtils.h"
 #include "runtime/exec/engineExecutor.h"
+#include "runtime/state/contextCache/blockHash.h"
 
 #include <NvInferRuntime.h>
 
 #include <algorithm>
+#include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <set>
 #include <stdexcept>
@@ -195,6 +198,48 @@ void validateAdaptersAgainstBindings(std::string const& contextLabel, std::map<s
     }
 }
 
+//! Accumulates the per-tensor lines that define an adapter's content identity.
+//! Tensors must be added in ascending name order.
+class AdapterIdentityBuilder
+{
+public:
+    void add(std::string const& tensorName, nvinfer1::DataType dataType, Coords const& shape, void const* payload,
+        size_t bytes)
+    {
+        Hash128 const payloadHash = hashOpaqueIdentity(std::string_view(static_cast<char const*>(payload), bytes));
+        mManifest += tensorName;
+        mManifest += '\t';
+        mManifest += std::to_string(static_cast<int32_t>(dataType));
+        mManifest += '\t';
+        for (int32_t d = 0; d < shape.getNumDims(); ++d)
+        {
+            if (d > 0)
+            {
+                mManifest += 'x';
+            }
+            mManifest += std::to_string(shape[d]);
+        }
+        mManifest += '\t';
+        mManifest += toHex(payloadHash);
+        mManifest += '\n';
+    }
+
+    std::string finish() const
+    {
+        return toHex(hashOpaqueIdentity(mManifest));
+    }
+
+private:
+    static std::string toHex(Hash128 const& hash)
+    {
+        char buffer[33];
+        std::snprintf(buffer, sizeof(buffer), "%016" PRIx64 "%016" PRIx64, hash.hi, hash.lo);
+        return std::string(buffer, 32);
+    }
+
+    std::string mManifest;
+};
+
 } // namespace
 
 LoRAManager::LoRAManager(int32_t maxSupportedLoraRank) noexcept
@@ -228,6 +273,20 @@ void LoRAManager::loadWeights(std::string const& name, std::filesystem::path con
         validateFiniteOnHost(name, entry.name, reader.getByteData() + metadata.dataOffset + entry.offset, entry.bytes);
     }
 
+    std::vector<safetensors::TensorMetadata const*> byName;
+    byName.reserve(metadata.tensors.size());
+    for (auto const& entry : metadata.tensors)
+    {
+        byName.push_back(&entry);
+    }
+    std::sort(byName.begin(), byName.end(), [](auto const* a, auto const* b) { return a->name < b->name; });
+    AdapterIdentityBuilder identity;
+    for (auto const* entry : byName)
+    {
+        identity.add(entry->name, entry->dataType, entry->shape,
+            reader.getByteData() + metadata.dataOffset + entry->offset, entry->bytes);
+    }
+
     // Metadata and values are valid; allocate and copy the payloads (the loop from safetensors::loadSafetensors).
     WeightMap weights;
     for (auto const& entry : metadata.tensors)
@@ -248,6 +307,7 @@ void LoRAManager::loadWeights(std::string const& name, std::filesystem::path con
 
     LOG_INFO("LoRAManager: adapter '%s' loaded with %zu binding(s)", name.c_str(), weights.size());
 
+    mAdapterIdentities[name] = identity.finish();
     mAdapters[name] = std::move(weights);
 }
 
@@ -264,6 +324,7 @@ void LoRAManager::addWeights(std::string const& name, std::map<std::string, rt::
         ELLM_CHECK(ranksOf.emplace(tensorName, validateAdapterTensorHeader(name, tensorName, tensor.getShape())).second,
             "LoRAManager: adapter '" + name + "' contains duplicate tensor '" + tensorName + "'");
     }
+    AdapterIdentityBuilder identity; // std::map iterates in ascending name order
     for (auto const& [tensorName, tensor] : weights)
     {
         validateAdapterTensorMetadata(name,
@@ -276,10 +337,12 @@ void LoRAManager::addWeights(std::string const& name, std::map<std::string, rt::
             std::vector<uint16_t> host(bytes / sizeof(uint16_t));
             CUDA_CHECK(cudaMemcpy(host.data(), tensor.rawPointer(), bytes, cudaMemcpyDeviceToHost));
             validateFiniteOnHost(name, tensorName, host.data(), bytes);
+            identity.add(tensorName, tensor.getDataType(), tensor.getShape(), host.data(), bytes);
         }
         else
         {
             validateFiniteOnHost(name, tensorName, tensor.rawPointer(), bytes);
+            identity.add(tensorName, tensor.getDataType(), tensor.getShape(), tensor.rawPointer(), bytes);
         }
     }
 
@@ -288,6 +351,7 @@ void LoRAManager::addWeights(std::string const& name, std::map<std::string, rt::
         validateAdaptersAgainstBindings("LoRAManager", weights, name, mEngineMaxBindingShapes);
     }
 
+    mAdapterIdentities[name] = identity.finish();
     mAdapters[name] = std::move(weights);
 }
 
@@ -358,6 +422,13 @@ std::vector<std::string> LoRAManager::getAdapterNames() const
         names.push_back(adapterName);
     }
     return names;
+}
+
+std::string const& LoRAManager::getAdapterIdentity(std::string const& name) const
+{
+    auto const it = mAdapterIdentities.find(name);
+    ELLM_CHECK(it != mAdapterIdentities.end(), "LoRAManager: adapter '" + name + "' not found");
+    return it->second;
 }
 
 bool LoRAManager::hasActiveAdapter() const noexcept

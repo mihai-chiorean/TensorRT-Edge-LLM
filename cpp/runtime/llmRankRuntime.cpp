@@ -1300,7 +1300,7 @@ AdmitDecision LLMRankRuntime::GenerationSession::reserveAdmission(AdmissionInten
         ContextCacheRequest::AdmitSequenceStatus status;
         try
         {
-            status = mManagedRequest->admitSequence(seed.promptTokenIds, mContext.loraWeightsName, mKvHeadroom,
+            status = mManagedRequest->admitSequence(seed.promptTokenIds, mContext.loraCacheIdentity, mKvHeadroom,
                 prefillStart, *intent.resident, mContext.stream, mediaTokenIds, seed.imageBuffers, seed.audioBuffers);
         }
         catch (...)
@@ -1851,6 +1851,15 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
     DecodingInferenceContext& context = generation->context;
     context.initialize(activeBatchSize, maxGenerateLength, std::nullopt, rt::OptionalInputTensors{}, loraWeightsName,
         stream, mDeployment.base.recurrentPoolRows);
+    try
+    {
+        context.loraCacheIdentity = resolveLoraCacheIdentity(loraWeightsName);
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("Failed to resolve LoRA adapter '%s': %s", loraWeightsName.c_str(), e.what());
+        return nullptr;
+    }
     if (founderRequestId != 0)
     {
         ELLM_CHECK(activeBatchSize == 1, "Stepped execution requires a single-sequence founder.");
@@ -3649,6 +3658,17 @@ bool LLMRankRuntime::runBaseModelPrefill(
     return true;
 }
 
+std::string LLMRankRuntime::resolveLoraCacheIdentity(std::string const& loraWeightsName) const
+{
+    if (loraWeightsName.empty())
+    {
+        return {};
+    }
+    ELLM_CHECK(mSharedResources->loraManager != nullptr,
+        "LoRA adapter '" + loraWeightsName + "' was requested, but the runtime has no LoRA manager");
+    return mSharedResources->loraManager->getAdapterIdentity(loraWeightsName);
+}
+
 bool LLMRankRuntime::captureBaseGraphWithLoraFanout(InferenceDims const& dims, cudaStream_t stream)
 {
     auto captureOnce = [&](std::string const& loraName) -> bool {
@@ -3775,7 +3795,7 @@ bool LLMRankRuntime::setUpForPrefillExecution(DecodingInferenceContext& context,
             ELLM_CHECK(context.residentSlots.contains(resident), "System-prompt setup received a stale resident slot");
             int32_t const residentSlot = resident.slot;
             auto const& prompt = context.systemPrompts[i];
-            auto const promptKey = keySystemPromptWithLoraWeights(prompt, context.loraWeightsName);
+            auto const promptKey = keySystemPromptWithLoraIdentity(prompt, context.loraCacheIdentity);
             auto const cached = mSystemPromptKVCacheBase.find(promptKey);
             bool const prefixMatches = cached != mSystemPromptKVCacheBase.end()
                 && hasReusableSystemPromptPrefix(cached->second, batchedInputIds[i]);
@@ -3874,8 +3894,9 @@ bool LLMRankRuntime::genAndSaveSystemPromptKVCache(DecodingInferenceContext& con
     }
 
     std::string const& loraWeightsName = context.loraWeightsName;
+    std::string const& loraCacheIdentity = context.loraCacheIdentity;
     std::string const prompt = context.systemPrompts[genAndSaveBatchIdx];
-    auto const promptKey = keySystemPromptWithLoraWeights(prompt, loraWeightsName);
+    auto const promptKey = keySystemPromptWithLoraIdentity(prompt, loraCacheIdentity);
 
     if (prompt.empty())
     {
@@ -3922,6 +3943,7 @@ bool LLMRankRuntime::genAndSaveSystemPromptKVCache(DecodingInferenceContext& con
     auto initTempContext = [&](DecodingInferenceContext& tempContext, std::vector<int32_t> const& tokens) {
         tempContext.initialize(
             1, 1, context.visualEmbeddings, context.deepstackFeatures, loraWeightsName, context.stream);
+        tempContext.loraCacheIdentity = loraCacheIdentity;
         tempContext.initializeRaggedScratch(RaggedEngineContract{TokenLayoutBackend::kEntryPaddedCompatibility,
             mDeployment.base.maxNumSequences, mDeployment.base.maxQueryLength, mDeployment.base.maxPhysicalTokens,
             mDeployment.base.recurrentPoolRows, /* mixedStepSupported = */ false});
@@ -4019,7 +4041,8 @@ bool LLMRankRuntime::genAndSaveSystemPromptKVCache(
         LOG_DEBUG("The systemPrompt is empty. Skip saving system prompt KVCache.");
         return true;
     }
-    auto const promptKey = keySystemPromptWithLoraWeights(prompt, loraWeightsName);
+    std::string const loraCacheIdentity = resolveLoraCacheIdentity(loraWeightsName);
+    auto const promptKey = keySystemPromptWithLoraIdentity(prompt, loraCacheIdentity);
     DecodingStrategy& cacheStrategy = mDecoderRegistry->cachePrimingStrategy();
     if (mSystemPromptKVCacheBase.find(promptKey) != mSystemPromptKVCacheBase.end()
         && (!cacheStrategy.isSpeculative() || cacheStrategy.hasSystemPromptKVCache(promptKey)))
@@ -4029,6 +4052,7 @@ bool LLMRankRuntime::genAndSaveSystemPromptKVCache(
     }
     DecodingInferenceContext tempContext;
     tempContext.initialize(1, 1, std::nullopt, rt::OptionalInputTensors{}, loraWeightsName, stream);
+    tempContext.loraCacheIdentity = loraCacheIdentity;
     tempContext.systemPrompts[0] = prompt;
     auto tokenizedPrompt = mTokenizer->encode(prompt, true);
     if (tokenizedPrompt.empty())
