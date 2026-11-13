@@ -899,3 +899,163 @@ def test_configured_adapter_outside_lora_weights_is_verified(tmp_path,
               lora_adapters=[LoraAdapterConfig("tool", str(weights))])
 
     assert [entry["verified"] for entry in llm.lora_adapter_info()] == [True]
+
+
+
+
+# ---------------------------------------------------------------------------
+# Decoding CUDA graph readiness
+# ---------------------------------------------------------------------------
+
+
+def _graph_runtime(monkeypatch, captured, stats=None):
+    """Point the fake module at a runtime whose capture returns ``captured``."""
+
+    class GraphRuntime(_FakeLLMRuntime):
+
+        def capture_decoding_cuda_graph(self):
+            return captured
+
+    if stats is not None:
+        GraphRuntime.get_cuda_graph_stats = lambda self: stats
+    monkeypatch.setattr(_FakeRuntimeModule, "LLMRuntime", GraphRuntime)
+
+
+def test_failed_capture_refuses_start_when_graphs_are_required(
+        tmp_path, _fake_runtime, monkeypatch):
+    _graph_runtime(monkeypatch, captured=False)
+    bundle = _engine_tree(tmp_path, max_lora_rank=16)
+
+    with pytest.raises(RuntimeError, match="CUDA graph"):
+        LLM(model=str(bundle),
+            cache_dir=str(tmp_path / "cache"),
+            require_cuda_graphs=True)
+
+
+def test_failed_capture_is_reported_as_degraded(tmp_path, _fake_runtime,
+                                                monkeypatch):
+    pytest.importorskip("fastapi")
+    _graph_runtime(monkeypatch, captured=False)
+    llm = _build_llm(tmp_path)
+    client, _ = _client_with(llm)
+
+    health = client.get("/health").json()
+
+    assert health["status"] == "healthy"
+    assert health["degraded"] == ["cuda_graph_capture_failed"]
+    assert health["cuda_graphs"]["captured"] is False
+    assert health["cuda_graphs"]["required"] is False
+
+
+def test_health_reports_native_graph_counters(tmp_path, _fake_runtime,
+                                              monkeypatch):
+    pytest.importorskip("fastapi")
+    stats = {
+        "capture_succeeded": True,
+        "base": {
+            "1": {
+                "graph_launches": 12,
+                "enqueue_runs": 3,
+                "graph_launch_failures": 0,
+                "captured_graphs": 3
+            }
+        },
+        "draft": {},
+    }
+    _graph_runtime(monkeypatch, captured=True, stats=stats)
+    llm = _build_llm(tmp_path)
+    client, _ = _client_with(llm)
+
+    health = client.get("/health").json()
+
+    assert health["degraded"] == []
+    assert health["cuda_graphs"]["captured"] is True
+    assert health["cuda_graphs"]["counters"] == stats
+
+
+def test_runtime_without_graph_counters_reports_none(tmp_path, _fake_runtime):
+    llm = _build_llm(tmp_path)
+    info = llm.cuda_graph_info()
+    assert info["captured"] is True
+    assert info["counters"] is None
+
+
+def test_graph_info_does_not_wait_for_a_running_request(
+        tmp_path, _fake_runtime, monkeypatch):
+    _graph_runtime(monkeypatch, captured=True, stats={"base": {}})
+    llm = _build_llm(tmp_path)
+    result = []
+    with llm._infer_lock:
+        reader = threading.Thread(
+            target=lambda: result.append(llm.cuda_graph_info()))
+        reader.start()
+        reader.join(timeout=5)
+    assert not reader.is_alive()
+    assert result[0]["counters"] == {"base": {}}
+
+
+def test_required_graphs_contradict_disabled_capture(tmp_path, monkeypatch):
+    monkeypatch.setenv("EDGELLM_DISABLE_CUDA_GRAPH", "1")
+    with pytest.raises(ValueError, match="EDGELLM_DISABLE_CUDA_GRAPH"):
+        LLM(model=str(_engine_tree(tmp_path)),
+            cache_dir=str(tmp_path / "cache"),
+            require_cuda_graphs=True)
+
+
+def test_cli_parses_require_cuda_graphs():
+    assert parse_server_config(["m", "--require-cuda-graphs"
+                                ]).model.require_cuda_graphs is True
+    assert parse_server_config(["m"]).model.require_cuda_graphs is False
+
+
+def test_empty_disable_variable_still_contradicts_required_graphs(
+        tmp_path, monkeypatch):
+    # The native coordinator skips capture when the variable is present at all.
+    monkeypatch.setenv("EDGELLM_DISABLE_CUDA_GRAPH", "")
+    with pytest.raises(ValueError, match="EDGELLM_DISABLE_CUDA_GRAPH"):
+        LLM(model=str(_engine_tree(tmp_path)),
+            cache_dir=str(tmp_path / "cache"),
+            require_cuda_graphs=True)
+
+
+def _tts_load(tmp_path, monkeypatch, require_cuda_graphs=False):
+    """Run load_model for a standalone TTS checkpoint with the options this
+    server adds (at their CLI defaults unless overridden), binding the result
+    against the real TTS constructor signature."""
+    import inspect
+
+    from experimental.server.runtime import engine as engine_module
+    from experimental.server.runtime import engine_build
+    from experimental.server.runtime.engine_layout import runtime_config_path
+
+    model_dir = tmp_path / "tts"
+    model_dir.mkdir()
+    config_path = Path(runtime_config_path(str(model_dir)))
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(config_path, {"model_type": "qwen3_tts"})
+    monkeypatch.setattr(engine_build, "prebuilt_bundle_layout", lambda m: None)
+    monkeypatch.setattr(engine_build, "resolve_model_dir",
+                        lambda m, c: str(model_dir))
+    signature = inspect.signature(engine_module.TTS.__init__)
+
+    class BoundTTS:
+
+        def __init__(self, **kwargs):
+            signature.bind(None, **kwargs)
+
+    monkeypatch.setattr(engine_module, "TTS", BoundTTS)
+    model = parse_server_config([str(model_dir)]).model
+    return engine_module.load_model(model=str(model_dir),
+                                    lora_verify=model.lora_verify,
+                                    allow_unverified_lora_adapters=model.
+                                    allow_unverified_lora_adapters,
+                                    require_cuda_graphs=require_cuda_graphs)
+
+
+def test_tts_dispatch_accepts_the_default_server_options(tmp_path, monkeypatch):
+    assert _tts_load(tmp_path, monkeypatch) is not None
+
+
+def test_tts_dispatch_refuses_required_cuda_graphs(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="require-cuda-graphs"):
+        _tts_load(tmp_path, monkeypatch, require_cuda_graphs=True)

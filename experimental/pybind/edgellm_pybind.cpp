@@ -435,6 +435,31 @@ public:
         return mRuntime->getContextCacheMetrics();
     }
 
+    //! Graph counters as plain Python values; called without the inference lock (the counters are atomics).
+    py::dict getCudaGraphStats() const
+    {
+        auto const toDict = [](std::map<int32_t, EngineExecutor::GraphCounters> const& perProfile) {
+            py::dict out;
+            for (auto const& [profile, counters] : perProfile)
+            {
+                py::dict entry;
+                entry["graph_launches"] = counters.graphLaunches;
+                entry["enqueue_runs"] = counters.enqueueRuns;
+                entry["graph_launch_failures"] = counters.graphLaunchFailures;
+                entry["captured_graphs"] = counters.capturedGraphs;
+                out[py::int_(profile)] = entry;
+            }
+            return out;
+        };
+        CudaGraphStats const stats = mRuntime->getCudaGraphStats();
+        py::dict result;
+        result["capture_succeeded"]
+            = stats.captureSucceeded.has_value() ? py::object(py::bool_(*stats.captureSucceeded)) : py::none();
+        result["base"] = toDict(stats.base);
+        result["draft"] = toDict(stats.draft);
+        return result;
+    }
+
 private:
     CudaStreamWrapper mStream;
     std::unique_ptr<void, DlDeleter> mPluginHandle;
@@ -1188,7 +1213,9 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def("get_eagle_generation_metrics", &PyLLMRuntime::getSpecDecodeGenerationMetrics,
             py::return_value_policy::reference_internal) // deprecated alias
         .def("get_multimodal_metrics", &PyLLMRuntime::getMultimodalMetrics)
-        .def("get_context_cache_metrics", &PyLLMRuntime::getContextCacheMetrics);
+        .def("get_context_cache_metrics", &PyLLMRuntime::getContextCacheMetrics)
+        .def("get_cuda_graph_stats", &PyLLMRuntime::getCudaGraphStats,
+            "Per-profile CUDA graph launch/enqueue counters of the base and draft engines");
 
     // ========================================================================
     // Request engine: in-flight batching over the same runtime
