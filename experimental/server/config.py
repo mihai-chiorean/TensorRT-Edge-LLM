@@ -263,7 +263,7 @@ class ModelConfig:
     host_embedding_tables: bool = False
     host_ple_table: bool = False
     lora_adapters: Tuple[LoraAdapterConfig, ...] = ()
-    lora_verify: str = "sizes"
+    lora_verify: str = "full"
     allow_unverified_lora_adapters: bool = False
 
     def __post_init__(self) -> None:
@@ -577,11 +577,13 @@ def create_argument_parser(
     model.add_argument(
         "--lora-verify",
         choices=("sizes", "full"),
-        default="sizes",
+        default="full",
         help="How the engine directory is checked against its "
-        "edgellm_base_identity.json at startup when adapters are served: "
-        "file set and sizes (default), or a full SHA-256 rehash of the "
-        "engines, tables and tokenizer (several GB).",
+        "edgellm_base_identity.json at startup when adapters are served. "
+        "full (default): SHA-256 of every engine, table and tokenizer file, "
+        "skipping files whose inode stamp is unchanged since their last "
+        "successful hash (recorded under --cache-dir). sizes: file set and "
+        "sizes only, which does not detect a same-size engine rebuild.",
     )
     model.add_argument(
         "--allow-unverified-lora-adapters",

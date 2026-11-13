@@ -386,14 +386,23 @@ SHA-256 of every engine, table, tokenizer, chat template and config file,
 `edgellm_adapter_manifest.json` naming that identity's digest, the adapter's
 version and the SHA-256 of its weights. Both are written by
 `tensorrt-edgellm-lora-package`. At startup the server checks the engine
-directory against its identity (`--lora-verify sizes`, the default, compares
-the file set and sizes; `--lora-verify full` rehashes every file) and refuses
+directory against its identity and refuses
 an adapter whose manifest is missing, names another base, or whose weights,
 modules or rank do not match. `--allow-unverified-lora-adapters` serves such
 adapters with a warning instead. Checkpoint-backed bundles (built from a
 checkpoint at startup) are not covered by the identity, so their adapters are
 unverified. `/health` reports each adapter's `version`, `verified` and the first
 12 hex characters of its `base_identity`.
+
+`--lora-verify full` (the default) checks the SHA-256 of every file in the
+identity. Files whose inode stamp (device, inode, size, mtime, ctime) is
+unchanged since their last successful hash are not rehashed; the stamps live
+under `--cache-dir`, so only the first start after a file is replaced pays the
+hash. `--lora-verify sizes` compares only the file set and sizes and does not
+detect an engine rebuilt to the same size with different weights.
+`/health.lora.base_identity` reports the mode, the identity digest, how many
+files were hashed or trusted from their stamps, and the seconds taken; the
+startup log line says the same.
 
 A request selects an adapter with either spelling — a model name of
 `<served>:<adapter>` or a `lora_name` field. Clients that always send

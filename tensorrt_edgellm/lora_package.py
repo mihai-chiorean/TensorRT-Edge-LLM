@@ -28,6 +28,8 @@ import json
 import os
 import re
 import struct
+import time
+from concurrent.futures import ThreadPoolExecutor
 import tempfile
 from typing import Dict, List, Optional, Tuple
 
@@ -126,12 +128,42 @@ def write_base_identity(engine_dir: str) -> dict:
     return record
 
 
-def read_base_identity(engine_dir: str, verify: str = "sizes") -> dict:
+def _file_stamp(path: str) -> List[int]:
+    """Identity of a file's current inode and contents as the filesystem sees
+    it; replacing or rewriting the file changes it (ctime cannot be set)."""
+    st = os.stat(path)
+    return [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
+
+
+def _load_stamps(stamp_path: Optional[str], digest: str) -> Dict[str, list]:
+    if not stamp_path or not os.path.isfile(stamp_path):
+        return {}
+    try:
+        with open(stamp_path) as stream:
+            cached = json.load(stream)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(cached, dict) or cached.get("digest") != digest:
+        return {}
+    stamps = cached.get("stamps")
+    return stamps if isinstance(stamps, dict) else {}
+
+
+def read_base_identity(engine_dir: str,
+                       verify: str = "full",
+                       stamp_path: Optional[str] = None) -> dict:
     """Read the identity file and check the tree against it.
 
-    ``verify="sizes"`` checks the file set and sizes; ``"full"`` also rehashes
-    every file.
+    ``verify="full"`` rehashes every file; ``"sizes"`` only checks the file set
+    and sizes, which a same-size engine rebuild passes. With ``stamp_path``,
+    full verification skips files whose inode stamp (device, inode, size,
+    mtime, ctime) matches the one recorded after their last successful hash
+    against this identity, and records the stamps after it succeeds.
+
+    The returned record carries ``verification``: mode, files hashed, files
+    trusted from stamps, and seconds taken.
     """
+    started = time.monotonic()
     if verify not in ("sizes", "full"):
         raise ValueError(f"verify must be 'sizes' or 'full', got {verify!r}")
     path = os.path.join(engine_dir, BASE_IDENTITY_FILE)
@@ -165,9 +197,34 @@ def read_base_identity(engine_dir: str, verify: str = "sizes") -> dict:
             raise ValueError(
                 f"base identity mismatch: {rel} size {present[rel]} != "
                 f"recorded {recorded[rel]['size']}")
-        if verify == "full" and _sha256(os.path.join(
-                engine_dir, rel)) != recorded[rel]["sha256"]:
-            raise ValueError(f"base identity mismatch: {rel} sha256 differs")
+    hashed = trusted = 0
+    if verify == "full":
+        stamps = {rel: _file_stamp(os.path.join(engine_dir, rel)) for rel in paths}
+        cached = _load_stamps(stamp_path, record["digest"])
+        pending = [rel for rel in paths if cached.get(rel) != stamps[rel]]
+        trusted = len(paths) - len(pending)
+        with ThreadPoolExecutor(max_workers=max(1, min(4, len(pending)))) as pool:
+            digests = dict(
+                zip(pending,
+                    pool.map(lambda rel: _sha256(os.path.join(engine_dir, rel)),
+                             pending)))
+        for rel in pending:
+            if digests[rel] != recorded[rel]["sha256"]:
+                raise ValueError(f"base identity mismatch: {rel} sha256 differs")
+        hashed = len(pending)
+        if stamp_path:
+            os.makedirs(os.path.dirname(os.path.abspath(stamp_path)),
+                        exist_ok=True)
+            _write_json_atomic(stamp_path, {
+                "digest": record["digest"],
+                "stamps": stamps
+            })
+    record["verification"] = {
+        "mode": verify,
+        "hashed_files": hashed,
+        "trusted_files": trusted,
+        "seconds": round(time.monotonic() - started, 3),
+    }
     return record
 
 

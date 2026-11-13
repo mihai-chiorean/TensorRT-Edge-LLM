@@ -289,3 +289,41 @@ def test_symlinked_engine_directory_is_refused(tmp_path):
     with pytest.raises(ValueError, match="symlink"):
         lora_package.compute_base_identity(str(tmp_path / "alias"))
 
+
+
+def test_full_verification_skips_files_whose_stamp_is_unchanged(tmp_path):
+    llm = _engine(tmp_path)
+    lora_package.write_base_identity(str(llm))
+    stamps = str(tmp_path / "stamps" / "llm.json")
+
+    first = lora_package.read_base_identity(str(llm), stamp_path=stamps)
+    second = lora_package.read_base_identity(str(llm), stamp_path=stamps)
+
+    assert first["verification"]["mode"] == "full"
+    assert (first["verification"]["hashed_files"],
+            first["verification"]["trusted_files"]) == (3, 0)
+    assert (second["verification"]["hashed_files"],
+            second["verification"]["trusted_files"]) == (0, 3)
+
+
+def test_replaced_file_is_rehashed_despite_a_stamp(tmp_path):
+    llm = _engine(tmp_path)
+    lora_package.write_base_identity(str(llm))
+    stamps = str(tmp_path / "stamps.json")
+    lora_package.read_base_identity(str(llm), stamp_path=stamps)
+
+    replacement = llm / "llm.engine.new"
+    replacement.write_bytes(b"ENGINE-bytes")  # same size, new inode
+    os.replace(replacement, llm / "llm.engine")
+
+    with pytest.raises(ValueError, match="llm.engine sha256 differs"):
+        lora_package.read_base_identity(str(llm), stamp_path=stamps)
+
+
+def test_default_verification_is_full(tmp_path):
+    llm = _engine(tmp_path)
+    lora_package.write_base_identity(str(llm))
+    (llm / "llm.engine").write_bytes(b"ENGINE-bytes")  # same size
+
+    with pytest.raises(ValueError, match="sha256 differs"):
+        lora_package.read_base_identity(str(llm))
