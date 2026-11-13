@@ -28,6 +28,7 @@ import json
 import os
 import re
 import struct
+import tempfile
 from typing import Dict, List, Optional, Tuple
 
 BASE_IDENTITY_FILE = "edgellm_base_identity.json"
@@ -53,15 +54,27 @@ def _sha256(path: str) -> str:
 
 
 def _write_json_atomic(path: str, value: dict) -> None:
-    tmp = path + ".tmp"
-    with open(tmp, "w") as out:
-        json.dump(value, out, indent=2, sort_keys=True)
-        out.write("\n")
-    os.replace(tmp, path)
+    """Write through a uniquely named, exclusively created temporary file."""
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=".edgellm-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as out:
+            json.dump(value, out, indent=2, sort_keys=True)
+            out.write("\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 def _identity_files(engine_dir: str) -> Dict[str, int]:
     """``{posix relpath: size}`` of the files an identity covers."""
+    if os.path.islink(os.path.normpath(engine_dir)):
+        raise ValueError(f"engine directory {engine_dir} is a symlink; the "
+                         "base identity must describe real files")
     if not os.path.isdir(engine_dir):
         raise FileNotFoundError(f"engine directory not found: {engine_dir}")
     files: Dict[str, int] = {}
@@ -76,8 +89,9 @@ def _identity_files(engine_dir: str) -> Dict[str, int]:
                     f"symlink in engine directory: {path}; the base identity "
                     "must describe real files")
         for name in names:
-            if rel_root == "." and name in (BASE_IDENTITY_FILE,
-                                            BASE_IDENTITY_FILE + ".tmp"):
+            if rel_root == "." and (name == BASE_IDENTITY_FILE or
+                                    (name.startswith(".edgellm-")
+                                     and name.endswith(".tmp"))):
                 continue
             path = os.path.join(root, name)
             rel = os.path.relpath(path, engine_dir).replace(os.sep, "/")
@@ -132,6 +146,14 @@ def read_base_identity(engine_dir: str, verify: str = "sizes") -> dict:
     files = record.get("files")
     if not isinstance(files, list) or _digest(files) != record.get("digest"):
         raise ValueError(f"{path}: digest does not match its file list")
+    if not all(
+            isinstance(entry, dict) and isinstance(entry.get("path"), str)
+            and isinstance(entry.get("size"), int)
+            and isinstance(entry.get("sha256"), str) for entry in files):
+        raise ValueError(f"{path}: malformed file entry")
+    paths = [entry["path"] for entry in files]
+    if paths != sorted(set(paths)):
+        raise ValueError(f"{path}: file entries must be unique and sorted")
     recorded = {entry["path"]: entry for entry in files}
     present = _identity_files(engine_dir)
     for rel in sorted(set(recorded) | set(present)):
@@ -149,42 +171,70 @@ def read_base_identity(engine_dir: str, verify: str = "sizes") -> dict:
     return record
 
 
+_DTYPE_BYTES = {"F16": 2, "BF16": 2, "F32": 4, "I8": 1, "U8": 1}
+
+
 def read_safetensors_tensor_names(path: str) -> Dict[str, Tuple[str, List[int]]]:
-    """``{name: (dtype, shape)}`` from a safetensors header, without the payload."""
+    """``{name: (dtype, shape)}`` from a safetensors header, without reading the
+    payload; refuses headers whose byte ranges the file cannot hold."""
+    file_size = os.path.getsize(path)
     with open(path, "rb") as stream:
         raw = stream.read(8)
         if len(raw) != 8:
             raise ValueError(f"{path}: truncated safetensors header")
         length = struct.unpack("<Q", raw)[0]
-        if not 0 < length <= _MAX_HEADER:
+        if not 0 < length <= min(_MAX_HEADER, file_size - 8):
             raise ValueError(f"{path}: invalid safetensors header length")
-        header = json.loads(stream.read(length))
-    return {
-        name: (info["dtype"], list(info["shape"]))
-        for name, info in header.items() if name != "__metadata__"
-    }
+        blob = stream.read(length)
+    if len(blob) != length:
+        raise ValueError(f"{path}: truncated safetensors header")
+    try:
+        header = json.loads(blob)
+    except ValueError as error:
+        raise ValueError(f"{path}: invalid safetensors header: {error}")
+    if not isinstance(header, dict):
+        raise ValueError(f"{path}: invalid safetensors header")
+    payload = file_size - 8 - length
+    tensors = {}
+    for name, info in header.items():
+        if name == "__metadata__":
+            continue
+        try:
+            dtype, shape = info["dtype"], [int(d) for d in info["shape"]]
+            begin, end = (int(v) for v in info["data_offsets"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(f"{path}: malformed header entry {name!r}")
+        count = 1
+        for dim in shape:
+            count *= dim
+        if (dtype not in _DTYPE_BYTES or not 0 <= begin <= end <= payload
+                or end - begin != count * _DTYPE_BYTES[dtype]):
+            raise ValueError(f"{path}: tensor {name!r} does not fit the file")
+        tensors[name] = (dtype, shape)
+    return tensors
 
 
-def _adapter_targets(weights_path: str) -> Tuple[List[str], Dict[str, list]]:
-    """Module stems of a processed adapter and its ``lora_A`` shapes."""
+def _adapter_targets(weights_path: str) -> Tuple[List[str], set]:
+    """Module stems of a processed adapter and the set of ranks its factors carry."""
     tensors = read_safetensors_tensor_names(weights_path)
     factors: Dict[str, set] = {}
-    a_shapes: Dict[str, list] = {}
+    ranks = set()
     for name, (_, shape) in tensors.items():
         suffix = next((s for s in _FACTOR_SUFFIXES if name.endswith(s)), None)
         if suffix is None:
             raise ValueError(f"{weights_path}: tensor {name!r} is not a "
                              "lora_A/lora_B weight")
+        if len(shape) != 2:
+            raise ValueError(f"{weights_path}: tensor {name!r} is not 2-D")
         stem = name[:-len(suffix)]
         factors.setdefault(stem, set()).add(suffix)
-        if suffix == ".lora_A.weight":
-            a_shapes[stem] = shape
+        ranks.add(shape[1] if suffix == ".lora_A.weight" else shape[0])
     unpaired = sorted(stem for stem, found in factors.items()
                       if found != set(_FACTOR_SUFFIXES))
     if unpaired:
         raise ValueError(f"{weights_path}: modules without both factors: "
                          f"{unpaired[:5]}")
-    return sorted(factors), a_shapes
+    return sorted(factors), ranks
 
 
 def _processing_record(adapter_dir: str) -> dict:
@@ -214,15 +264,15 @@ def write_adapter_manifest(adapter_dir: str, engine_dir: str,
         raise FileNotFoundError(f"{weights_path} not found")
     record = _processing_record(adapter_dir)
     base = read_base_identity(engine_dir, verify="full")
-    targets, a_shapes = _adapter_targets(weights_path)
+    targets, ranks = _adapter_targets(weights_path)
     if targets != sorted(record.get("bound_modules") or []):
         raise ValueError(
             f"{adapter_dir}: the weights file and its processing record "
             "disagree on the bound modules; reprocess the adapter")
     rank = record.get("rank")
-    if any(shape[-1] != rank for shape in a_shapes.values()):
-        raise ValueError(f"{adapter_dir}: lora_A rank differs from the "
-                         f"recorded rank {rank}")
+    if ranks != {rank}:
+        raise ValueError(f"{adapter_dir}: factor ranks {sorted(ranks)} differ "
+                         f"from the recorded rank {rank}")
     manifest = {
         "schema": ADAPTER_MANIFEST_SCHEMA,
         "version": version,
@@ -245,11 +295,34 @@ def write_adapter_manifest(adapter_dir: str, engine_dir: str,
     return manifest
 
 
-def verify_adapter(adapter_path: str, base_identity: dict,
+def _manifest_fields(manifest, where: str) -> None:
+    """Refuse a manifest whose fields have the wrong type or are missing."""
+    if not isinstance(manifest, dict) or manifest.get("schema") != ADAPTER_MANIFEST_SCHEMA:
+        raise ValueError(f"{where}: unsupported manifest schema")
+    weights = manifest.get("weights")
+    checks = {
+        "version": isinstance(manifest.get("version"), str)
+        and bool(_VERSION_RE.fullmatch(manifest["version"])),
+        "base_identity": isinstance(manifest.get("base_identity"), str),
+        "weights": isinstance(weights, dict)
+        and isinstance(weights.get("file"), str)
+        and isinstance(weights.get("size"), int)
+        and isinstance(weights.get("sha256"), str),
+        "rank": isinstance(manifest.get("rank"), int)
+        and not isinstance(manifest.get("rank"), bool),
+        "targets": isinstance(manifest.get("targets"), list)
+        and all(isinstance(t, str) for t in manifest["targets"]),
+    }
+    bad = sorted(field for field, ok in checks.items() if not ok)
+    if bad:
+        raise ValueError(f"{where}: manifest fields missing or malformed: {bad}")
+
+
+def verify_adapter(weights_path: str, base_identity: dict,
                    max_lora_rank: int) -> dict:
-    """Check an adapter directory (or its weights file) against the deployed base."""
-    adapter_dir = (adapter_path
-                   if os.path.isdir(adapter_path) else os.path.dirname(adapter_path))
+    """Check the exact weights file the runtime will load against its manifest
+    (in the same directory) and the deployed base."""
+    adapter_dir = os.path.dirname(os.path.abspath(weights_path))
     path = os.path.join(adapter_dir, ADAPTER_MANIFEST_FILE)
     if not os.path.isfile(path):
         raise ValueError(
@@ -257,32 +330,40 @@ def verify_adapter(adapter_path: str, base_identity: dict,
             "tensorrt-edgellm-lora-package adapter --engine-dir <llm dir> "
             f"--adapter-dir {adapter_dir} --version <version>")
     with open(path) as stream:
-        manifest = json.load(stream)
-    if not isinstance(manifest, dict) or manifest.get("schema") != ADAPTER_MANIFEST_SCHEMA:
-        raise ValueError(f"{adapter_dir}: unsupported manifest schema")
+        try:
+            manifest = json.load(stream)
+        except ValueError as error:
+            raise ValueError(f"{path}: invalid JSON: {error}")
+    _manifest_fields(manifest, adapter_dir)
     if manifest.get("processing_schema_version") not in SUPPORTED_PROCESSING_SCHEMAS:
         raise ValueError(f"{adapter_dir}: unsupported processing_schema_version "
                          f"{manifest.get('processing_schema_version')!r}")
-    if manifest.get("base_identity") != base_identity["digest"]:
+    if manifest["base_identity"] != base_identity["digest"]:
         raise ValueError(
             f"{adapter_dir}: packaged for base "
-            f"{str(manifest.get('base_identity'))[:12]}, deployed base is "
+            f"{manifest['base_identity'][:12]}, deployed base is "
             f"{base_identity['digest'][:12]}")
-    weights = manifest.get("weights") or {}
-    weights_path = os.path.join(adapter_dir, weights.get("file") or WEIGHTS_FILE)
+    weights = manifest["weights"]
+    if weights["file"] != os.path.basename(weights_path):
+        raise ValueError(
+            f"{adapter_dir}: manifest describes {weights['file']!r}, the "
+            f"runtime loads {os.path.basename(weights_path)!r}")
     if not os.path.isfile(weights_path):
-        raise ValueError(f"{adapter_dir}: weights file missing")
-    if os.path.getsize(weights_path) != weights.get("size"):
+        raise ValueError(f"{weights_path}: weights file missing")
+    if os.path.getsize(weights_path) != weights["size"]:
         raise ValueError(f"{adapter_dir}: weights size differs from manifest")
-    if _sha256(weights_path) != weights.get("sha256"):
+    if _sha256(weights_path) != weights["sha256"]:
         raise ValueError(f"{adapter_dir}: weights sha256 differs from manifest")
-    targets, _ = _adapter_targets(weights_path)
-    if targets != manifest.get("targets"):
+    targets, ranks = _adapter_targets(weights_path)
+    if targets != manifest["targets"]:
         raise ValueError(f"{adapter_dir}: weights modules differ from the "
                          "manifest targets")
-    rank = manifest.get("rank")
-    if not isinstance(rank, int) or rank > max_lora_rank:
-        raise ValueError(f"{adapter_dir}: rank {rank!r} exceeds the engine's "
+    rank = manifest["rank"]
+    if ranks != {rank}:
+        raise ValueError(f"{adapter_dir}: factor ranks {sorted(ranks)} differ "
+                         f"from the manifest rank {rank}")
+    if rank > max_lora_rank:
+        raise ValueError(f"{adapter_dir}: rank {rank} exceeds the engine's "
                          f"max_lora_rank={max_lora_rank}")
     return manifest
 

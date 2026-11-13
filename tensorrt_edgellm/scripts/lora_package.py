@@ -50,7 +50,8 @@ def _verify(args) -> None:
     max_rank = lora_package.max_lora_rank_of(args.engine_dir) or 0
     print(f"base identity {base['digest'][:12]} ok")
     for adapter_dir in lora_package.adapter_dirs(args.engine_dir):
-        manifest = lora_package.verify_adapter(adapter_dir, base, max_rank)
+        manifest = lora_package.verify_adapter(
+            os.path.join(adapter_dir, lora_package.WEIGHTS_FILE), base, max_rank)
         print(f"{os.path.basename(adapter_dir)} version {manifest['version']} ok")
 
 

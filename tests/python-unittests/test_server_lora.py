@@ -861,3 +861,41 @@ def test_cli_parses_lora_verification_flags():
     defaults = parse_server_config(["m"])
     assert defaults.model.lora_verify == "sizes"
     assert defaults.model.allow_unverified_lora_adapters is False
+
+
+def test_full_verification_and_health_fields(tmp_path, _fake_runtime):
+    pytest.importorskip("fastapi")
+    bundle = _engine_tree(tmp_path, max_lora_rank=16)
+    _adapter(bundle / "llm", "tool", rank=4)
+    llm = LLM(model=str(bundle),
+              cache_dir=str(tmp_path / "cache"),
+              lora_verify="full")
+    client, _ = _client_with(llm)
+
+    adapters = client.get("/health").json()["lora"]["adapters"]
+
+    digest = lora_package.read_base_identity(str(bundle / "llm"))["digest"]
+    assert adapters == [{
+        "name": "tool",
+        "rank": 4,
+        "bound_modules": 2,
+        "unbound_untargeted_bindings": 1,
+        "processed": True,
+        "version": "tool-v1",
+        "verified": True,
+        "base_identity": digest[:12],
+    }]
+
+
+def test_configured_adapter_outside_lora_weights_is_verified(tmp_path,
+                                                             _fake_runtime):
+    bundle = _engine_tree(tmp_path, max_lora_rank=16)
+    digest = lora_package.read_base_identity(str(bundle / "llm"))["digest"]
+    weights = _adapter(tmp_path / "staging", "tool", rank=4,
+                       base_identity=digest)
+
+    llm = LLM(model=str(bundle),
+              cache_dir=str(tmp_path / "cache"),
+              lora_adapters=[LoraAdapterConfig("tool", str(weights))])
+
+    assert [entry["verified"] for entry in llm.lora_adapter_info()] == [True]

@@ -163,8 +163,8 @@ def test_verify_adapter_accepts_a_matching_package(tmp_path):
 def test_verify_adapter_refuses_another_base(tmp_path):
     _, base, adapter = _packaged(tmp_path)
     with pytest.raises(ValueError, match="deployed base"):
-        lora_package.verify_adapter(str(adapter), dict(base, digest="f" * 64),
-                                    16)
+        lora_package.verify_adapter(str(adapter / lora_package.WEIGHTS_FILE),
+                                    dict(base, digest="f" * 64), 16)
 
 
 def test_verify_adapter_refuses_changed_weights(tmp_path):
@@ -175,13 +175,13 @@ def test_verify_adapter_refuses_changed_weights(tmp_path):
     weights.write_bytes(bytes(data))
 
     with pytest.raises(ValueError, match="sha256"):
-        lora_package.verify_adapter(str(adapter), base, 16)
+        lora_package.verify_adapter(str(adapter / lora_package.WEIGHTS_FILE), base, 16)
 
 
 def test_verify_adapter_refuses_rank_above_the_engine(tmp_path):
     _, base, adapter = _packaged(tmp_path)
     with pytest.raises(ValueError, match="max_lora_rank"):
-        lora_package.verify_adapter(str(adapter), base, 2)
+        lora_package.verify_adapter(str(adapter / lora_package.WEIGHTS_FILE), base, 2)
 
 
 def test_cli_packages_and_verifies(tmp_path, capsys):
@@ -202,3 +202,90 @@ def test_cli_packages_and_verifies(tmp_path, capsys):
     with pytest.raises(SystemExit) as exited:
         main(["verify", "--engine-dir", str(llm)])
     assert exited.value.code == 1
+
+
+def _manifest_path(adapter):
+    return adapter / lora_package.ADAPTER_MANIFEST_FILE
+
+
+def _edit_manifest(adapter, **changes):
+    manifest = json.loads(_manifest_path(adapter).read_text())
+    manifest.update(changes)
+    _manifest_path(adapter).write_text(json.dumps(manifest))
+
+
+def test_verify_adapter_checks_the_file_the_runtime_loads(tmp_path):
+    _, base, adapter = _packaged(tmp_path)
+    other = adapter / "other.safetensors"
+    other.write_bytes((adapter / lora_package.WEIGHTS_FILE).read_bytes())
+
+    with pytest.raises(ValueError, match="runtime loads"):
+        lora_package.verify_adapter(str(other), base, 16)
+
+
+def test_verify_adapter_refuses_factor_ranks_that_disagree_with_the_manifest(
+        tmp_path):
+    _, base, adapter = _packaged(tmp_path)
+    weights = adapter / lora_package.WEIGHTS_FILE
+    tensors = {}
+    for stem in _STEMS:
+        tensors[f"{stem}.lora_A.weight"] = np.ones((8, 8), np.float16)
+        tensors[f"{stem}.lora_B.weight"] = np.ones((8, 8), np.float16)
+    save_file(tensors, str(weights))
+    _edit_manifest(adapter,
+                   weights={
+                       "file": weights.name,
+                       "size": weights.stat().st_size,
+                       "sha256": lora_package._sha256(str(weights))
+                   })
+
+    with pytest.raises(ValueError, match="rank"):
+        lora_package.verify_adapter(str(weights), base, 16)
+
+
+def test_truncated_weights_payload_is_refused(tmp_path):
+    weights = tmp_path / "w.safetensors"
+    save_file({"m.lora_A.weight": np.ones((8, 4), np.float16)}, str(weights))
+    weights.write_bytes(weights.read_bytes()[:-2])
+
+    with pytest.raises(ValueError, match="does not fit"):
+        lora_package.read_safetensors_tensor_names(str(weights))
+
+
+@pytest.mark.parametrize("changes", [
+    {"weights": ["bad"]},
+    {"version": None},
+    {"rank": "4"},
+    {"targets": "model.layers.0.mlp.up_proj"},
+])
+def test_malformed_manifest_fields_are_verification_errors(tmp_path, changes):
+    _, base, adapter = _packaged(tmp_path)
+    _edit_manifest(adapter, **changes)
+
+    with pytest.raises(ValueError, match="manifest fields"):
+        lora_package.verify_adapter(str(adapter / lora_package.WEIGHTS_FILE),
+                                    base, 16)
+
+
+def test_identity_file_with_duplicate_or_unsorted_entries_is_refused(tmp_path):
+    llm = _engine(tmp_path)
+    record = lora_package.write_base_identity(str(llm))
+    files = list(reversed(record["files"]))
+    tampered = {
+        "schema": 1,
+        "files": files,
+        "digest": lora_package._digest(files)
+    }
+    (llm / lora_package.BASE_IDENTITY_FILE).write_text(json.dumps(tampered))
+
+    with pytest.raises(ValueError, match="unique and sorted"):
+        lora_package.read_base_identity(str(llm), verify="full")
+
+
+def test_symlinked_engine_directory_is_refused(tmp_path):
+    llm = _engine(tmp_path)
+    os.symlink(llm, tmp_path / "alias")
+
+    with pytest.raises(ValueError, match="symlink"):
+        lora_package.compute_base_identity(str(tmp_path / "alias"))
+
