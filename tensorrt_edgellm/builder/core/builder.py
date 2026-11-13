@@ -33,6 +33,7 @@ import tensorrt as trt
 
 from tensorrt_edgellm.checkpoint.ple_source import ngram_shard_identities
 from tensorrt_edgellm.dflash import DFlashVersion
+from tensorrt_edgellm.lora_targets import unmatched_targets
 
 from ..ops.backend import Net
 from ..ops.functional.attention import KV_PAGE_SIZE
@@ -178,6 +179,7 @@ class BuildArgs:
     max_kv_cache_capacity: int = 4096
     max_batch_size: int = 4
     max_lora_rank: int = 0
+    lora_targets: Optional[Tuple[str, ...]] = None
     max_spec_verify_tokens: int = 60
     max_spec_draft_tokens: int = 60
     min_image_tokens: int = 4
@@ -740,9 +742,29 @@ def load_device_config(args: BuildArgs) -> DeviceConfig:
 # ---------------------------------------------------------------------------
 
 
+def _check_lora_targets(network, args: BuildArgs) -> None:
+    """Refuse --lora-targets entries that selected no LoRA input of this network."""
+    targets = getattr(args, "lora_targets", None)
+    if targets is None:
+        return
+    stems = {
+        network.get_input(index).name.rsplit(".lora_", 1)[0]
+        for index in range(network.num_inputs)
+        if network.get_input(index).name.endswith((".lora_A.weight",
+                                                    ".lora_B.weight"))
+    }
+    missing = unmatched_targets(stems, targets)
+    if missing:
+        raise ValueError(f"--lora-targets {missing} match no projection of "
+                         f"this network; LoRA stems look like "
+                         f"{sorted(stems)[:5]}")
+
+
 def _setup_profiles(builder, config, network, cfg: Optional[DeviceConfig],
                     args: BuildArgs, bundle: BundleConfig) -> None:
     from ..models import registry as model_registry
+
+    _check_lora_targets(network, args)
 
     configuration = model_registry.configuration_module_for(
         bundle.root_model_type)

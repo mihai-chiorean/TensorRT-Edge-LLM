@@ -33,6 +33,7 @@ def build_model(net, bundle, cfg, weights, args) -> None:
                                     supports_sm12x_nvfp4_gemm_allreduce(cfg)),
         max_lora_rank=args.max_lora_rank,
         trt_native_moe=args.trt_native_moe,
+        lora_targets=getattr(args, "lora_targets", None),
     )
     context = BuildContext(net=net,
                            cfg=cfg,

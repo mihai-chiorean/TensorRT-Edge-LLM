@@ -257,7 +257,7 @@ them:
 cd ~/tensorrt-edgellm-workspace
 PYTHONPATH="$REPO" ./quantvenv/bin/python -c \
   'from tensorrt_edgellm.scripts.insert_lora import main; main()' \
-  --onnx-dir $ONNX/llm
+  --onnx-dir $ONNX/llm --lora-targets self_attn,mlp
 PYTHONPATH="$REPO" ./quantvenv/bin/python -c \
   'from tensorrt_edgellm.scripts.process_lora_weights import main; main()' \
   --input-dir $ADAPTER --output-dir $OUT/<name> \
@@ -270,6 +270,17 @@ the device builds from. For Gemma 4 E4B (0.11.1 export) it adds 686 inputs,
 an `lora_A`/`lora_B` pair for each of 343 GEMMs: 132 attention and 126 MLP
 projections, 84 per-layer PLE gates and projections, and the PLE model
 projection. Each is bound to a rank-1 zero when an adapter does not cover it.
+
+Build Gemma 4 LoRA engines with `--lora-targets self_attn,mlp` as above: it
+inserts the 258 attention and MLP branches and leaves out the 85 PLE ones,
+which the tool adapter never trains and which cost about 3.4 ms per decode
+token on the AGX. Targets match whole dot-separated segments of the module path
+(`q_proj`, `mlp`, `layers.3.mlp`); without the flag every eligible GEMM gets a
+branch. The selection is recorded as `edgellm_lora_targets` in the metadata of
+`lora_model.onnx`. An adapter that has tensors for an excluded module (for
+example the PLE projections) is refused by `process-lora`. Changing the targets
+needs a new `lora_model.onnx` and an engine rebuild; the direct builder takes
+the same `--lora-targets` flag.
 
 `process-lora` checks the adapter against those inputs and writes
 `processed_adapter_model.safetensors` plus a `config.json` whose
