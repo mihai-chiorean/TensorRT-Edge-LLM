@@ -306,9 +306,13 @@ identity; see the LoRA section of the experimental server guide. The robot runs
 the default `--lora-verify full`: every engine, table and tokenizer file is
 hashed against the identity at startup, and files unchanged since their last
 successful hash (same inode stamp, recorded under the server's cache directory)
-are skipped. Measured on the Spark (GB10) for a 6.7 GB Gemma 4 MTP `llm/`
-directory: 4.8 s for the first start after files change, 3 ms afterwards; an
-Orin is expected to take roughly twice the first-start time (not measured).
+are skipped. Measured on the AGX Orin 32 GB (MAXN, Samsung 990 PRO NVMe,
+2026-11-13) for the 6.40 GB rank-16 Gemma 4 MTP `llm/` directory (9 files:
+`spec_base.engine`, `spec_draft.engine`, both embedding tables, tokenizer,
+template, configs): 4.3-4.4 s with a cold page cache, 2.5 s warm, and 7-18 ms
+once the stamps are recorded (also after dropping the page cache). The Orin NX
+has fewer and slower cores and its own storage, so expect a somewhat longer
+first start there (not measured).
 `--lora-verify sizes` would miss a same-size engine rebuild with new weights,
 so it is not used on the robot. Rebuilding or
 re-exporting the engine changes the identity, so every adapter must be
