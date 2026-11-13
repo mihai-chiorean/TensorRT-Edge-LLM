@@ -1,10 +1,11 @@
 # LoRA fused into the W4A16 GEMM/GEMV epilogue: design
 
 Status: draft for review, 2026-11-13. Fork `main` 5a56baaa. This is step 4 of
-the LoRA decode speed-up plan. It builds on the grouped LoRA plugin stack that
-is being split into PRs now (`LoraGroupPlugin`, `insert-lora
---lora-group-plugin`, `builder_config.lora_inactive_rank`), and it replaces
-that plugin on INT4 engines.
+the LoRA decode speed-up plan. It builds on the grouped LoRA plugin branches,
+stacked on `main` in this order: `lora-group-plugin` (2ed53e5 `LoraGroupPlugin`,
+then b95e8b4 for 8-SM GPUs), `lora-group-insert` (55b3358, `insert-lora
+--lora-group-plugin`) and `lora-inactive-rank` (74f7de7, engine-recorded
+`lora_inactive_rank`). On INT4 engines it replaces that plugin.
 
 ## 1. Problem
 
@@ -18,6 +19,10 @@ AGX Orin (16 SMs, MAXN) with the rank-16 tool adapter:
 | rank 0 (no LoRA inputs) | 20.89 | 47.87 |
 | grouped `LoraGroupPlugin`, adapter on | 23.09 | 43.30 |
 | unfused MatMul branches, adapter on | 26.3 | 38.0 |
+
+The current AGX baseline with that adapter on the grouped-plugin branches,
+as a fraction of rank-0 throughput, is 90.7% non-MTP, 91.0% for the MTP count
+prompt and 93.6% for the MTP story prompt.
 
 The grouped plugin costs 168 extra launches per decode token (about 11.9 µs
 each, 2.0 ms in all). The launch cost fits `6.5 µs + bytes / 75 GB/s`: half of
@@ -406,7 +411,8 @@ Milestones A to C are the decode result. D to F follow in that order.
   path always uses the LoRA engine's own tactic.
 - **AOT build time and size double** for the `int4_fp16_gemm` group, in every
   artifact of the Docker builder matrix.
-- **Dependency on the grouped-plugin PR stack** for `lora_inactive_rank`, the
+- **Dependency on the grouped-plugin branches** (`lora-group-plugin`,
+  `lora-group-insert`, `lora-inactive-rank`) for `lora_inactive_rank`, the
   rank-0 binding path and the insertion plumbing. If that stack changes, this
   design follows it; the kernels do not depend on it.
 
