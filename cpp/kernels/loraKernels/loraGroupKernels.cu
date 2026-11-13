@@ -47,8 +47,10 @@ constexpr size_t kMaxDynSmem{160 * 1024};
 struct GroupParams
 {
     half const* x;
-    half const* A[kLoraGroupMaxTargets];
-    half const* B[kLoraGroupMaxTargets];
+    void const* A[kLoraGroupMaxTargets]; // fp16, or int8 codes when Q
+    void const* B[kLoraGroupMaxTargets];
+    half const* aS[kLoraGroupMaxTargets]; // Q: per-column scales of A ([r]) and B ([N])
+    half const* bS[kLoraGroupMaxTargets];
     half const* base[kLoraGroupMaxTargets];
     half* out[kLoraGroupMaxTargets];
     int32_t r[kLoraGroupMaxTargets];
@@ -76,6 +78,48 @@ __device__ __forceinline__ void cpAsync16(void* smem, void const* gmem, bool pre
     unsigned const s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
     int const size = pred ? 16 : 0;
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem), "r"(size) : "memory");
+}
+
+__device__ __forceinline__ void cpAsync8(void* smem, void const* gmem, bool pred)
+{
+    unsigned const s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    int const size = pred ? 8 : 0;
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n" ::"r"(s), "l"(gmem), "r"(size) : "memory");
+}
+
+//! float(code) for an int8 code without the conversion unit: the low mantissa bits of 2^23
+//! hold code + 128 exactly, so the subtraction is exact.
+__device__ __forceinline__ float codeToFloat(int32_t code)
+{
+    return __int_as_float(0x4B000080 + code) - 8388736.f;
+}
+
+//! Eight codes (8-byte aligned) times their eight float column scales to eight halves written
+//! as one 16-byte store. int8_per_channel_v1 dequantization, bit-identical to the runtime's host
+//! path fp16(float(code) * float(scale)): an exact float(code), one IEEE single multiply, round to
+//! nearest (paired float-to-half packing rounds each element the same way).
+__device__ __forceinline__ void dequant8(int8_t const* codes, float const* scales, half* out)
+{
+    uint2 const c = *reinterpret_cast<uint2 const*>(codes);
+    int8_t const* cb = reinterpret_cast<int8_t const*>(&c);
+    uint4 o;
+    half2* oh = reinterpret_cast<half2*>(&o);
+#pragma unroll
+    for (int e = 0; e < 4; ++e)
+    {
+        oh[e] = __floats2half2_rn(
+            __fmul_rn(codeToFloat(cb[2 * e]), scales[2 * e]), __fmul_rn(codeToFloat(cb[2 * e + 1]), scales[2 * e + 1]));
+    }
+    *reinterpret_cast<uint4*>(out) = o;
+}
+
+//! Staged FP16 scales to float, once per CTA (all threads; caller synchronizes).
+__device__ __forceinline__ void scalesToFloat(half const* src, float* dst, int32_t n)
+{
+    for (int32_t i = threadIdx.x; i < n; i += blockDim.x)
+    {
+        dst[i] = __half2float(src[i]);
+    }
 }
 
 __device__ __forceinline__ void cpAsyncCommit()
@@ -117,7 +161,7 @@ __device__ __forceinline__ void gridBarrier(unsigned long long* counter)
 struct SmemLayout
 {
     int32_t xsLd, asLd, cols;
-    size_t xs, as, bs, bm, scr, ts, total;
+    size_t xs, as, bs, bm, scr, ts, aq, aSc, aScf, bsc, bscf, bw, total;
 };
 
 __host__ __device__ inline size_t align128(size_t v)
@@ -125,7 +169,10 @@ __host__ __device__ inline size_t align128(size_t v)
     return (v + 127) / 128 * 128;
 }
 
-__host__ __device__ inline SmemLayout smemLayout(int32_t kPer, int32_t cols, int32_t tilesPer, int32_t rtMax)
+//! q: INT8 factors. B tiles are staged as codes (half the bytes) with their column scales and
+//! dequantized per warp into bw; A is staged as codes in aq and dequantized into as.
+__host__ __device__ inline SmemLayout smemLayout(
+    int32_t kPer, int32_t cols, int32_t tilesPer, int32_t rtMax, bool q = false)
 {
     SmemLayout L{};
     L.xsLd = kPer + 8;
@@ -137,13 +184,28 @@ __host__ __device__ inline SmemLayout smemLayout(int32_t kPer, int32_t cols, int
     L.as = off;
     off = align128(off + size_t(kPer) * L.asLd * 2);
     L.bs = off;
-    off = align128(off + size_t(tilesPer) * rtMax * 16 * 16 * 2);
+    off = align128(off + size_t(tilesPer) * rtMax * 16 * 16 * (q ? 1 : 2));
     L.bm = off;
     off = align128(off + size_t(tilesPer) * 16 * 16 * 2);
     L.scr = off;
     off = align128(off + size_t(kWarps) * 16 * cols * 4);
     L.ts = off;
     off = align128(off + size_t(16) * L.asLd * 2);
+    if (q)
+    {
+        L.aq = off;
+        off = align128(off + size_t(kPer) * cols);
+        L.aSc = off;
+        off = align128(off + size_t(cols) * 2);
+        L.aScf = off;
+        off = align128(off + size_t(cols) * 4);
+        L.bsc = off;
+        off = align128(off + size_t(tilesPer) * 16 * 2);
+        L.bscf = off;
+        off = align128(off + size_t(tilesPer) * 16 * 4);
+        L.bw = off;
+        off = align128(off + size_t(kWarps) * rtMax * 16 * 16 * 2);
+    }
     L.total = off;
     return L;
 }
@@ -158,15 +220,15 @@ __device__ __forceinline__ int32_t targetOfTile(GroupParams const& p, int32_t gt
     return i;
 }
 
+template <bool Q>
 __global__ void __launch_bounds__(kThreads, 1) loraGroupSmallKernel(GroupParams const p)
 {
     using namespace nvcuda;
     extern __shared__ __align__(128) unsigned char smem[];
     int32_t const cols = p.colOff[p.n];
-    SmemLayout const L = smemLayout(p.kPer, cols, p.tileCap, p.rtMax);
+    SmemLayout const L = smemLayout(p.kPer, cols, p.tileCap, p.rtMax, Q);
     half* xs = reinterpret_cast<half*>(smem + L.xs);
     half* as = reinterpret_cast<half*>(smem + L.as);
-    half* bs = reinterpret_cast<half*>(smem + L.bs);
     half* bm = reinterpret_cast<half*>(smem + L.bm);
     float* scr = reinterpret_cast<float*>(smem + L.scr);
     half* ts = reinterpret_cast<half*>(smem + L.ts);
@@ -185,8 +247,10 @@ __global__ void __launch_bounds__(kThreads, 1) loraGroupSmallKernel(GroupParams 
     // Stages B and base for tiles [first, first + count) of this CTA into the round buffers:
     // per tile, rtMax*16 B rows and 16 base rows, two 16-byte chunks each, in row-major order
     // (row, tile, half) so consecutive threads read consecutive 16 bytes.
+    // Q: B rows are int8 codes (two 8-byte chunks per row) plus one extra row per tile for its
+    // 16 column scales.
     auto stageTiles = [&](int32_t first, int32_t count) {
-        int32_t const perTile = (bRows + 16) * 2;
+        int32_t const perTile = (bRows + 16 + (Q ? 1 : 0)) * 2;
         int32_t const rowLen = count * 2;
         for (int32_t i = tid; i < count * perTile; i += kThreads)
         {
@@ -201,15 +265,43 @@ __global__ void __launch_bounds__(kThreads, 1) loraGroupSmallKernel(GroupParams 
             if (row < bRows)
             {
                 bool const ok = row < p.r[ti] && n0 + h < N;
-                cpAsync16(&bs[(static_cast<size_t>(li) * bRows + row) * 16 + h],
-                    ok ? &p.B[ti][static_cast<size_t>(row) * N + n0 + h] : p.x, ok);
+                size_t const src = static_cast<size_t>(row) * N + n0 + h;
+                size_t const dst = (static_cast<size_t>(li) * bRows + row) * 16 + h;
+                if (Q)
+                {
+                    // A row of 16 codes is one 16-byte copy when N keeps rows 16-byte aligned.
+                    if (N % 16 == 0)
+                    {
+                        if (h == 0)
+                        {
+                            cpAsync16(smem + L.bs + dst,
+                                ok ? static_cast<void const*>(static_cast<int8_t const*>(p.B[ti]) + src) : p.x, ok);
+                        }
+                    }
+                    else
+                    {
+                        cpAsync8(smem + L.bs + dst,
+                            ok ? static_cast<void const*>(static_cast<int8_t const*>(p.B[ti]) + src) : p.x, ok);
+                    }
+                }
+                else
+                {
+                    cpAsync16(reinterpret_cast<half*>(smem + L.bs) + dst,
+                        ok ? static_cast<half const*>(p.B[ti]) + src : p.x, ok);
+                }
             }
-            else
+            else if (row < bRows + 16)
             {
                 int32_t const m = row - bRows;
                 bool const ok = m < p.M && n0 + h < N;
                 cpAsync16(&bm[(static_cast<size_t>(li) * 16 + m) * 16 + h],
                     ok ? &p.base[ti][static_cast<size_t>(m) * N + n0 + h] : p.x, ok);
+            }
+            else
+            {
+                bool const ok = n0 + h < N;
+                cpAsync16(reinterpret_cast<half*>(smem + L.bsc) + static_cast<size_t>(li) * 16 + h,
+                    ok ? &p.bS[ti][n0 + h] : p.x, ok);
             }
         }
     };
@@ -237,8 +329,36 @@ __global__ void __launch_bounds__(kThreads, 1) loraGroupSmallKernel(GroupParams 
             int32_t const kk = i / chunks;
             int32_t const c = (i % chunks) * 8;
             bool const ok = kk < kLen && c < r;
-            cpAsync16(
-                &as[kk * L.asLd + p.colOff[ti] + c], ok ? &p.A[ti][static_cast<size_t>(k0 + kk) * r + c] : p.x, ok);
+            size_t const src = static_cast<size_t>(k0 + kk) * r + c;
+            if (Q)
+            {
+                // Rank a multiple of 16: one 16-byte copy per 16 codes (odd 8-chunks are covered).
+                if (r % 16 == 0)
+                {
+                    if (c % 16 == 0)
+                    {
+                        cpAsync16(smem + L.aq + static_cast<size_t>(kk) * cols + p.colOff[ti] + c,
+                            ok ? static_cast<void const*>(static_cast<int8_t const*>(p.A[ti]) + src) : p.x, ok);
+                    }
+                }
+                else
+                {
+                    cpAsync8(smem + L.aq + static_cast<size_t>(kk) * cols + p.colOff[ti] + c,
+                        ok ? static_cast<void const*>(static_cast<int8_t const*>(p.A[ti]) + src) : p.x, ok);
+                }
+            }
+            else
+            {
+                cpAsync16(&as[kk * L.asLd + p.colOff[ti] + c], ok ? static_cast<half const*>(p.A[ti]) + src : p.x, ok);
+            }
+        }
+        if (Q)
+        {
+            for (int32_t c = tid * 8; c < w; c += kThreads * 8)
+            {
+                bool const ok = c < r;
+                cpAsync16(reinterpret_cast<half*>(smem + L.aSc) + p.colOff[ti] + c, ok ? &p.aS[ti][c] : p.x, ok);
+            }
         }
     }
     cpAsyncCommit(); // group 0: x and A (phase 1)
@@ -247,6 +367,21 @@ __global__ void __launch_bounds__(kThreads, 1) loraGroupSmallKernel(GroupParams 
     cpAsyncCommit(); // group 1: B and base (phase 2), still in flight during phase 1 and the barrier
     cpAsyncWait<1>();
     __syncthreads();
+    if (Q)
+    {
+        // Codes beyond kLen or r were zero-filled, and so were their scales: they dequantize to 0.
+        int8_t const* aq = reinterpret_cast<int8_t const*>(smem + L.aq);
+        float* aScf = reinterpret_cast<float*>(smem + L.aScf);
+        scalesToFloat(reinterpret_cast<half const*>(smem + L.aSc), aScf, cols);
+        __syncthreads();
+        for (int32_t i = tid * 8; i < p.kPer * cols; i += kThreads * 8)
+        {
+            int32_t const kk = i / cols;
+            int32_t const c = i % cols;
+            dequant8(aq + i, aScf + c, &as[kk * L.asLd + c]);
+        }
+        __syncthreads();
+    }
 
     // ---- Phase 1: partial shrink over this CTA's K slice. ----
     int32_t const rtTot = cols / 16;
@@ -297,6 +432,12 @@ __global__ void __launch_bounds__(kThreads, 1) loraGroupSmallKernel(GroupParams 
     gridBarrier(p.counter);
     cpAsyncWait<0>();
     __syncthreads();
+    if (Q)
+    {
+        // B column scales of the first round to float (the sync after t below covers it).
+        scalesToFloat(reinterpret_cast<half const*>(smem + L.bsc), reinterpret_cast<float*>(smem + L.bscf),
+            min(nT, p.tileCap) * 16);
+    }
 
     // ---- Phase 2: t = fp16(sum of partials); expand + add for this CTA's tiles. ----
     // Partials: one thread per output (m, c), all G loads in flight at once.
@@ -334,6 +475,12 @@ __global__ void __launch_bounds__(kThreads, 1) loraGroupSmallKernel(GroupParams 
             cpAsyncCommit();
             cpAsyncWait<0>();
             __syncthreads();
+            if (Q)
+            {
+                scalesToFloat(
+                    reinterpret_cast<half const*>(smem + L.bsc), reinterpret_cast<float*>(smem + L.bscf), nR * 16);
+                __syncthreads();
+            }
         }
         for (int32_t li = warp; li < nR; li += kWarps)
         {
@@ -342,7 +489,21 @@ __global__ void __launch_bounds__(kThreads, 1) loraGroupSmallKernel(GroupParams 
             int32_t const N = p.N[ti];
             int32_t const n0 = (gt - p.tileOff[ti]) * 16;
             int32_t const rt = (p.colOff[ti + 1] - p.colOff[ti]) / 16;
-            half const* bt = bs + static_cast<size_t>(li) * p.rtMax * 256;
+            half const* bt = reinterpret_cast<half const*>(smem + L.bs) + static_cast<size_t>(li) * p.rtMax * 256;
+            if (Q)
+            {
+                // This warp's tile: dequantize its rt*16 x 16 codes into the warp's own buffer.
+                int8_t const* bq
+                    = reinterpret_cast<int8_t const*>(smem + L.bs) + static_cast<size_t>(li) * p.rtMax * 256;
+                float const* sc = reinterpret_cast<float const*>(smem + L.bscf) + static_cast<size_t>(li) * 16;
+                half* bw = reinterpret_cast<half*>(smem + L.bw) + static_cast<size_t>(warp) * p.rtMax * 256;
+                for (int32_t e = lane * 8; e < rt * 256; e += 256)
+                {
+                    dequant8(bq + e, sc + e % 16, bw + e);
+                }
+                __syncwarp();
+                bt = bw;
+            }
             wmma::fragment<wmma::accumulator, 16, 16, 16, float> d;
             wmma::fill_fragment(d, 0.f);
             for (int32_t j = 0; j < rt; ++j)
@@ -388,7 +549,7 @@ __global__ void __launch_bounds__(kThreads, 1) loraGroupSmallKernel(GroupParams 
 struct MidLayout
 {
     int32_t xcLd, acLd, tsLd;
-    size_t stage, xc, ac, ring, scr, ts, bs, total;
+    size_t stage, xc, ac, aq, ring, scr, ts, bs, aSc, aScf, bsc, bscf, bw, total;
 };
 
 __host__ __device__ inline int32_t midChunkRows(int32_t rowTiles)
@@ -398,7 +559,7 @@ __host__ __device__ inline int32_t midChunkRows(int32_t rowTiles)
 }
 
 __host__ __device__ inline MidLayout midLayout(
-    int32_t rowTiles, int32_t cols, int32_t stages, int32_t tileCap, int32_t rtMax)
+    int32_t rowTiles, int32_t cols, int32_t stages, int32_t tileCap, int32_t rtMax, bool q = false)
 {
     MidLayout L{};
     int32_t const kc = midChunkRows(rowTiles);
@@ -407,7 +568,8 @@ __host__ __device__ inline MidLayout midLayout(
     L.tsLd = cols + 8;
     L.xc = 0;
     L.ac = align128(size_t(16) * rowTiles * L.xcLd * 2);
-    L.stage = align128(L.ac + size_t(kc) * L.acLd * 2);
+    L.aq = align128(L.ac + size_t(kc) * L.acLd * 2); // q: the chunk's A codes, dequantized into ac
+    L.stage = q ? align128(L.aq + size_t(kc) * cols) : L.aq;
     size_t off = 0;
     off += L.stage * stages;
     L.ring = 0;
@@ -416,7 +578,20 @@ __host__ __device__ inline MidLayout midLayout(
     L.ts = align128(off);
     off = L.ts + size_t(16) * rowTiles * L.tsLd * 2;
     L.bs = align128(off);
-    off = L.bs + size_t(tileCap) * rtMax * 16 * 16 * 2;
+    off = L.bs + size_t(tileCap) * rtMax * 16 * 16 * (q ? 1 : 2);
+    if (q)
+    {
+        L.aSc = align128(off);
+        off = L.aSc + size_t(cols) * 2;
+        L.aScf = align128(off);
+        off = L.aScf + size_t(cols) * 4;
+        L.bsc = align128(off);
+        off = L.bsc + size_t(tileCap) * 16 * 2;
+        L.bscf = align128(off);
+        off = L.bscf + size_t(tileCap) * 16 * 4;
+        L.bw = align128(off);
+        off = L.bw + size_t(kWarps) * rtMax * 16 * 16 * 2;
+    }
     L.total = align128(off);
     return L;
 }
@@ -435,7 +610,7 @@ __device__ __forceinline__ void cpAsyncWaitN(int32_t n)
     }
 }
 
-template <int RT>
+template <int RT, bool Q>
 __global__ void __launch_bounds__(kThreads, 1) loraGroupMidKernel(GroupParams const p, int32_t const stages)
 {
     using namespace nvcuda;
@@ -446,10 +621,9 @@ __global__ void __launch_bounds__(kThreads, 1) loraGroupMidKernel(GroupParams co
     constexpr int32_t kMaxCt = kLoraGroupMaxCols / 16;
     extern __shared__ __align__(128) unsigned char smem[];
     int32_t const cols = p.colOff[p.n];
-    MidLayout const L = midLayout(RT, cols, stages, p.tileCap, p.rtMax);
+    MidLayout const L = midLayout(RT, cols, stages, p.tileCap, p.rtMax, Q);
     float* scr = reinterpret_cast<float*>(smem + L.scr);
     half* ts = reinterpret_cast<half*>(smem + L.ts);
-    half* bs = reinterpret_cast<half*>(smem + L.bs);
 
     int32_t const tid = threadIdx.x;
     int32_t const warp = tid / 32;
@@ -490,13 +664,34 @@ __global__ void __launch_bounds__(kThreads, 1) loraGroupMidKernel(GroupParams co
             int32_t const c = cc - p.colOff[ti];
             int32_t const r = p.r[ti];
             bool const ok = kc0 + kk < kLen && c < r;
-            cpAsync16(&ac[kk * L.acLd + cc], ok ? &p.A[ti][static_cast<size_t>(k0 + kc0 + kk) * r + c] : p.x, ok);
+            size_t const src = static_cast<size_t>(k0 + kc0 + kk) * r + c;
+            if (Q)
+            {
+                if (r % 16 == 0)
+                {
+                    if (c % 16 == 0)
+                    {
+                        cpAsync16(st + L.aq + static_cast<size_t>(kk) * cols + cc,
+                            ok ? static_cast<void const*>(static_cast<int8_t const*>(p.A[ti]) + src) : p.x, ok);
+                    }
+                }
+                else
+                {
+                    cpAsync8(st + L.aq + static_cast<size_t>(kk) * cols + cc,
+                        ok ? static_cast<void const*>(static_cast<int8_t const*>(p.A[ti]) + src) : p.x, ok);
+                }
+            }
+            else
+            {
+                cpAsync16(&ac[kk * L.acLd + cc], ok ? static_cast<half const*>(p.A[ti]) + src : p.x, ok);
+            }
         }
     };
     // B rows of tiles [first, first + count) of this CTA (base is read in phase 2).
+    // Q: codes in two 8-byte chunks per row, plus one row per tile of 16 column scales.
     auto stageB = [&](int32_t first, int32_t count) {
         int32_t const rowLen = count * 2;
-        for (int32_t i = tid; i < count * bRows * 2; i += kThreads)
+        for (int32_t i = tid; i < count * (bRows + (Q ? 1 : 0)) * 2; i += kThreads)
         {
             int32_t const row = i / rowLen;
             int32_t const j = i - row * rowLen;
@@ -506,18 +701,65 @@ __global__ void __launch_bounds__(kThreads, 1) loraGroupMidKernel(GroupParams co
             int32_t const ti = targetOfTile(p, gt);
             int32_t const N = p.N[ti];
             int32_t const n0 = (gt - p.tileOff[ti]) * 16;
+            if (row == bRows)
+            {
+                bool const ok = n0 + h < N;
+                cpAsync16(reinterpret_cast<half*>(smem + L.bsc) + static_cast<size_t>(li) * 16 + h,
+                    ok ? &p.bS[ti][n0 + h] : p.x, ok);
+                continue;
+            }
             bool const ok = row < p.r[ti] && n0 + h < N;
-            cpAsync16(&bs[(static_cast<size_t>(li) * bRows + row) * 16 + h],
-                ok ? &p.B[ti][static_cast<size_t>(row) * N + n0 + h] : p.x, ok);
+            size_t const src = static_cast<size_t>(row) * N + n0 + h;
+            size_t const dst = (static_cast<size_t>(li) * bRows + row) * 16 + h;
+            if (Q)
+            {
+                if (N % 16 == 0)
+                {
+                    if (h == 0)
+                    {
+                        cpAsync16(smem + L.bs + dst,
+                            ok ? static_cast<void const*>(static_cast<int8_t const*>(p.B[ti]) + src) : p.x, ok);
+                    }
+                }
+                else
+                {
+                    cpAsync8(smem + L.bs + dst,
+                        ok ? static_cast<void const*>(static_cast<int8_t const*>(p.B[ti]) + src) : p.x, ok);
+                }
+            }
+            else
+            {
+                cpAsync16(
+                    reinterpret_cast<half*>(smem + L.bs) + dst, ok ? static_cast<half const*>(p.B[ti]) + src : p.x, ok);
+            }
         }
     };
 
-    // ---- Entry: the first `stages` chunks, then the first round of B tiles. ----
+    // ---- Entry: the first `stages` chunks (the first also carries A's scales), then the first
+    // round of B tiles. ----
     int32_t const pre = min(stages, nChunks);
+    if (Q)
+    {
+        for (int32_t c = tid * 8; c < cols; c += kThreads * 8)
+        {
+            int32_t ti = 0;
+            while (ti + 1 < p.n && c >= p.colOff[ti + 1])
+            {
+                ++ti;
+            }
+            int32_t const cc = c - p.colOff[ti];
+            bool const ok = cc < p.r[ti];
+            cpAsync16(reinterpret_cast<half*>(smem + L.aSc) + c, ok ? &p.aS[ti][cc] : p.x, ok);
+        }
+    }
     for (int32_t c = 0; c < pre; ++c)
     {
         stageChunk(c);
         cpAsyncCommit();
+    }
+    if (pre == 0)
+    {
+        cpAsyncCommit(); // no K rows here: A's scales (Q) alone; phase 1 does not run
     }
     stageB(0, min(nT, p.tileCap));
     cpAsyncCommit();
@@ -539,9 +781,25 @@ __global__ void __launch_bounds__(kThreads, 1) loraGroupMidKernel(GroupParams co
         int32_t const pos = c < stages ? c : c + 1;
         cpAsyncWaitN(committed - pos);
         __syncthreads();
-        unsigned char const* st = smem + L.ring + static_cast<size_t>(c % stages) * L.stage;
+        unsigned char* st = smem + L.ring + static_cast<size_t>(c % stages) * L.stage;
         half const* xc = reinterpret_cast<half const*>(st + L.xc);
-        half const* ac = reinterpret_cast<half const*>(st + L.ac);
+        half* ac = reinterpret_cast<half*>(st + L.ac);
+        if (Q)
+        {
+            int8_t const* aq = reinterpret_cast<int8_t const*>(st + L.aq);
+            float* aScf = reinterpret_cast<float*>(smem + L.aScf);
+            if (c == 0)
+            {
+                // A's scales arrived with chunk 0.
+                scalesToFloat(reinterpret_cast<half const*>(smem + L.aSc), aScf, cols);
+                __syncthreads();
+            }
+            for (int32_t i = tid * 8; i < kKc * cols; i += kThreads * 8)
+            {
+                dequant8(aq + i, aScf + i % cols, &ac[(i / cols) * L.acLd + i % cols]);
+            }
+            __syncthreads();
+        }
         if (c * kKc + myK < kLen)
         {
             wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa;
@@ -633,6 +891,11 @@ __global__ void __launch_bounds__(kThreads, 1) loraGroupMidKernel(GroupParams co
     gridBarrier(p.counter);
     cpAsyncWait<0>();
     __syncthreads();
+    if (Q)
+    {
+        scalesToFloat(reinterpret_cast<half const*>(smem + L.bsc), reinterpret_cast<float*>(smem + L.bscf),
+            min(nT, p.tileCap) * 16);
+    }
 
     // ---- Phase 2: t = fp16(sum of partials) for the columns this CTA's tiles use. ----
     int32_t cLo = 0;
@@ -680,6 +943,12 @@ __global__ void __launch_bounds__(kThreads, 1) loraGroupMidKernel(GroupParams co
             cpAsyncCommit();
             cpAsyncWait<0>();
             __syncthreads();
+            if (Q)
+            {
+                scalesToFloat(
+                    reinterpret_cast<half const*>(smem + L.bsc), reinterpret_cast<float*>(smem + L.bscf), nR * 16);
+                __syncthreads();
+            }
             loadBase(r0 + warp, bv);
         }
         for (int32_t li = warp; li < nR; li += kWarps)
@@ -694,7 +963,21 @@ __global__ void __launch_bounds__(kThreads, 1) loraGroupMidKernel(GroupParams co
             int32_t const N = p.N[ti];
             int32_t const n0 = (gt - p.tileOff[ti]) * 16;
             int32_t const rtT = (p.colOff[ti + 1] - p.colOff[ti]) / 16;
-            half const* bt = bs + static_cast<size_t>(li) * p.rtMax * 256;
+            half const* bt = reinterpret_cast<half const*>(smem + L.bs) + static_cast<size_t>(li) * p.rtMax * 256;
+            if (Q)
+            {
+                int8_t const* bq
+                    = reinterpret_cast<int8_t const*>(smem + L.bs) + static_cast<size_t>(li) * p.rtMax * 256;
+                float const* sc = reinterpret_cast<float const*>(smem + L.bscf) + static_cast<size_t>(li) * 16;
+                half* bw = reinterpret_cast<half*>(smem + L.bw) + static_cast<size_t>(warp) * p.rtMax * 256;
+                __syncwarp();
+                for (int32_t e = lane * 8; e < rtT * 256; e += 256)
+                {
+                    dequant8(bq + e, sc + e % 16, bw + e);
+                }
+                __syncwarp();
+                bt = bw;
+            }
             half* out = p.out[ti];
             bool const colOk = n0 + lc < N;
 #pragma unroll
@@ -784,18 +1067,18 @@ DeviceLimits deviceLimits()
 
 } // namespace
 
-size_t loraGroupWorkspaceBytes(int64_t maxM, int32_t nbTargets, int32_t maxRank) noexcept
+namespace
 {
-    size_t const part
-        = std::max(static_cast<size_t>(kMaxGrid) * 16, static_cast<size_t>(kMaxBarrierGrid) * kLoraGroupMidMaxM)
-        * kLoraGroupMaxCols * sizeof(float);
-    int32_t const rp16 = (std::max(maxRank, 1) + 15) / 16 * 16;
-    int32_t const cols = std::min(nbTargets * rp16, kPrefillMaxCols);
-    return std::max({part, loraAddWorkspaceBytes(maxM, maxRank), loraPrefillWorkspaceBytes(maxM, cols)});
+
+//! Bytes after the per-target fallback's own workspace where INT8 factors are dequantized.
+size_t dequantOffset(int64_t maxM, int32_t maxRank) noexcept
+{
+    return align128(loraAddWorkspaceBytes(maxM, maxRank));
 }
 
-LoraGroupPlan planLoraGroup(
-    int64_t M, int32_t K, LoraTarget const* targets, int32_t nbTargets, int32_t grid, size_t smemLimit) noexcept
+//! The plan for one factor format (q: INT8).
+LoraGroupPlan planFor(
+    int64_t M, int32_t K, LoraTarget const* targets, int32_t nbTargets, int32_t grid, size_t smemLimit, bool q) noexcept
 {
     LoraGroupPlan plan{};
     // One launch for short prefills up to kLoraGroupMidMaxM rows on 16+ SMs, up to 32 rows on smaller
@@ -837,13 +1120,13 @@ LoraGroupPlan planLoraGroup(
         int32_t const kc = midChunkRows(rowTiles);
         int32_t const nChunks = std::max(1, (kPer + kc - 1) / kc);
         int32_t stages = std::min(nChunks, 4);
-        while (stages > 2 && midLayout(rowTiles, cols, stages, tilesPer, rtMax).total > smemLimit)
+        while (stages > 2 && midLayout(rowTiles, cols, stages, tilesPer, rtMax, q).total > smemLimit)
         {
             --stages;
         }
         auto const fitCap = [&](int32_t ring) {
             int32_t cap = tilesPer;
-            while (cap > 0 && midLayout(rowTiles, cols, ring, cap, rtMax).total > smemLimit)
+            while (cap > 0 && midLayout(rowTiles, cols, ring, cap, rtMax, q).total > smemLimit)
             {
                 cap = cap > kWarps ? std::max(kWarps, cap - kWarps) : cap - 1;
             }
@@ -865,13 +1148,13 @@ LoraGroupPlan planLoraGroup(
         plan.tilesPerRound = cap;
         plan.rowTiles = rowTiles;
         plan.stages = stages;
-        plan.smemBytes = midLayout(rowTiles, cols, stages, cap, rtMax).total;
+        plan.smemBytes = midLayout(rowTiles, cols, stages, cap, rtMax, q).total;
         return plan;
     }
     // Stage every tile at once when it fits; otherwise the largest round that does (at least one
     // tile per warp keeps every warp busy in each round).
     int32_t cap = tilesPer;
-    while (cap > 0 && smemLayout(kPer, cols, cap, rtMax).total > smemLimit)
+    while (cap > 0 && smemLayout(kPer, cols, cap, rtMax, q).total > smemLimit)
     {
         cap = cap > kWarps ? std::max(kWarps, cap - kWarps) : cap - 1;
     }
@@ -884,8 +1167,67 @@ LoraGroupPlan planLoraGroup(
     plan.tilesPerCta = tilesPer;
     plan.tilesPerRound = cap;
     plan.rowTiles = 1;
-    plan.smemBytes = smemLayout(kPer, cols, cap, rtMax).total;
+    plan.smemBytes = smemLayout(kPer, cols, cap, rtMax, q).total;
     return plan;
+}
+
+template <typename... Args>
+int32_t launchCooperative(void (*kernel)(Args...), LoraGroupPlan const& plan, cudaStream_t stream, Args... args)
+{
+    // The opt-in above 48 KB is per context: set it for the current one before launching.
+    // It is a host-side function attribute, legal during stream capture.
+    if (plan.smemBytes > 48 * 1024
+        && cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(plan.smemBytes))
+            != cudaSuccess)
+    {
+        (void) cudaGetLastError();
+        return 1; // not launched: take the unfused path
+    }
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = dim3(plan.grid);
+    cfg.blockDim = dim3(kThreads);
+    cfg.dynamicSmemBytes = plan.smemBytes;
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeCooperative;
+    attr[0].val.cooperative = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    return cudaLaunchKernelEx(&cfg, kernel, args...) == cudaSuccess ? 0 : -1;
+}
+
+} // namespace
+
+size_t loraGroupWorkspaceBytes(
+    int64_t maxM, int32_t nbTargets, int32_t maxRank, bool int8Factors, int32_t maxK, int32_t maxN) noexcept
+{
+    size_t const part
+        = std::max(static_cast<size_t>(kMaxGrid) * 16, static_cast<size_t>(kMaxBarrierGrid) * kLoraGroupMidMaxM)
+        * kLoraGroupMaxCols * sizeof(float);
+    int32_t const rp16 = (std::max(maxRank, 1) + 15) / 16 * 16;
+    int32_t const cols = std::min(nbTargets * rp16, kPrefillMaxCols);
+    size_t bytes = std::max({part, loraAddWorkspaceBytes(maxM, maxRank), loraPrefillWorkspaceBytes(maxM, cols)});
+    if (int8Factors)
+    {
+        // Per-target fallback with INT8 factors: one target's A and B dequantized to FP16.
+        size_t const r = static_cast<size_t>(std::max(maxRank, 1));
+        size_t const dq = align128(r * std::max(maxK, 1) * 2) + align128(r * std::max(maxN, 1) * 2);
+        bytes = std::max(bytes, dequantOffset(maxM, maxRank) + dq);
+    }
+    return bytes;
+}
+
+LoraGroupPlan planLoraGroup(
+    int64_t M, int32_t K, LoraTarget const* targets, int32_t nbTargets, int32_t grid, size_t smemLimit) noexcept
+{
+    // The route (fused or not, grid, row tiles) must not depend on the factor format, so that an
+    // INT8 engine computes exactly what the FP16 path computes with the same factors dequantized
+    // on the host: the group is fused only if both formats' layouts fit. Rounds and ring depth
+    // only change when loads are issued, not the arithmetic, so each format keeps its own.
+    bool const q = nbTargets > 0 && targets[0].aScale != nullptr;
+    LoraGroupPlan const own = planFor(M, K, targets, nbTargets, grid, smemLimit, q);
+    LoraGroupPlan const other = planFor(M, K, targets, nbTargets, grid, smemLimit, !q);
+    return own.fused && other.fused ? own : LoraGroupPlan{};
 }
 
 int32_t launchLoraGroup(void const* x, int64_t M, int32_t K, LoraTarget const* targets, int32_t nbTargets,
@@ -907,9 +1249,16 @@ int32_t launchLoraGroupWithLimits(void const* x, int64_t M, int32_t K, LoraTarge
     {
         return -1;
     }
+    bool const q = targets[0].aScale != nullptr;
+    for (int32_t i = 0; i < nbTargets; ++i)
+    {
+        if ((targets[i].aScale != nullptr) != q || (targets[i].bScale != nullptr) != q)
+        {
+            return -1; // one factor format per launch
+        }
+    }
     LoraGroupPlan const plan = planLoraGroup(M, K, targets, nbTargets, grid, std::min(smemLimit, kMaxDynSmem));
-    bool fast = plan.fused;
-    if (fast)
+    if (plan.fused)
     {
         GroupParams p{};
         p.x = static_cast<half const*>(x);
@@ -922,8 +1271,10 @@ int32_t launchLoraGroupWithLimits(void const* x, int64_t M, int32_t K, LoraTarge
         for (int32_t i = 0; i < nbTargets; ++i)
         {
             auto const& t = targets[i];
-            p.A[i] = static_cast<half const*>(t.A);
-            p.B[i] = static_cast<half const*>(t.B);
+            p.A[i] = t.A;
+            p.B[i] = t.B;
+            p.aS[i] = static_cast<half const*>(t.aScale);
+            p.bS[i] = static_cast<half const*>(t.bScale);
             p.base[i] = static_cast<half const*>(t.base);
             p.out[i] = static_cast<half*>(t.out);
             p.r[i] = t.r;
@@ -943,51 +1294,35 @@ int32_t launchLoraGroupWithLimits(void const* x, int64_t M, int32_t K, LoraTarge
         p.tileCap = plan.tilesPerRound;
         p.rtMax = rtMax;
         p.part = static_cast<float*>(workspace);
-        // Word 0 of the state: this kernel's barrier. The per-target small-M fallback below uses
-        // its own word, because its grid size differs and a shared counter would desynchronize.
+        // Word 0 of the state: the small kernel's barrier. The short-prefill kernel and the
+        // per-target fallback use their own words (the fallback's grid size differs, and a shared
+        // counter would desynchronize).
         p.counter = static_cast<unsigned long long*>(state);
-        void const* kernel = reinterpret_cast<void const*>(loraGroupSmallKernel);
-        int32_t stages = 0;
-        if (plan.rowTiles > 1)
+        auto* const midCounter
+            = reinterpret_cast<unsigned long long*>(static_cast<char*>(state) + kLoraMidCounterOffset);
+        int32_t status = 1;
+        if (plan.rowTiles == 1)
         {
-            // Short prefill: its own barrier word (same grid as the small kernel, kept separate
-            // so the two paths never depend on each other's launch count).
-            kernel = plan.rowTiles == 2 ? reinterpret_cast<void const*>(loraGroupMidKernel<2>)
-                                        : reinterpret_cast<void const*>(loraGroupMidKernel<4>);
-            stages = plan.stages;
-            p.counter = reinterpret_cast<unsigned long long*>(static_cast<char*>(state) + kLoraMidCounterOffset);
+            status = q ? launchCooperative(loraGroupSmallKernel<true>, plan, stream, p)
+                       : launchCooperative(loraGroupSmallKernel<false>, plan, stream, p);
         }
-        // The opt-in above 48 KB is per context: set it for the current one before launching.
-        // It is a host-side function attribute, legal during stream capture.
-        if (plan.smemBytes > 48 * 1024
-            && cudaFuncSetAttribute(
-                   kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(plan.smemBytes))
-                != cudaSuccess)
+        else
         {
-            (void) cudaGetLastError();
-            fast = false;
-        }
-        if (fast)
-        {
-            cudaLaunchConfig_t cfg{};
-            cfg.gridDim = dim3(plan.grid);
-            cfg.blockDim = dim3(kThreads);
-            cfg.dynamicSmemBytes = plan.smemBytes;
-            cfg.stream = stream;
-            cudaLaunchAttribute attr[1];
-            attr[0].id = cudaLaunchAttributeCooperative;
-            attr[0].val.cooperative = 1;
-            cfg.attrs = attr;
-            cfg.numAttrs = 1;
+            p.counter = midCounter;
             if (plan.rowTiles == 2)
             {
-                return cudaLaunchKernelEx(&cfg, loraGroupMidKernel<2>, p, stages) == cudaSuccess ? 0 : -1;
+                status = q ? launchCooperative(loraGroupMidKernel<2, true>, plan, stream, p, plan.stages)
+                           : launchCooperative(loraGroupMidKernel<2, false>, plan, stream, p, plan.stages);
             }
-            if (plan.rowTiles == 4)
+            else
             {
-                return cudaLaunchKernelEx(&cfg, loraGroupMidKernel<4>, p, stages) == cudaSuccess ? 0 : -1;
+                status = q ? launchCooperative(loraGroupMidKernel<4, true>, plan, stream, p, plan.stages)
+                           : launchCooperative(loraGroupMidKernel<4, false>, plan, stream, p, plan.stages);
             }
-            return cudaLaunchKernelEx(&cfg, loraGroupSmallKernel, p) == cudaSuccess ? 0 : -1;
+        }
+        if (status <= 0)
+        {
+            return status;
         }
     }
     if (M > 16)
@@ -995,6 +1330,8 @@ int32_t launchLoraGroupWithLimits(void const* x, int64_t M, int32_t K, LoraTarge
         // Prefill: one grouped shrink (x read once), one streaming expand per target.
         void const* As[kLoraGroupMaxTargets];
         void const* Bs[kLoraGroupMaxTargets];
+        void const* aScales[kLoraGroupMaxTargets];
+        void const* bScales[kLoraGroupMaxTargets];
         void const* bases[kLoraGroupMaxTargets];
         void* outs[kLoraGroupMaxTargets];
         int32_t rs[kLoraGroupMaxTargets];
@@ -1003,18 +1340,38 @@ int32_t launchLoraGroupWithLimits(void const* x, int64_t M, int32_t K, LoraTarge
         {
             As[i] = targets[i].A;
             Bs[i] = targets[i].B;
+            aScales[i] = targets[i].aScale;
+            bScales[i] = targets[i].bScale;
             bases[i] = targets[i].base;
             outs[i] = targets[i].out;
             rs[i] = targets[i].r;
             Ns[i] = targets[i].N;
         }
-        return launchLoraPrefill(x, M, K, nbTargets, As, Bs, bases, outs, rs, Ns, workspace, stream);
+        return launchLoraPrefill(x, M, K, nbTargets, As, Bs, bases, outs, rs, Ns, workspace, stream,
+            q ? aScales : nullptr, q ? bScales : nullptr);
     }
-    // Small-M fallback (unaligned shapes, oversize groups): one target at a time.
+    // Small-M fallback (unaligned shapes, oversize groups): one target at a time. INT8 factors are
+    // dequantized into the workspace first (the same expression as the kernels), so both formats
+    // run the same FP16 kernel.
     for (int32_t i = 0; i < nbTargets; ++i)
     {
         auto const& t = targets[i];
-        if (launchLoraAdd(t.base, x, t.A, t.B, t.out, M, K, t.N, t.r, workspace,
+        void const* A = t.A;
+        void const* B = t.B;
+        if (q)
+        {
+            char* const dq = static_cast<char*>(workspace) + dequantOffset(M, t.r);
+            void* const dA = dq;
+            void* const dB = dq + align128(static_cast<size_t>(t.r) * K * 2);
+            if (launchLoraDequantInt8(t.A, t.aScale, dA, K, t.r, stream) != 0
+                || launchLoraDequantInt8(t.B, t.bScale, dB, t.r, t.N, stream) != 0)
+            {
+                return -1;
+            }
+            A = dA;
+            B = dB;
+        }
+        if (launchLoraAdd(t.base, x, A, B, t.out, M, K, t.N, t.r, workspace,
                 static_cast<char*>(state) + kLoraFallbackCounterOffset, stream)
             != 0)
         {

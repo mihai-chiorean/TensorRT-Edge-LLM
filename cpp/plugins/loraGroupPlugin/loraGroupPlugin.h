@@ -36,8 +36,10 @@ namespace plugins
  *
  * Inputs: [0, n) base_i [b,s,N_i] or [M,N_i] fp16; [n] x [b,s,K] or [M,K] fp16 (unsmoothed);
  * [n+1, 2n] lora_A_i [K, r_i] fp16; [2n+1, 3n] lora_B_i [r_i, N_i] fp16 (B carries alpha / r).
+ * With lora_factor_format = 1, A and B are int8 and the additional inputs are
+ * [3n+1, 4n] A scale_i [r_i] fp16; [4n+1, 5n] B scale_i [N_i] fp16.
  * Outputs: [0, n) out_i, shaped like base_i.
- * Attributes: num_targets (1..3), inplace (0/1).
+ * Attributes: num_targets (1..3), inplace (0/1), lora_factor_format (0 = fp16, 1 = int8_per_channel_v1).
  */
 class LoraGroupPlugin : public nvinfer1::IPluginV3,
                         public nvinfer1::IPluginV3OneCore,
@@ -45,7 +47,7 @@ class LoraGroupPlugin : public nvinfer1::IPluginV3,
                         public nvinfer1::IPluginV3OneRuntime
 {
 public:
-    LoraGroupPlugin(std::string const& name, int32_t numTargets, int32_t inplace);
+    LoraGroupPlugin(std::string const& name, int32_t numTargets, int32_t inplace, int32_t loraFactorFormat = 0);
     LoraGroupPlugin() = delete;
     LoraGroupPlugin(LoraGroupPlugin const&) = delete;
     ~LoraGroupPlugin() override;
@@ -82,6 +84,7 @@ private:
     std::string mNamespace;
     int32_t mNumTargets{1};
     int32_t mInplace{1};
+    int32_t mLoraFactorFormat{0};
     void* mState{nullptr};
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize{};

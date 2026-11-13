@@ -790,7 +790,8 @@ def _lora_stem(gemm_name: str) -> str:
 _LORA_GROUP_MAX_TARGETS = 3
 
 
-def _emit_lora_group_plugins(graph: gs.Graph, members) -> int:
+def _emit_lora_group_plugins(graph: gs.Graph, members,
+                             int8_factors: bool = False) -> int:
     """Replace the LoRA branches collected in ``members`` with LoraGroupPlugin nodes.
 
     Branches that read the same activation (q/k/v, gate/up) share one node, up to
@@ -810,17 +811,23 @@ def _emit_lora_group_plugins(graph: gs.Graph, members) -> int:
                     f"{member['name']}/lora_add_output", dtype=np.float16)
                 # Snapshot consumers before the plugin node also consumes the GEMM output.
                 member["consumers"] = list(member["output"].outputs)
+            attrs = {
+                "num_targets": np.int32(len(chunk)),
+                "inplace": np.int32(1)
+            }
+            inputs = ([m["output"] for m in chunk] + [chunk[0]["input"]] +
+                      [m["lora_a"] for m in chunk] +
+                      [m["lora_b"] for m in chunk])
+            if int8_factors:
+                attrs["lora_factor_format"] = np.int32(1)
+                inputs.extend([m["lora_a_scale"] for m in chunk])
+                inputs.extend([m["lora_b_scale"] for m in chunk])
             graph.nodes.append(
                 gs.Node(op="LoraGroupPlugin",
                         name=f"{chunk[0]['name']}/lora_group",
                         domain="trt_edgellm",
-                        attrs={
-                            "num_targets": np.int32(len(chunk)),
-                            "inplace": np.int32(1)
-                        },
-                        inputs=[m["output"] for m in chunk] +
-                        [chunk[0]["input"]] + [m["lora_a"] for m in chunk] +
-                        [m["lora_b"] for m in chunk],
+                        attrs=attrs,
+                        inputs=inputs,
                         outputs=[m["final_output"] for m in chunk]))
             nodes += 1
             for member in chunk:
@@ -842,7 +849,8 @@ def _emit_lora_group_plugins(graph: gs.Graph, members) -> int:
 
 def insert_lora_and_save(onnx_dir: str,
                          lora_targets: Optional[Sequence[str]] = None,
-                         lora_group_plugin: bool = False):
+                         lora_group_plugin: bool = False,
+                         lora_factor_format: str = "fp16"):
     """
     Insert LoRA patterns into ONNX models.
 
@@ -855,7 +863,17 @@ def insert_lora_and_save(onnx_dir: str,
         lora_group_plugin: Emit LoraGroupPlugin nodes (grouped by shared input, residual
             added in place) instead of MatMul -> MatMul -> Add branches. Needs the
             matching plugin library.
+        lora_factor_format: ``fp16`` or ``int8`` (``int8_per_channel_v1``).
+            INT8 factors require ``lora_group_plugin=True``.
     """
+    if lora_factor_format not in _WEIGHT_FORMATS:
+        raise ValueError("lora_factor_format must be 'fp16' or 'int8'")
+    int8_factors = lora_factor_format == "int8"
+    if int8_factors and not lora_group_plugin:
+        raise ValueError("INT8 LoRA factors require --lora-group-plugin "
+                         "(lora_group_plugin=True)")
+    if int8_factors:
+        lora_factor_format = INT8_LORA_FORMAT
     start_time = time.time()
     # Load ONNX model
     onnx_model_path = os.path.join(onnx_dir, "model.onnx")
@@ -903,21 +921,33 @@ def insert_lora_and_save(onnx_dir: str,
         gemm_name_for_lora = _lora_stem(gemm_name)
 
         lora_a = gs.Variable(f"{gemm_name_for_lora}.lora_A.weight",
-                             dtype=np.float16,
+                             dtype=np.int8 if int8_factors else np.float16,
                              shape=[k, f"{gemm_name_for_lora}.rank"])
         lora_b = gs.Variable(f"{gemm_name_for_lora}.lora_B.weight",
-                             dtype=np.float16,
+                             dtype=np.int8 if int8_factors else np.float16,
                              shape=[f"{gemm_name_for_lora}.rank", n])
         graph.inputs.extend([lora_a, lora_b])
 
         if lora_group_plugin:
-            group_members.append({
+            member = {
                 "name": gemm_name,
                 "input": input_tensor,
                 "output": output_tensor,
                 "lora_a": lora_a,
                 "lora_b": lora_b
-            })
+            }
+            if int8_factors:
+                lora_a_scale = gs.Variable(
+                    f"{lora_a.name}_scale",
+                    dtype=np.float16,
+                    shape=[f"{gemm_name_for_lora}.rank"])
+                lora_b_scale = gs.Variable(f"{lora_b.name}_scale",
+                                           dtype=np.float16,
+                                           shape=[n])
+                graph.inputs.extend([lora_a_scale, lora_b_scale])
+                member.update(lora_a_scale=lora_a_scale,
+                              lora_b_scale=lora_b_scale)
+            group_members.append(member)
             continue
 
         # First MatMul: input @ lora_A
@@ -962,7 +992,7 @@ def insert_lora_and_save(onnx_dir: str,
 
     if group_members:
         logger.info("Emitted %d LoraGroupPlugin nodes for %d LoRA targets",
-                    _emit_lora_group_plugins(graph, group_members),
+                    _emit_lora_group_plugins(graph, group_members, int8_factors),
                     len(group_members))
 
     graph.cleanup().toposort().fold_constants().cleanup()
@@ -975,6 +1005,8 @@ def insert_lora_and_save(onnx_dir: str,
     props = {prop.key: prop.value for prop in onnx_model.metadata_props}
     props["edgellm_lora_targets"] = (",".join(lora_targets)
                                      if lora_targets is not None else "all")
+    if int8_factors:
+        props["edgellm_lora_factor_format"] = lora_factor_format
     onnx.helper.set_model_props(modified_onnx_model, props)
     onnx.save_model(modified_onnx_model, output_model_path)
 

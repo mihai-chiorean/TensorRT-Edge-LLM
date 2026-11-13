@@ -441,6 +441,24 @@ bool LLMBuilder::build()
     // Record it so the runtime binds LoRA inputs no adapter covers at rank 0 (the plugin
     // launches nothing for them) instead of rank-1 zero dummies.
     mBuilderConfig.loraInactiveRank = loraGroupPlugin ? 0 : 1;
+    bool int8Factors = false;
+    for (int32_t i = 0; i < network->getNbInputs(); ++i)
+    {
+        auto const* input = network->getInput(i);
+        std::string_view const name = input->getName();
+        bool const isScale = name.size() >= 6 && name.substr(name.size() - 6) == "_scale";
+        if (!isScale && (name.find("lora_A") != std::string_view::npos || name.find("lora_B") != std::string_view::npos)
+            && input->getType() == nvinfer1::DataType::kINT8)
+        {
+            int8Factors = true;
+        }
+    }
+    if (int8Factors && !allLoraBranchesGrouped(*network))
+    {
+        LOG_ERROR("INT8 LoRA factors require every LoRA branch to use LoraGroupPlugin");
+        return false;
+    }
+    mBuilderConfig.loraFactorFormat = int8Factors ? "int8_per_channel_v1" : "fp16";
     if (loraGroupPlugin)
     {
         LOG_INFO("LoRA branches are LoraGroupPlugin nodes: aliased plugin I/O enabled, inactive LoRA rank 0");
@@ -1781,6 +1799,22 @@ bool LLMBuilder::setupLoraProfiles(nvinfer1::IOptimizationProfile& contextProfil
         auto* input = network.getInput(i);
         char const* const inputName = input->getName();
         std::string_view const inputNameView = inputName;
+
+        if (inputNameView.size() >= 6 && inputNameView.substr(inputNameView.size() - 6) == "_scale")
+        {
+            if (inputNameView.find(binding_names::kLoraAPrefix) != std::string_view::npos)
+            {
+                auto const dims = input->getDimensions();
+                if (dims.nbDims == 1 && dims.d[0] < 0)
+                {
+                    result &= setOptimizationProfile(&contextProfile, inputName, createDims({0}),
+                        createDims({mBuilderConfig.maxLoraRank / 2}), createDims({mBuilderConfig.maxLoraRank}));
+                    result &= setOptimizationProfile(&generationProfile, inputName, createDims({0}),
+                        createDims({mBuilderConfig.maxLoraRank / 2}), createDims({mBuilderConfig.maxLoraRank}));
+                }
+            }
+            continue;
+        }
 
         if (inputNameView.find(binding_names::kLoraAPrefix) != std::string_view::npos)
         {

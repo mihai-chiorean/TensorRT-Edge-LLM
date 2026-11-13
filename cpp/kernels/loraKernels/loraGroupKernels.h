@@ -36,12 +36,16 @@ constexpr int32_t kLoraGroupMidMaxM{64};
 //! One active LoRA target: out = base + fp16(fp16(x @ A) @ B). out may equal base (in place).
 struct LoraTarget
 {
-    void const* A{nullptr};    //!< [K, r] fp16
-    void const* B{nullptr};    //!< [r, N] fp16
+    void const* A{nullptr};    //!< [K, r] fp16 (or int8 codes, see aScale)
+    void const* B{nullptr};    //!< [r, N] fp16 (or int8 codes, see bScale)
     void const* base{nullptr}; //!< [M, N] fp16
     void* out{nullptr};        //!< [M, N] fp16
     int32_t r{0};
     int32_t N{0};
+    //! INT8 factors (int8_per_channel_v1): A and B hold int8 codes and these hold one FP16 scale per
+    //! column ([r] for A, [N] for B). Both null: FP16 factors. All targets of a launch use one format.
+    void const* aScale{nullptr};
+    void const* bScale{nullptr};
 };
 
 //! How launchLoraGroup runs a group on a device with `grid` cooperative CTAs and
@@ -67,7 +71,10 @@ int32_t launchLoraGroupWithLimits(void const* x, int64_t M, int32_t K, LoraTarge
     void* workspace, void* state, cudaStream_t stream, int32_t grid, size_t smemLimit) noexcept;
 
 //! Workspace bytes for launchLoraGroup with up to maxM rows and per-target ranks up to maxRank.
-size_t loraGroupWorkspaceBytes(int64_t maxM, int32_t nbTargets, int32_t maxRank) noexcept;
+//! INT8 factors (int8Factors) also need room to dequantize one target of up to maxK x maxRank and
+//! maxRank x maxN on the rare per-target fallback path.
+size_t loraGroupWorkspaceBytes(int64_t maxM, int32_t nbTargets, int32_t maxRank, bool int8Factors = false,
+    int32_t maxK = 0, int32_t maxN = 0) noexcept;
 
 //! Persistent per-plugin device state, zeroed once at allocation: grid-barrier counters, one
 //! per launcher path (each path always launches the same grid size on a given device).
@@ -84,6 +91,10 @@ constexpr size_t kLoraFallbackCounterOffset{128};
  * 16 < M <= kLoraGroupMidMaxM (short prefill), same shape rules: one cooperative launch with
  * 2 or 4 row tiles; x and A stream through a ring of K chunks and base is read in the expand.
  * Otherwise: one grouped split-K WMMA shrink and a streaming expand per target (prefill).
+ *
+ * INT8 factors (aScale/bScale set) are staged as codes and dequantized in the kernels with the
+ * runtime's host expression fp16(float(code) * float(scale)); the route is chosen independently of
+ * the format, so the output equals the FP16 path fed the same factors dequantized on the host.
  *
  * Rounding follows the unfused ONNX branch: the rank-r intermediate and the delta are each
  * rounded to fp16 and the final add is done in fp32 and rounded once.

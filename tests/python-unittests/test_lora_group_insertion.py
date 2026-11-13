@@ -19,8 +19,10 @@ output."""
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
+import pytest
 
-from tensorrt_edgellm.lora.lora import insert_lora_and_save
+from tensorrt_edgellm.lora.lora import (_read_lora_bindings,
+                                       insert_lora_and_save)
 
 
 def _int4(stem, activation, n, k=16):
@@ -138,3 +140,71 @@ def test_without_the_filter_every_int4_projection_gets_a_target(tmp_path):
     assert sum(int(n.attrs["num_targets"]) for n in groups.values()) == 8
     assert sorted(int(n.attrs["num_targets"])
                   for n in groups.values()) == [1, 1, 1, 2, 3]
+
+
+def test_int8_factor_bindings_and_plugin_input_order(tmp_path):
+    graph = _insert(tmp_path,
+                    lora_group_plugin=True,
+                    lora_factor_format="int8")
+    graph_inputs = {tensor.name: tensor for tensor in graph.inputs}
+    for node in _groups(graph).values():
+        count = int(node.attrs["num_targets"])
+        assert int(node.attrs["lora_factor_format"]) == 1
+        assert len(node.inputs) == 5 * count + 1
+        assert all(t.dtype == np.float16 for t in node.inputs[:count + 1])
+        for index in range(count):
+            base = node.inputs[index]
+            stem = base.name.rsplit(".", 1)[0]
+            k, n = node.inputs[count].shape[-1], base.shape[-1]
+            bindings = (
+                (count + 1 + index, "lora_A.weight", np.int8,
+                 [k, f"{stem}.rank"]),
+                (2 * count + 1 + index, "lora_B.weight", np.int8,
+                 [f"{stem}.rank", n]),
+                (3 * count + 1 + index, "lora_A.weight_scale", np.float16,
+                 [f"{stem}.rank"]),
+                (4 * count + 1 + index, "lora_B.weight_scale", np.float16, [n]),
+            )
+            for position, suffix, dtype, shape in bindings:
+                tensor = node.inputs[position]
+                assert tensor.name == f"{stem}.{suffix}"
+                assert tensor is graph_inputs[tensor.name]
+                assert tensor.dtype == dtype
+                assert tensor.shape == shape
+    model = onnx.load(tmp_path / "lora_model.onnx")
+    props = {prop.key: prop.value for prop in model.metadata_props}
+    assert props["edgellm_lora_factor_format"] == "int8_per_channel_v1"
+
+
+def test_fp16_factor_format_preserves_default_output(tmp_path):
+    _insert(tmp_path, lora_group_plugin=True)
+    default_output = (tmp_path / "lora_model.onnx").read_bytes()
+    graph = _insert(tmp_path,
+                    lora_group_plugin=True,
+                    lora_factor_format="fp16")
+    assert (tmp_path / "lora_model.onnx").read_bytes() == default_output
+    for node in _groups(graph).values():
+        assert "lora_factor_format" not in node.attrs
+        assert len(node.inputs) == 3 * int(node.attrs["num_targets"]) + 1
+    factors = [tensor for tensor in graph.inputs if ".lora_" in tensor.name]
+    assert all(t.dtype == np.float16 and len(t.shape) == 2 for t in factors)
+
+
+def test_int8_requires_group_plugin(tmp_path):
+    with pytest.raises(ValueError, match="require --lora-group-plugin"):
+        _insert(tmp_path, lora_factor_format="int8")
+
+
+def test_invalid_factor_format_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="must be 'fp16' or 'int8'"):
+        _insert(tmp_path, lora_group_plugin=True, lora_factor_format="int4")
+
+
+def test_read_lora_bindings_ignores_int8_scales(tmp_path):
+    _insert(tmp_path, lora_group_plugin=True)
+    fp16_bindings, fp16_modules = _read_lora_bindings(str(tmp_path))
+    assert fp16_bindings["model.layers.0.self_attn.q_proj"] == (16, 32)
+    _insert(tmp_path, lora_group_plugin=True, lora_factor_format="int8")
+    int8_bindings, int8_modules = _read_lora_bindings(str(tmp_path))
+    assert int8_bindings == fp16_bindings
+    assert int8_modules == fp16_modules

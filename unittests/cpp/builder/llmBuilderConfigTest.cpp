@@ -55,6 +55,25 @@ TEST(LLMBuilderConfigTest, LoraInactiveRankRoundTripsForLoraEngines)
     EXPECT_EQ(LLMBuilderConfig::fromJson(legacy).loraInactiveRank, 1);
 }
 
+TEST(LLMBuilderConfigTest, LoraFactorFormatRoundTripsForLoraEngines)
+{
+    LLMBuilderConfig config = makeConfig();
+    config.maxLoraRank = 16;
+    config.loraFactorFormat = "int8_per_channel_v1";
+    Json const json = config.toJson();
+    EXPECT_EQ(json.at("lora_factor_format"), "int8_per_channel_v1");
+    EXPECT_EQ(LLMBuilderConfig::fromJson(json).loraFactorFormat, "int8_per_channel_v1");
+
+    EXPECT_FALSE(makeConfig().toJson().contains("lora_factor_format"));
+    Json legacy = json;
+    legacy.erase("lora_factor_format");
+    EXPECT_EQ(LLMBuilderConfig::fromJson(legacy).loraFactorFormat, "fp16");
+
+    config.loraFactorFormat = "fp16";
+    EXPECT_EQ(config.toJson().at("lora_factor_format"), "fp16");
+    EXPECT_EQ(LLMBuilderConfig::fromJson(config.toJson()).loraFactorFormat, "fp16");
+}
+
 TEST(LLMBuilderConfigTest, DefaultPoolPagesResolveToMinimumActivePages)
 {
     LLMBuilderConfig const config = makeConfig();

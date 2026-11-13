@@ -132,8 +132,9 @@ Do not set `modules_to_save`, `rank_pattern`, `alpha_pattern`,
    `--weight-format int8` writes per-column INT8 factors with FP16 scales
    instead; for that adapter: 37.4 MB, at most 0.44% per-tensor error and
    identical greedy output on 9 of 9 test prompts (measured off-device,
-   2026-11-12). It is a transport format only: the runtime dequantizes to FP16
-   at load, so device memory and speed are those of the FP16 adapter.
+   2026-11-12). FP16 engines dequantize it to FP16 at load, so device memory
+   and speed are those of the FP16 adapter. INT8-resident engines keep the codes
+   and scales on the device (see below).
 2. `tensorrt-edgellm-lora-package base-identity --engine-dir <engine>/llm`
    whenever any file it covers changes, then `tensorrt-edgellm-lora-package adapter
    --engine-dir <engine>/llm --adapter-dir <engine>/llm/lora_weights/<name>
@@ -149,6 +150,26 @@ Do not set `modules_to_save`, `rank_pattern`, `alpha_pattern`,
    does not). The default `--lora-verify full` checks those hashes at startup;
    `sizes` checks only names and sizes. After a change, write the base identity
    first, then re-package and re-qualify every adapter.
+
+### INT8-resident engines
+
+Insert with `--lora-group-plugin --lora-factor-format int8` to keep
+`int8_per_channel_v1` factors on the GPU. Only LoraGroupPlugin engines support
+this format. Each target uses the transport file's tensor names:
+
+| Binding | Dtype | Shape |
+|---------|-------|-------|
+| `<stem>.lora_A.weight` | INT8 | `[K, <stem>.rank]` |
+| `<stem>.lora_A.weight_scale` | FP16 | `[<stem>.rank]` |
+| `<stem>.lora_B.weight` | INT8 | `[<stem>.rank, N]` |
+| `<stem>.lora_B.weight_scale` | FP16 | `[N]` |
+
+Scales are one-dimensional: A's rank is dynamic and B's `N` is static.
+Inactive targets have rank 0: A `[K, 0]`, B `[0, N]`, A scale `[0]`, and
+B scale `[N]` filled with zeros. These engines refuse FP16 adapter files;
+process adapters with `process-lora --weight-format int8`. Kernels reconstruct
+each factor as `fp16(float(code) * float(scale))`, so output equals the same
+INT8 file served by an FP16 engine, which dequantizes on the host.
 
 ### Qualification
 

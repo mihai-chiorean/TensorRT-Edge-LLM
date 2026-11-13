@@ -89,10 +89,11 @@ std::vector<PluginField> LoraGroupPluginCreator::mPluginAttributes;
 
 REGISTER_TENSORRT_PLUGIN(LoraGroupPluginCreator);
 
-LoraGroupPlugin::LoraGroupPlugin(std::string const& name, int32_t numTargets, int32_t inplace)
+LoraGroupPlugin::LoraGroupPlugin(std::string const& name, int32_t numTargets, int32_t inplace, int32_t loraFactorFormat)
     : mLayerName(name)
     , mNumTargets(numTargets)
     , mInplace(inplace)
+    , mLoraFactorFormat(loraFactorFormat)
 {
 }
 
@@ -121,7 +122,7 @@ IPluginV3* LoraGroupPlugin::clone() noexcept
 {
     try
     {
-        auto* p = new LoraGroupPlugin(mLayerName, mNumTargets, mInplace);
+        auto* p = new LoraGroupPlugin(mLayerName, mNumTargets, mInplace, mLoraFactorFormat);
         p->setPluginNamespace(mNamespace.c_str());
         return p;
     }
@@ -169,7 +170,7 @@ int32_t LoraGroupPlugin::getOutputDataTypes(
 int32_t LoraGroupPlugin::getOutputShapes(DimsExprs const* inputs, int32_t nbInputs, DimsExprs const* /*shapeInputs*/,
     int32_t /*nbShapeInputs*/, DimsExprs* outputs, int32_t nbOutputs, IExprBuilder& /*exprBuilder*/) noexcept
 {
-    if (nbInputs != 3 * mNumTargets + 1 || nbOutputs != mNumTargets)
+    if (nbInputs != (mLoraFactorFormat == 1 ? 5 : 3) * mNumTargets + 1 || nbOutputs != mNumTargets)
     {
         return -1;
     }
@@ -184,12 +185,14 @@ bool LoraGroupPlugin::supportsFormatCombination(
     int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
     int32_t const n = mNumTargets;
-    if (nbInputs != 3 * n + 1 || nbOutputs != n || pos < 0 || pos >= nbInputs + nbOutputs)
+    if (nbInputs != (mLoraFactorFormat == 1 ? 5 : 3) * n + 1 || nbOutputs != n || pos < 0
+        || pos >= nbInputs + nbOutputs)
     {
         return false;
     }
     auto const& d = inOut[pos].desc;
-    if (d.type != DataType::kHALF || d.format != PluginFormat::kLINEAR)
+    bool const int8Factor = mLoraFactorFormat == 1 && pos > n && pos <= 3 * n;
+    if (d.type != (int8Factor ? DataType::kINT8 : DataType::kHALF) || d.format != PluginFormat::kLINEAR)
     {
         return false;
     }
@@ -201,7 +204,11 @@ bool LoraGroupPlugin::supportsFormatCombination(
     {
         return d.dims.nbDims == 2; // A_i, B_i
     }
-    return d.dims.nbDims == inOut[pos - 3 * n - 1].desc.dims.nbDims; // out_i like base_i
+    if (pos < nbInputs)
+    {
+        return d.dims.nbDims == 1; // A scale_i, B scale_i
+    }
+    return d.dims.nbDims == inOut[pos - nbInputs].desc.dims.nbDims; // out_i like base_i
 }
 
 int32_t LoraGroupPlugin::configurePlugin(DynamicPluginTensorDesc const* /*in*/, int32_t /*nbInputs*/,
@@ -216,11 +223,14 @@ size_t LoraGroupPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, 
     int32_t const n = mNumTargets;
     int64_t const maxM = leadingVolume(inputs[n].max);
     int32_t maxRank = 1;
+    int32_t const maxK = static_cast<int32_t>(inputs[n].max.d[inputs[n].max.nbDims - 1]);
+    int32_t maxN = 0;
     for (int32_t i = 0; i < n; ++i)
     {
         maxRank = std::max<int32_t>(maxRank, static_cast<int32_t>(inputs[n + 1 + i].max.d[1]));
+        maxN = std::max<int32_t>(maxN, static_cast<int32_t>(inputs[i].max.d[inputs[i].max.nbDims - 1]));
     }
-    return kernels::loraGroupWorkspaceBytes(maxM, n, maxRank);
+    return kernels::loraGroupWorkspaceBytes(maxM, n, maxRank, mLoraFactorFormat == 1, maxK, maxN);
 }
 
 int32_t LoraGroupPlugin::getAliasedInput(int32_t outputIndex) noexcept
@@ -253,6 +263,13 @@ int32_t LoraGroupPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensor
             LOG_ERROR("LoraGroupPlugin %s: null tensor for target %d", mLayerName.c_str(), i);
             return -1;
         }
+        if (mLoraFactorFormat == 1
+            && (inputDesc[3 * n + 1 + i].dims.nbDims != 1 || inputDesc[4 * n + 1 + i].dims.nbDims != 1
+                || inputDesc[3 * n + 1 + i].dims.d[0] != r || inputDesc[4 * n + 1 + i].dims.d[0] != N))
+        {
+            LOG_ERROR("LoraGroupPlugin %s: inconsistent scale shapes for target %d", mLayerName.c_str(), i);
+            return -1;
+        }
         if (r == 0)
         {
             if (mInplace == 0 && M > 0
@@ -271,6 +288,16 @@ int32_t LoraGroupPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensor
         t.out = outputs[i];
         t.r = r;
         t.N = N;
+        if (mLoraFactorFormat == 1)
+        {
+            t.aScale = inputs[3 * n + 1 + i];
+            t.bScale = inputs[4 * n + 1 + i];
+            if (t.aScale == nullptr || t.bScale == nullptr)
+            {
+                LOG_ERROR("LoraGroupPlugin %s: null scale for target %d", mLayerName.c_str(), i);
+                return -1;
+            }
+        }
     }
     int32_t const status = kernels::launchLoraGroup(inputs[n], M, K, active, nbActive, workspace, mState, stream);
     if (status != 0)
@@ -310,6 +337,7 @@ PluginFieldCollection const* LoraGroupPlugin::getFieldsToSerialize() noexcept
     mDataToSerialize.clear();
     mDataToSerialize.emplace_back("num_targets", &mNumTargets, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("inplace", &mInplace, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("lora_factor_format", &mLoraFactorFormat, PluginFieldType::kINT32, 1);
     mFCToSerialize.nbFields = static_cast<int32_t>(mDataToSerialize.size());
     mFCToSerialize.fields = mDataToSerialize.data();
     return &mFCToSerialize;
@@ -322,6 +350,7 @@ LoraGroupPluginCreator::LoraGroupPluginCreator()
     mPluginAttributes.clear();
     mPluginAttributes.emplace_back(PluginField("num_targets", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("inplace", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("lora_factor_format", nullptr, PluginFieldType::kINT32, 1));
     mFieldCollection.nbFields = static_cast<int32_t>(mPluginAttributes.size());
     mFieldCollection.fields = mPluginAttributes.data();
 }
@@ -358,6 +387,7 @@ IPluginV3* LoraGroupPluginCreator::createPlugin(
     {
         int32_t numTargets = 1;
         int32_t inplace = 1;
+        int32_t loraFactorFormat = 0;
         for (int32_t i = 0; fc != nullptr && i < fc->nbFields; ++i)
         {
             std::string const f(fc->fields[i].name);
@@ -369,12 +399,22 @@ IPluginV3* LoraGroupPluginCreator::createPlugin(
             {
                 inplace = *static_cast<int32_t const*>(fc->fields[i].data);
             }
+            else if (f == "lora_factor_format")
+            {
+                if (fc->fields[i].type != PluginFieldType::kINT32 || fc->fields[i].length != 1
+                    || fc->fields[i].data == nullptr)
+                {
+                    return nullptr;
+                }
+                loraFactorFormat = *static_cast<int32_t const*>(fc->fields[i].data);
+            }
         }
-        if (numTargets < 1 || numTargets > kernels::kLoraGroupMaxTargets)
+        if (numTargets < 1 || numTargets > kernels::kLoraGroupMaxTargets
+            || (loraFactorFormat != 0 && loraFactorFormat != 1))
         {
             return nullptr;
         }
-        auto* p = new LoraGroupPlugin(name == nullptr ? "" : name, numTargets, inplace);
+        auto* p = new LoraGroupPlugin(name == nullptr ? "" : name, numTargets, inplace, loraFactorFormat);
         p->setPluginNamespace(mNamespace.c_str());
         return p;
     }
