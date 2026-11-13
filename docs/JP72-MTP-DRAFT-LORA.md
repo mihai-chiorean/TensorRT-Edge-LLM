@@ -1,6 +1,6 @@
 # LoRA adapters for the Gemma 4 MTP draft: design
 
-Status: draft for review, 2026-11-13. Fork `main` 8db9d3f6. MIT-2120. The
+Status: draft for review, 2026-11-13. Fork `main` 23e37714. MIT-2120. The
 implementation issues in section 8 are filed after this document is reviewed.
 
 ## 1. Problem
