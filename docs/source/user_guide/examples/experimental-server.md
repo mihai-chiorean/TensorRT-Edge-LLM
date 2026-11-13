@@ -361,6 +361,22 @@ with a warning). `/v1/models` lists one card per adapter as
 adapter's rank and binding coverage from its `edgellm_lora_processing`
 record.
 
+Every served adapter must be packaged for the deployed engine directory. The
+engine's `llm/` directory carries `edgellm_base_identity.json` (size and
+SHA-256 of every engine, table, tokenizer, chat template and config file,
+`lora_weights/` excluded), and each adapter directory carries
+`edgellm_adapter_manifest.json` naming that identity's digest, the adapter's
+version and the SHA-256 of its weights. Both are written by
+`tensorrt-edgellm-lora-package`. At startup the server checks the engine
+directory against its identity (`--lora-verify sizes`, the default, compares
+the file set and sizes; `--lora-verify full` rehashes every file) and refuses
+an adapter whose manifest is missing, names another base, or whose weights,
+modules or rank do not match. `--allow-unverified-lora-adapters` serves such
+adapters with a warning instead. Checkpoint-backed bundles (built from a
+checkpoint at startup) are not covered by the identity, so their adapters are
+unverified. `/health` reports each adapter's `version`, `verified` and the first
+12 hex characters of its `base_identity`.
+
 A request selects an adapter with either spelling — a model name of
 `<served>:<adapter>` or a `lora_name` field. Clients that always send
 `model` can keep using the bare served name: `model` equal to the bare

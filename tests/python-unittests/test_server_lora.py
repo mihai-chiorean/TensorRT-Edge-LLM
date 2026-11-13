@@ -19,13 +19,18 @@ from an engine tree under ``tmp_path``.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import threading
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+from safetensors.numpy import save_file as save_numpy_safetensors
+
+from tensorrt_edgellm import lora_package
 
 from experimental.server.config import (ApiConfig, LoraAdapterConfig,
                                         ModelConfig, ServerConfigError,
@@ -211,17 +216,34 @@ def _engine_tree(tmp_path: Path, max_lora_rank: int = 0) -> Path:
             },
         },
     )
+    lora_package.write_base_identity(str(bundle / "llm"))
     return bundle
 
 
-def _adapter(engine_dir: Path, name: str, rank=None) -> Path:
+def _adapter(engine_dir: Path,
+             name: str,
+             rank=None,
+             *,
+             manifest: bool = True,
+             base_identity=None) -> Path:
+    """A processed adapter directory: real FP16 factors for two modules, an
+    ``edgellm_lora_processing`` record when ``rank`` is given, and a manifest
+    bound to the engine directory's base identity (or ``base_identity``)."""
     directory = engine_dir / "lora_weights" / name
     directory.mkdir(parents=True)
-    (directory / "processed_adapter_model.safetensors").touch()
+    file_rank = rank or 4
+    stems = ["model.layers.0.self_attn.q_proj", "model.layers.0.mlp.up_proj"]
+    tensors = {}
+    for stem in stems:
+        tensors[f"{stem}.lora_A.weight"] = np.zeros((8, file_rank), np.float16)
+        tensors[f"{stem}.lora_B.weight"] = np.zeros((file_rank, 8), np.float16)
+    weights = directory / "processed_adapter_model.safetensors"
+    save_numpy_safetensors(tensors, str(weights))
     if rank is not None:
         _write_json(
             directory / "config.json", {
                 "edgellm_lora_processing": {
+                    "processing_schema_version": 1,
                     "rank": rank,
                     "lora_scale": 1.0,
                     "max_lora_rank": 64,
@@ -229,7 +251,28 @@ def _adapter(engine_dir: Path, name: str, rank=None) -> Path:
                     "unbound_untargeted_bindings": ["c"],
                 }
             })
-    return directory / "processed_adapter_model.safetensors"
+    if manifest:
+        if base_identity is None:
+            base_identity = lora_package.read_base_identity(
+                str(engine_dir))["digest"]
+        _write_json(
+            directory / lora_package.ADAPTER_MANIFEST_FILE, {
+                "schema": 1,
+                "version": f"{name}-v1",
+                "base_identity": base_identity,
+                "weights": {
+                    "file": weights.name,
+                    "size": weights.stat().st_size,
+                    "sha256": hashlib.sha256(weights.read_bytes()).hexdigest(),
+                },
+                "rank": file_rank,
+                "lora_scale": 1.0,
+                "processing_schema_version": 1,
+                "targets": sorted(stems),
+                "source_adapter_sha256": None,
+                "created_utc": "2026-11-12T00:00:00Z",
+            })
+    return weights
 
 
 @pytest.fixture
@@ -746,3 +789,113 @@ def test_engine_client_carries_the_adapter_to_the_request(
     # Request preparation builds the native request; the adapter selector
     # rides on it ready for the runtime's LoRAManager.
     assert prepared.request.lora_weights_name == "french"
+
+
+# ---------------------------------------------------------------------------
+# Manifest and base-identity enforcement
+# ---------------------------------------------------------------------------
+
+
+def test_adapter_without_a_manifest_refuses_to_start(tmp_path, _fake_runtime):
+    bundle = _engine_tree(tmp_path, max_lora_rank=16)
+    _adapter(bundle / "llm", "tool", rank=8, manifest=False)
+
+    with pytest.raises(ValueError, match="tool"):
+        LLM(model=str(bundle), cache_dir=str(tmp_path / "cache"))
+
+
+def test_adapter_packaged_for_another_base_refuses_to_start(
+        tmp_path, _fake_runtime):
+    bundle = _engine_tree(tmp_path, max_lora_rank=16)
+    _adapter(bundle / "llm", "tool", rank=8, base_identity="0" * 64)
+
+    with pytest.raises(ValueError, match="deployed base"):
+        LLM(model=str(bundle), cache_dir=str(tmp_path / "cache"))
+
+
+def test_changed_base_file_refuses_to_start(tmp_path, _fake_runtime):
+    bundle = _engine_tree(tmp_path, max_lora_rank=16)
+    _adapter(bundle / "llm", "tool", rank=8)
+    (bundle / "llm" / "tokenizer.json").write_text("{}")
+
+    with pytest.raises(ValueError, match="tokenizer.json"):
+        LLM(model=str(bundle), cache_dir=str(tmp_path / "cache"))
+
+
+def test_unverified_adapters_are_served_only_when_allowed(
+        tmp_path, _fake_runtime):
+    bundle = _engine_tree(tmp_path, max_lora_rank=16)
+    _adapter(bundle / "llm", "good", rank=8)
+    _adapter(bundle / "llm", "stale", rank=8, base_identity="0" * 64)
+
+    llm = LLM(model=str(bundle),
+              cache_dir=str(tmp_path / "cache"),
+              allow_unverified_lora_adapters=True)
+
+    report = {entry["name"]: entry for entry in llm.lora_adapter_info()}
+    assert report["good"]["verified"] is True
+    assert report["good"]["version"] == "good-v1"
+    assert report["stale"]["verified"] is False
+    assert sorted(llm._runtime.args[2]) == ["good", "stale"]
+
+
+def test_checkpoint_backed_bundle_is_not_covered_by_the_base_identity(tmp_path):
+    from experimental.server.runtime.engine import _resolve_lora_adapters
+    engine_dir = _engine_tree(tmp_path, max_lora_rank=16) / "llm"
+    _adapter(engine_dir, "tool", rank=8)
+
+    with pytest.raises(ValueError, match="checkpoint-backed"):
+        _resolve_lora_adapters(str(engine_dir), [],
+                               checkpoint_dir=str(tmp_path / "ckpt"))
+    adapters = _resolve_lora_adapters(str(engine_dir), [],
+                                      checkpoint_dir=str(tmp_path / "ckpt"),
+                                      allow_unverified=True)
+    assert [adapter.verified for adapter in adapters] == [False]
+
+
+def test_cli_parses_lora_verification_flags():
+    config = parse_server_config(
+        ["m", "--lora-verify", "full", "--allow-unverified-lora-adapters"])
+    assert config.model.lora_verify == "full"
+    assert config.model.allow_unverified_lora_adapters is True
+    defaults = parse_server_config(["m"])
+    assert defaults.model.lora_verify == "sizes"
+    assert defaults.model.allow_unverified_lora_adapters is False
+
+
+def test_full_verification_and_health_fields(tmp_path, _fake_runtime):
+    pytest.importorskip("fastapi")
+    bundle = _engine_tree(tmp_path, max_lora_rank=16)
+    _adapter(bundle / "llm", "tool", rank=4)
+    llm = LLM(model=str(bundle),
+              cache_dir=str(tmp_path / "cache"),
+              lora_verify="full")
+    client, _ = _client_with(llm)
+
+    adapters = client.get("/health").json()["lora"]["adapters"]
+
+    digest = lora_package.read_base_identity(str(bundle / "llm"))["digest"]
+    assert adapters == [{
+        "name": "tool",
+        "rank": 4,
+        "bound_modules": 2,
+        "unbound_untargeted_bindings": 1,
+        "processed": True,
+        "version": "tool-v1",
+        "verified": True,
+        "base_identity": digest[:12],
+    }]
+
+
+def test_configured_adapter_outside_lora_weights_is_verified(tmp_path,
+                                                             _fake_runtime):
+    bundle = _engine_tree(tmp_path, max_lora_rank=16)
+    digest = lora_package.read_base_identity(str(bundle / "llm"))["digest"]
+    weights = _adapter(tmp_path / "staging", "tool", rank=4,
+                       base_identity=digest)
+
+    llm = LLM(model=str(bundle),
+              cache_dir=str(tmp_path / "cache"),
+              lora_adapters=[LoraAdapterConfig("tool", str(weights))])
+
+    assert [entry["verified"] for entry in llm.lora_adapter_info()] == [True]

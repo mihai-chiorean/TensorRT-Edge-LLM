@@ -262,6 +262,8 @@ class ModelConfig:
     host_embedding_tables: bool = False
     host_ple_table: bool = False
     lora_adapters: Tuple[LoraAdapterConfig, ...] = ()
+    lora_verify: str = "sizes"
+    allow_unverified_lora_adapters: bool = False
 
     def __post_init__(self) -> None:
         if self.host_embedding_tables and self.host_ple_table:
@@ -304,6 +306,9 @@ class ModelConfig:
             "host_embedding_tables": self.host_embedding_tables,
             "host_ple_table": self.host_ple_table,
             "lora_adapters": list(self.lora_adapters),
+            "lora_verify": self.lora_verify,
+            "allow_unverified_lora_adapters":
+            self.allow_unverified_lora_adapters,
         }
 
 
@@ -561,6 +566,22 @@ def create_argument_parser(
         "selectable per request through the model name or lora_name.",
     )
     model.add_argument(
+        "--lora-verify",
+        choices=("sizes", "full"),
+        default="sizes",
+        help="How the engine directory is checked against its "
+        "edgellm_base_identity.json at startup when adapters are served: "
+        "file set and sizes (default), or a full SHA-256 rehash of the "
+        "engines, tables and tokenizer (several GB).",
+    )
+    model.add_argument(
+        "--allow-unverified-lora-adapters",
+        action="store_true",
+        help="Serve adapters that fail manifest or base-identity "
+        "verification, with a warning each; /health reports them as "
+        "verified: false. Over-rank adapters are still refused.",
+    )
+    model.add_argument(
         "--context-cache-max-records",
         type=_non_negative_int,
         default=1024,
@@ -658,6 +679,8 @@ def parse_server_config(argv: Optional[Sequence[str]] = None,
         host_embedding_tables=args.host_embedding_tables,
         host_ple_table=args.host_ple_table,
         lora_adapters=tuple(args.lora_adapter or ()),
+        lora_verify=args.lora_verify,
+        allow_unverified_lora_adapters=args.allow_unverified_lora_adapters,
     )
     api = ApiConfig(
         host=args.host,

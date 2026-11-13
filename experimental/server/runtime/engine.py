@@ -985,6 +985,9 @@ class LoraAdapter:
     path: str
     rank: Optional[int] = None
     provenance: Optional[Dict[str, Any]] = None
+    version: Optional[str] = None
+    base_identity: Optional[str] = None
+    verified: bool = False
 
 
 _LORA_WEIGHTS_DIR = "lora_weights"
@@ -1045,9 +1048,12 @@ def _read_lora_provenance(adapter: LoraAdapter) -> LoraAdapter:
     )
 
 
-def _resolve_lora_adapters(
-        engine_dir: str,
-        configured: Optional[List[Any]] = None) -> List[LoraAdapter]:
+def _resolve_lora_adapters(engine_dir: str,
+                           configured: Optional[List[Any]] = None,
+                           *,
+                           verify_mode: str = "sizes",
+                           allow_unverified: bool = False,
+                           checkpoint_dir: str = "") -> List[LoraAdapter]:
     """Merge configured and discovered adapters and validate the set.
 
     The engine's ``builder_config.max_lora_rank`` gates everything: adapters
@@ -1090,7 +1096,58 @@ def _resolve_lora_adapters(
         raise ValueError(
             f"adapter rank exceeds the engine's max_lora_rank={max_lora_rank}"
             f": {', '.join(over_rank)}")
+    adapters = _verify_lora_adapters(adapters, engine_dir, max_lora_rank,
+                                     verify_mode, allow_unverified,
+                                     checkpoint_dir)
     return [adapters[name] for name in sorted(adapters)]
+
+
+def _verify_lora_adapters(adapters: Dict[str, LoraAdapter], engine_dir: str,
+                          max_lora_rank: int, verify_mode: str,
+                          allow_unverified: bool,
+                          checkpoint_dir: str) -> Dict[str, LoraAdapter]:
+    """Bind every adapter to the deployed base through its manifest.
+
+    A failure refuses startup unless ``allow_unverified``, which keeps the
+    adapter with ``verified=False`` and a warning.
+    """
+    from tensorrt_edgellm import lora_package
+
+    def refuse(name: str, reason: str) -> None:
+        if not allow_unverified:
+            raise ValueError(f"LoRA adapter {name!r} failed verification: "
+                             f"{reason}")
+        logger.warning("Serving unverified LoRA adapter %r: %s", name, reason)
+
+    if checkpoint_dir:
+        for name in adapters:
+            refuse(name, "checkpoint-backed bundles are not covered by the "
+                   "base identity")
+        return adapters
+    started = time.monotonic()
+    try:
+        base = lora_package.read_base_identity(engine_dir, verify=verify_mode)
+    except (OSError, ValueError) as error:
+        for name in adapters:
+            refuse(name, str(error))
+        return adapters
+    logger.info("Base identity %s verified (%s) in %.1f s",
+                base["digest"][:12], verify_mode,
+                time.monotonic() - started)
+    verified = {}
+    for name, adapter in adapters.items():
+        try:
+            manifest = lora_package.verify_adapter(adapter.path, base,
+                                                   max_lora_rank)
+        except (OSError, ValueError) as error:
+            refuse(name, str(error))
+            verified[name] = adapter
+            continue
+        verified[name] = replace(adapter,
+                                 version=manifest.get("version"),
+                                 base_identity=manifest.get("base_identity"),
+                                 verified=True)
+    return verified
 
 
 # ---------------------------------------------------------------------------
@@ -1134,6 +1191,8 @@ class LLM:
         host_embedding_tables: bool = False,
         host_ple_table: bool = False,
         lora_adapters: Optional[List[Any]] = None,
+        lora_verify: str = "sizes",
+        allow_unverified_lora_adapters: bool = False,
         on_progress: Optional[Callable[[str], None]] = None,
     ):
         if not model:
@@ -1174,6 +1233,8 @@ class LLM:
         self._host_embedding_tables = host_embedding_tables
         self._host_ple_table = host_ple_table
         self._configured_lora_adapters = list(lora_adapters or ())
+        self._lora_verify = lora_verify
+        self._allow_unverified_lora_adapters = allow_unverified_lora_adapters
         self._admission_sem = threading.Semaphore(1)
         self._infer_lock = threading.Lock()
         self._close_lock = threading.Lock()
@@ -1272,7 +1333,12 @@ class LLM:
         self._dflash_block_size = runtime_options.dflash_block_size
         self._init_from_bundle(prepared.bundle_dir)
         self._lora_adapters = _resolve_lora_adapters(
-            self._engine_dir, self._configured_lora_adapters)
+            self._engine_dir,
+            self._configured_lora_adapters,
+            verify_mode=getattr(self, "_lora_verify", "sizes"),
+            allow_unverified=getattr(self, "_allow_unverified_lora_adapters",
+                                     False),
+            checkpoint_dir=self._checkpoint_dir)
         if self._lora_adapters:
             logger.info(
                 "LoRA adapters registered (%d): %s (engine max_lora_rank=%d)",
@@ -2526,6 +2592,12 @@ class LLM:
                 len(unbound) if isinstance(unbound, list) else None,
                 "processed":
                 provenance is not None,
+                "version":
+                adapter.version,
+                "verified":
+                adapter.verified,
+                "base_identity":
+                adapter.base_identity[:12] if adapter.base_identity else None,
             })
         return report
 
