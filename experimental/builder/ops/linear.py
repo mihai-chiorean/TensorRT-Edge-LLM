@@ -20,6 +20,8 @@ from typing import Optional, Sequence
 import numpy as np
 import tensorrt as trt
 
+from tensorrt_edgellm.lora_targets import stem_matches_targets
+
 from ..core import quantization, weight_policy
 from . import functional as F
 from .module import BuildContext, Module
@@ -229,7 +231,10 @@ class Linear(Module):
     def _uses_lora(self) -> bool:
         return (self.ctx.options.max_lora_rank > 0
                 and self.prefix not in ("lm_head", "model.embed_tokens")
-                and not self.prefix.endswith("embed_tokens"))
+                and not self.prefix.endswith("embed_tokens")
+                and stem_matches_targets(
+                    self.prefix, getattr(self.ctx.options, "lora_targets",
+                                         None)))
 
 
 class DynamicLinear(Module):

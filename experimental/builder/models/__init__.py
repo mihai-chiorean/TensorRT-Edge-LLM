@@ -27,6 +27,7 @@ def build_model(net, bundle, cfg, weights, args) -> None:
         sm12x=args.sm12x,
         sm110=args.sm110,
         max_lora_rank=args.max_lora_rank,
+        lora_targets=getattr(args, "lora_targets", None),
     )
     context = BuildContext(net=net,
                            cfg=cfg,

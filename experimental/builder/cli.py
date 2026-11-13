@@ -32,6 +32,15 @@ def _value_or_default(value, default):
     return default if value is None else value
 
 
+def _lora_targets(args: argparse.Namespace):
+    from tensorrt_edgellm.lora_targets import parse_lora_targets
+
+    targets = parse_lora_targets(getattr(args, "lora_targets", None))
+    if targets is not None and args.max_lora_rank <= 0:
+        raise ValueError("--lora-targets requires --max-lora-rank > 0")
+    return targets
+
+
 def _build_args(args: argparse.Namespace, component: str):
     from .core.builder import BuildArgs
 
@@ -46,6 +55,7 @@ def _build_args(args: argparse.Namespace, component: str):
         max_kv_cache_capacity=args.max_kv_cache_capacity,
         max_batch_size=args.max_batch_size,
         max_lora_rank=args.max_lora_rank,
+        lora_targets=_lora_targets(args),
         num_decoder_layers=args.num_decoder_layer,
         max_verify_tree_size=_value_or_default(args.max_verify_tree_size, 60),
         max_draft_tree_size=_value_or_default(args.max_draft_tree_size, 60),
@@ -386,6 +396,13 @@ def _add_build_args(parser: argparse.ArgumentParser) -> None:
         default=0,
         help=("Maximum supported LoRA rank. 0 disables LoRA (default: "
               "%(default)s)"))
+    parser.add_argument(
+        "--lora-targets",
+        type=str,
+        default=None,
+        help=("Comma-separated module names that get LoRA inputs, matched as "
+              "whole dot-separated segments of the module path (Gemma 4: "
+              "self_attn,mlp). Default: every eligible projection."))
     parser.add_argument(
         "--num-decoder-layer",
         type=int,

@@ -32,6 +32,7 @@ import numpy as np
 import tensorrt as trt
 
 from tensorrt_edgellm.dflash import DFlashVersion
+from tensorrt_edgellm.lora_targets import unmatched_targets
 
 from ..ops.backend import Net
 from ..ops.functional.attention import KV_PAGE_SIZE
@@ -132,6 +133,7 @@ class BuildArgs:
     max_kv_cache_capacity: int = 4096
     max_batch_size: int = 4
     max_lora_rank: int = 0
+    lora_targets: Optional[Tuple[str, ...]] = None
     max_verify_tree_size: int = 60
     max_draft_tree_size: int = 60
     tree_base: bool = False
@@ -854,10 +856,12 @@ def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
         set_profile_shapes(name, prefill_range.token(width),
                            generation_range.token(width))
 
+    lora_stems = set()
     for input_index in range(network.num_inputs):
         tensor = network.get_input(input_index)
         if ".lora_A.weight" not in tensor.name and ".lora_B.weight" not in tensor.name:
             continue
+        lora_stems.add(tensor.name.rsplit(".lora_", 1)[0])
         shape = tuple(int(dim) for dim in tensor.shape)
         if ".lora_A.weight" in tensor.name:
             minimum = (shape[0], 0)
@@ -867,6 +871,12 @@ def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
             maximum = (args.max_lora_rank, shape[1])
         optimum = maximum
         set_profile_shapes(tensor.name, (minimum, optimum, maximum))
+    if args.lora_targets is not None:
+        missing = unmatched_targets(lora_stems, args.lora_targets)
+        if missing:
+            raise ValueError(f"--lora-targets {missing} match no projection "
+                             f"of this network; LoRA stems look like "
+                             f"{sorted(lora_stems)[:5]}")
 
     config.add_optimization_profile(ctx_prof)
     config.add_optimization_profile(gen_prof)

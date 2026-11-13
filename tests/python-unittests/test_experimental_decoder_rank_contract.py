@@ -436,3 +436,40 @@ def test_phi4_multimodal_mlp_slices_token_major_activations():
     mlp.forward(_Tensor(2))
 
     assert ranks == [2, 2]
+
+
+def _dynamic_lora_prefixes(monkeypatch, options, prefixes):
+    """Prefixes that receive runtime LoRA inputs when built with ``options``."""
+    recorded = []
+    monkeypatch.setattr(
+        F,
+        "linear_from_weights",
+        lambda hidden, descriptor, rank, name="": hidden)
+    monkeypatch.setattr(
+        F, "dynamic_lora",
+        lambda hidden, output, prefix, *args: recorded.append(prefix) or
+        output)
+    context = _context()
+    context.options = options
+    for prefix in prefixes:
+        Linear(context, prefix)(_Tensor(2))
+    return recorded
+
+
+def test_linear_lora_targets_skip_unselected_projections(monkeypatch):
+    recorded = _dynamic_lora_prefixes(
+        monkeypatch, BuildOptions(max_lora_rank=16,
+                                  lora_targets=("self_attn", )),
+        ["model.layers.0.self_attn.q_proj", "model.layers.0.per_layer_projection"])
+
+    assert recorded == ["model.layers.0.self_attn.q_proj"]
+
+
+def test_linear_without_lora_targets_adapts_every_projection(monkeypatch):
+    recorded = _dynamic_lora_prefixes(
+        monkeypatch, BuildOptions(max_lora_rank=16),
+        ["model.layers.0.self_attn.q_proj", "model.layers.0.per_layer_projection"])
+
+    assert recorded == [
+        "model.layers.0.self_attn.q_proj", "model.layers.0.per_layer_projection"
+    ]
