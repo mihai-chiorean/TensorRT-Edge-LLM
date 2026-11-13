@@ -63,7 +63,7 @@ std::vector<GroupCase> cases()
     std::vector<GroupCase> out;
     for (auto const& s : shapes)
     {
-        for (int32_t M : {1, 12, 64})
+        for (int32_t M : {1, 12, 28, 64})
         {
             for (int32_t r : {1, 8, 16})
             {
@@ -570,6 +570,249 @@ TEST(LoraGroupLauncher, MultiRoundExpandMatchesReference)
         cudaFree(dBase[i]);
     }
     cudaFree(workspace);
+    cudaStreamDestroy(stream);
+}
+
+//! Short prefill is one cooperative launch per group under the Orin shared-memory budget, for every
+//! Gemma 4 E4B group: up to 64 rows on 16 SMs (AGX Orin), up to 32 rows on 8 SMs (Orin NX), with 2
+//! row tiles up to 32 rows and 4 above. Wider prefills keep the shrink + expand path.
+TEST(LoraGroupPlan, ShortPrefillIsOneLaunch)
+{
+    constexpr size_t kOrinBudget = 160 * 1024;
+    struct Group
+    {
+        int32_t K;
+        std::vector<int32_t> N;
+    };
+    for (Group const& g : {Group{2560, {2048, 512, 512}}, Group{2560, {4096, 1024, 1024}}, Group{2560, {2048}},
+             Group{2048, {2560}}, Group{4096, {2560}}, Group{2560, {10240, 10240}}, Group{10240, {2560}}})
+    {
+        std::vector<LoraTarget> targets(g.N.size());
+        for (size_t i = 0; i < g.N.size(); ++i)
+        {
+            targets[i].r = 16;
+            targets[i].N = g.N[i];
+        }
+        int32_t const n = static_cast<int32_t>(targets.size());
+        for (int32_t const grid : {8, 16})
+        {
+            int32_t const maxM = grid >= 16 ? 64 : 32;
+            for (int32_t const M : {17, 28, 32, 33, 64})
+            {
+                LoraGroupPlan const plan = planLoraGroup(M, g.K, targets.data(), n, grid, kOrinBudget);
+                if (M > maxM)
+                {
+                    EXPECT_FALSE(plan.fused) << "grid " << grid << " M " << M;
+                    continue;
+                }
+                EXPECT_TRUE(plan.fused) << "K " << g.K << " N0 " << g.N[0] << " grid " << grid << " M " << M;
+                EXPECT_EQ(plan.rowTiles, M <= 32 ? 2 : 4);
+                EXPECT_LE(plan.smemBytes, kOrinBudget);
+            }
+            EXPECT_FALSE(planLoraGroup(maxM + 1, g.K, targets.data(), n, grid, kOrinBudget).fused);
+        }
+    }
+}
+
+//! The short-prefill kernel with the grid forced to 8 CTAs, at the Orin budget and at budgets
+//! small enough to force rounds of expand tiles and a 2-deep K ring, against the reference.
+TEST(LoraGroupLauncher, ShortPrefillOnEightSmsMatchesReference)
+{
+    int dev = 0;
+    int optin = 0;
+    CUDA_OK(cudaGetDevice(&dev));
+    CUDA_OK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+    struct Case
+    {
+        int32_t M;
+        int32_t K;
+        std::vector<int32_t> N;
+    };
+    std::mt19937 gen(77);
+    std::uniform_real_distribution<float> dist(-1.f, 1.f);
+    auto fill = [&](size_t count, float scale) {
+        std::vector<__half> v(count);
+        for (auto& e : v)
+        {
+            e = __float2half(dist(gen) * scale);
+        }
+        return v;
+    };
+    cudaStream_t stream{};
+    CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    for (Case const& c : {Case{28, 2560, {10240, 10240}}, Case{24, 10240, {2560}}, Case{32, 2560, {2048, 512, 512}}})
+    {
+        int32_t const n = static_cast<int32_t>(c.N.size());
+        std::vector<__half> const x = fill(static_cast<size_t>(c.M) * c.K, 0.5f);
+        void* dx = nullptr;
+        CUDA_OK(cudaMalloc(&dx, x.size() * 2));
+        CUDA_OK(cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice));
+        std::vector<std::vector<__half>> A, B, base;
+        std::vector<void*> dA(n), dB(n), dBase(n);
+        std::vector<LoraTarget> targets(n);
+        for (int32_t i = 0; i < n; ++i)
+        {
+            A.push_back(fill(static_cast<size_t>(c.K) * 16, 0.05f));
+            B.push_back(fill(static_cast<size_t>(16) * c.N[i], 0.05f));
+            base.push_back(fill(static_cast<size_t>(c.M) * c.N[i], 1.f));
+            CUDA_OK(cudaMalloc(&dA[i], A[i].size() * 2));
+            CUDA_OK(cudaMalloc(&dB[i], B[i].size() * 2));
+            CUDA_OK(cudaMalloc(&dBase[i], base[i].size() * 2));
+            CUDA_OK(cudaMemcpy(dA[i], A[i].data(), A[i].size() * 2, cudaMemcpyHostToDevice));
+            CUDA_OK(cudaMemcpy(dB[i], B[i].data(), B[i].size() * 2, cudaMemcpyHostToDevice));
+            targets[i].A = dA[i];
+            targets[i].B = dB[i];
+            targets[i].base = dBase[i];
+            targets[i].out = dBase[i];
+            targets[i].r = 16;
+            targets[i].N = c.N[i];
+        }
+        void* workspace = nullptr;
+        CUDA_OK(cudaMalloc(&workspace, loraGroupWorkspaceBytes(c.M, n, 16)));
+        for (size_t const budget : {size_t{160 * 1024}, size_t{64 * 1024}})
+        {
+            LoraGroupPlan const plan = planLoraGroup(c.M, c.K, targets.data(), n, 8, budget);
+            ASSERT_TRUE(plan.fused) << "M " << c.M << " budget " << budget;
+            ASSERT_GT(plan.rowTiles, 1);
+            if (plan.smemBytes > static_cast<size_t>(optin))
+            {
+                GTEST_SKIP() << "device opts in to " << optin << " B of shared memory per block, plan needs "
+                             << plan.smemBytes;
+            }
+            void* state = nullptr;
+            CUDA_OK(cudaMalloc(&state, kLoraGroupStateBytes));
+            CUDA_OK(cudaMemset(state, 0, kLoraGroupStateBytes));
+            for (int32_t i = 0; i < n; ++i)
+            {
+                CUDA_OK(cudaMemcpy(dBase[i], base[i].data(), base[i].size() * 2, cudaMemcpyHostToDevice));
+            }
+            CUDA_OK(cudaDeviceSynchronize());
+            ASSERT_EQ(
+                launchLoraGroupWithLimits(dx, c.M, c.K, targets.data(), n, workspace, state, stream, 8, budget), 0);
+            CUDA_OK(cudaStreamSynchronize(stream));
+            for (int32_t i = 0; i < n; ++i)
+            {
+                std::vector<float> const want = referenceOut(x, A[i], B[i], base[i], c.M, c.K, c.N[i], 16);
+                std::vector<__half> got(base[i].size());
+                CUDA_OK(cudaMemcpy(got.data(), dBase[i], got.size() * 2, cudaMemcpyDeviceToHost));
+                for (size_t e = 0; e < got.size(); ++e)
+                {
+                    ASSERT_NEAR(__half2float(got[e]), want[e], 2e-3f + 2e-3f * std::fabs(want[e]))
+                        << "M " << c.M << " budget " << budget << " (rounds " << plan.tilesPerRound << "/"
+                        << plan.tilesPerCta << ", ring " << plan.stages << ") target " << i << " element " << e;
+                }
+            }
+            cudaFree(state);
+        }
+        cudaFree(dx);
+        for (int32_t i = 0; i < n; ++i)
+        {
+            cudaFree(dA[i]);
+            cudaFree(dB[i]);
+            cudaFree(dBase[i]);
+        }
+        cudaFree(workspace);
+    }
+    cudaStreamDestroy(stream);
+}
+
+//! Decode, short prefill and per-target fallback launches interleaved in one captured graph on one
+//! plugin state, replayed: every replay finishes (no barrier counter shared across paths that could
+//! desynchronize) and gives the reference result.
+TEST(LoraGroupLauncher, DecodeAndShortPrefillShareOneStateAcrossReplays)
+{
+    int32_t const K = 2560;
+    int32_t const N = 2048;
+    struct Launch
+    {
+        int32_t M;
+        int32_t r;
+    };
+    std::vector<Launch> const launches{{12, 16}, {40, 16}, {12, 4}, {28, 16}, {1, 16}};
+    std::mt19937 gen(5);
+    std::uniform_real_distribution<float> dist(-1.f, 1.f);
+    auto fill = [&](size_t count, float scale) {
+        std::vector<__half> v(count);
+        for (auto& e : v)
+        {
+            e = __float2half(dist(gen) * scale);
+        }
+        return v;
+    };
+    std::vector<__half> const x = fill(static_cast<size_t>(64) * K, 0.5f);
+    void* dx = nullptr;
+    CUDA_OK(cudaMalloc(&dx, x.size() * 2));
+    CUDA_OK(cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice));
+    size_t const L = launches.size();
+    std::vector<std::vector<__half>> A(L), B(L), base(L);
+    std::vector<void*> dA(L), dB(L), dBase(L);
+    std::vector<LoraTarget> targets(L);
+    for (size_t l = 0; l < L; ++l)
+    {
+        A[l] = fill(static_cast<size_t>(K) * launches[l].r, 0.05f);
+        B[l] = fill(static_cast<size_t>(launches[l].r) * N, 0.05f);
+        base[l] = fill(static_cast<size_t>(launches[l].M) * N, 1.f);
+        CUDA_OK(cudaMalloc(&dA[l], A[l].size() * 2));
+        CUDA_OK(cudaMalloc(&dB[l], B[l].size() * 2));
+        CUDA_OK(cudaMalloc(&dBase[l], base[l].size() * 2));
+        CUDA_OK(cudaMemcpy(dA[l], A[l].data(), A[l].size() * 2, cudaMemcpyHostToDevice));
+        CUDA_OK(cudaMemcpy(dB[l], B[l].data(), B[l].size() * 2, cudaMemcpyHostToDevice));
+        targets[l].A = dA[l];
+        targets[l].B = dB[l];
+        targets[l].base = dBase[l];
+        targets[l].out = dBase[l];
+        targets[l].r = launches[l].r;
+        targets[l].N = N;
+    }
+    void* workspace = nullptr;
+    void* state = nullptr;
+    CUDA_OK(cudaMalloc(&workspace, loraGroupWorkspaceBytes(64, 1, 16)));
+    CUDA_OK(cudaMalloc(&state, kLoraGroupStateBytes));
+    CUDA_OK(cudaMemset(state, 0, kLoraGroupStateBytes));
+    CUDA_OK(cudaDeviceSynchronize());
+    cudaStream_t stream{};
+    CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    cudaGraph_t graph{};
+    cudaGraphExec_t exec{};
+    CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    for (size_t l = 0; l < L; ++l)
+    {
+        ASSERT_EQ(launchLoraGroup(dx, launches[l].M, K, &targets[l], 1, workspace, state, stream), 0);
+    }
+    CUDA_OK(cudaStreamEndCapture(stream, &graph));
+    CUDA_OK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    for (int32_t replay = 0; replay < 3; ++replay)
+    {
+        for (size_t l = 0; l < L; ++l)
+        {
+            CUDA_OK(cudaMemcpy(dBase[l], base[l].data(), base[l].size() * 2, cudaMemcpyHostToDevice));
+        }
+        CUDA_OK(cudaDeviceSynchronize());
+        CUDA_OK(cudaGraphLaunch(exec, stream));
+        CUDA_OK(cudaStreamSynchronize(stream));
+        for (size_t l = 0; l < L; ++l)
+        {
+            std::vector<float> const want = referenceOut(x, A[l], B[l], base[l], launches[l].M, K, N, launches[l].r);
+            std::vector<__half> got(base[l].size());
+            CUDA_OK(cudaMemcpy(got.data(), dBase[l], got.size() * 2, cudaMemcpyDeviceToHost));
+            for (size_t e = 0; e < got.size(); ++e)
+            {
+                ASSERT_NEAR(__half2float(got[e]), want[e], 2e-3f + 2e-3f * std::fabs(want[e]))
+                    << "replay " << replay << " launch " << l << " element " << e;
+            }
+        }
+    }
+    cudaGraphExecDestroy(exec);
+    cudaGraphDestroy(graph);
+    cudaFree(dx);
+    for (size_t l = 0; l < L; ++l)
+    {
+        cudaFree(dA[l]);
+        cudaFree(dB[l]);
+        cudaFree(dBase[l]);
+    }
+    cudaFree(workspace);
+    cudaFree(state);
     cudaStreamDestroy(stream);
 }
 
