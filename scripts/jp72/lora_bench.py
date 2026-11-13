@@ -120,8 +120,7 @@ TTFT_PARAGRAPH = (
     "runtime makes when it schedules prefill work against the L2 carveout. "
     "Builders on the bench log each engine's identity hash before measuring "
     "anything, because a stale adapter directory silently reuses the wrong "
-    "context cache and skews the time-to-first-token numbers. "
-)
+    "context cache and skews the time-to-first-token numbers. ")
 
 DEFAULT_TTFT_LENGTHS = "20,100,400,800,1600"
 DEFAULT_REPS = 5
@@ -153,42 +152,66 @@ RECORD_FIELDS = [
 def parse_args(argv=None):
     """Parse the CLI; importable without the runtime for --help/tests."""
     parser = argparse.ArgumentParser(
-        description="LoRA/MTP engine bench (Jetson; touches CUDA via the pybind runtime).")
-    parser.add_argument("--engine", required=True, help="Engine directory (base+draft for --mtp).")
-    parser.add_argument("--mtp",
-                        action="store_true",
-                        help="Engine is a speculative-decoding (MTP) engine; collect verify-step metrics.")
-    parser.add_argument("--adapter",
-                        action="append",
-                        default=[],
-                        metavar="NAME=PATH",
-                        help="LoRA adapter as NAME=PATH; repeatable. Base is always measured too.")
-    parser.add_argument("--build-dir",
-                        default=os.environ.get("B", ""),
-                        metavar="DIR",
-                        help="EdgeLLM build tree with the plugin lib and pybind module (default: $B).")
-    parser.add_argument("--ttft-lengths",
-                        default=DEFAULT_TTFT_LENGTHS,
-                        help="Comma-separated target prompt token counts for the TTFT sweep "
-                        f"(default: {DEFAULT_TTFT_LENGTHS}).")
-    parser.add_argument("--reps",
-                        type=int,
-                        default=DEFAULT_REPS,
-                        help="Repetitions per TTFT sweep point (default: %(default)s).")
-    parser.add_argument("--no-reuse",
-                        action="store_true",
-                        help="Accepted for compatibility; unique time_ns prefixes always defeat context reuse.")
-    parser.add_argument("--out",
-                        metavar="FILE.jsonl",
-                        help="Append one JSON line per record to this file instead of stdout.")
-    parser.add_argument("--skip-outputs",
-                        action="store_true",
-                        help="Do not include generated texts in records (they are still generated).")
+        prog="lora_bench.py",
+        description=
+        "LoRA/MTP engine bench (Jetson; touches CUDA via the pybind runtime).")
+    parser.add_argument("--engine",
+                        required=True,
+                        help="Engine directory (base+draft for --mtp).")
+    parser.add_argument(
+        "--mtp",
+        action="store_true",
+        help=
+        "Engine is a speculative-decoding (MTP) engine; collect verify-step metrics."
+    )
+    parser.add_argument(
+        "--adapter",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help=
+        "LoRA adapter as NAME=PATH; repeatable. Base is always measured too.")
+    parser.add_argument(
+        "--build-dir",
+        default=os.environ.get("B", ""),
+        metavar="DIR",
+        help=
+        "EdgeLLM build tree with the plugin lib and pybind module (default: $B)."
+    )
+    parser.add_argument(
+        "--ttft-lengths",
+        default=DEFAULT_TTFT_LENGTHS,
+        help="Comma-separated target prompt token counts for the TTFT sweep "
+        f"(default: {DEFAULT_TTFT_LENGTHS}).")
+    parser.add_argument(
+        "--reps",
+        type=int,
+        default=DEFAULT_REPS,
+        help="Repetitions per TTFT sweep point (default: %(default)s).")
+    parser.add_argument(
+        "--no-reuse",
+        action="store_true",
+        help=
+        "Accepted for compatibility; unique time_ns prefixes always defeat context reuse."
+    )
+    parser.add_argument(
+        "--out",
+        metavar="FILE.jsonl",
+        help="Append one JSON line per record to this file instead of stdout.")
+    parser.add_argument(
+        "--skip-outputs",
+        action="store_true",
+        help=
+        "Do not include generated texts in records (they are still generated)."
+    )
     args = parser.parse_args(argv)
     if not args.build_dir:
         parser.error("--build-dir is required (or set $B)")
     if args.reps < 1:
         parser.error("--reps must be >= 1")
+    for pair in args.adapter:
+        if "=" not in pair:
+            parser.error(f"--adapter must be NAME=PATH, got {pair!r}")
     return args
 
 
@@ -213,9 +236,12 @@ def parse_ttft_lengths(spec):
         try:
             value = int(part)
         except ValueError:
-            raise ValueError(f"--ttft-lengths must be comma-separated integers, got {spec!r}") from None
+            raise ValueError(
+                f"--ttft-lengths must be comma-separated integers, got {spec!r}"
+            ) from None
         if value <= 0:
-            raise ValueError(f"--ttft-lengths entries must be positive, got {value}")
+            raise ValueError(
+                f"--ttft-lengths entries must be positive, got {value}")
         lengths.append(value)
     if not lengths:
         raise ValueError("--ttft-lengths is empty")
@@ -246,7 +272,8 @@ def build_ttft_prompt(target_tokens, tokenizer=None, paragraph=TTFT_PARAGRAPH):
     stamp = time.time_ns()
     unique = f"[probe {stamp}]\n"
     if tokenizer is None:
-        body = paragraph * max(1, int(round(target_tokens * 4.0 / len(paragraph))))
+        body = paragraph * max(
+            1, int(round(target_tokens * 4.0 / len(paragraph))))
         candidate = unique + body
         return candidate, -1
 
@@ -256,7 +283,8 @@ def build_ttft_prompt(target_tokens, tokenizer=None, paragraph=TTFT_PARAGRAPH):
     # character cut point of the final partial paragraph.
     para_len = len(paragraph)
     para_tokens = max(1, len(tokenizer.encode(paragraph).ids))
-    whole_reps, remainder_target = divmod(max(target_tokens - 10, 1), para_tokens)
+    whole_reps, remainder_target = divmod(max(target_tokens - 10, 1),
+                                          para_tokens)
     if whole_reps == 0:
         lo, hi = 1, para_len
         best_small = unique + paragraph
@@ -321,16 +349,17 @@ def make_tool_request(rt, prompt):
         item.has_parameters = True
         item.has_strict = True
         tools.append(item)
-    req = rt.create_generation_request([[rt.create_text_message("user", prompt)]],
-                                       temperature=0.0,
-                                       top_k=1,
-                                       max_generate_length=TTFT_MAX_TOKENS,
-                                       apply_chat_template=True,
-                                       add_generation_prompt=True,
-                                       enable_thinking=False,
-                                       lora_weights_name="",
-                                       save_system_prompt_kv_cache=False,
-                                       disable_spec_decode=False)
+    req = rt.create_generation_request(
+        [[rt.create_text_message("user", prompt)]],
+        temperature=0.0,
+        top_k=1,
+        max_generate_length=TTFT_MAX_TOKENS,
+        apply_chat_template=True,
+        add_generation_prompt=True,
+        enable_thinking=False,
+        lora_weights_name="",
+        save_system_prompt_kv_cache=False,
+        disable_spec_decode=False)
     req.tools = tools
     req.tool_choice = rt.ToolChoice()
     req.tool_choice.mode = rt.ToolChoiceMode.AUTO
@@ -339,16 +368,17 @@ def make_tool_request(rt, prompt):
 
 def make_decode_request(rt, prompt, max_tokens=DECODE_MAX_TOKENS):
     """Build a plain decode request."""
-    return rt.create_generation_request([[rt.create_text_message("user", prompt)]],
-                                        temperature=0.0,
-                                        top_k=1,
-                                        max_generate_length=max_tokens,
-                                        apply_chat_template=True,
-                                        add_generation_prompt=True,
-                                        enable_thinking=False,
-                                        lora_weights_name="",
-                                        save_system_prompt_kv_cache=False,
-                                        disable_spec_decode=False)
+    return rt.create_generation_request(
+        [[rt.create_text_message("user", prompt)]],
+        temperature=0.0,
+        top_k=1,
+        max_generate_length=max_tokens,
+        apply_chat_template=True,
+        add_generation_prompt=True,
+        enable_thinking=False,
+        lora_weights_name="",
+        save_system_prompt_kv_cache=False,
+        disable_spec_decode=False)
 
 
 def run_decode(rt, runtime, prompt, max_tokens=DECODE_MAX_TOKENS):
@@ -357,7 +387,8 @@ def run_decode(rt, runtime, prompt, max_tokens=DECODE_MAX_TOKENS):
     t0 = time.perf_counter()
     resp = runtime.handle_request(req)
     seconds = time.perf_counter() - t0
-    prompt_tokens = int(resp.prompt_token_counts[0]) if resp.prompt_token_counts else 0
+    prompt_tokens = int(
+        resp.prompt_token_counts[0]) if resp.prompt_token_counts else 0
     out_ids = list(resp.output_ids[0]) if resp.output_ids else []
     return prompt_tokens, len(out_ids), seconds, out_ids
 
@@ -381,30 +412,46 @@ def assemble_record(tag,
                     greedy_match=None):
     """Assemble one output record dict; pure (no runtime)."""
     record = {
-        "tag": tag,
-        "mtp": mtp,
-        "engine": engine_dir,
-        "adapter": adapter_path,
-        "peak_host_rss_mb": peak_rss_mb,
-        "prompt_tokens": decode["prompt_tokens"],
-        "ttft_ms_tool": ttft_tool_ms,
-        "ttft_sweep": ttft_sweep,
-        "decode_prompt_tokens": decode["prompt_tokens"],
-        "decode_generated": decode["generated"],
-        "decode_seconds": round(decode["seconds"], 4),
-        "decode_tok_s": round(decode["generated"] / decode["seconds"], 2) if decode["seconds"] > 0 else None,
+        "tag":
+        tag,
+        "mtp":
+        mtp,
+        "engine":
+        engine_dir,
+        "adapter":
+        adapter_path,
+        "peak_host_rss_mb":
+        peak_rss_mb,
+        "prompt_tokens":
+        decode["prompt_tokens"],
+        "ttft_ms_tool":
+        ttft_tool_ms,
+        "ttft_sweep":
+        ttft_sweep,
+        "decode_prompt_tokens":
+        decode["prompt_tokens"],
+        "decode_generated":
+        decode["generated"],
+        "decode_seconds":
+        round(decode["seconds"], 4),
+        "decode_tok_s":
+        round(decode["generated"] /
+              decode["seconds"], 2) if decode["seconds"] > 0 else None,
     }
     if spec_metrics is None:
         record["tokens_per_verify_step"] = None
         record["verify_steps"] = None
     else:
-        tps = verify_step_math(spec_metrics["total_generated_tokens"], spec_metrics["total_iterations"])
+        tps = verify_step_math(spec_metrics["total_generated_tokens"],
+                               spec_metrics["total_iterations"])
         record["tokens_per_verify_step"] = tps
         record["verify_steps"] = spec_metrics["total_iterations"]
         if "accepted_draft_tokens" in spec_metrics:
-            record["accepted_draft_tokens"] = spec_metrics["accepted_draft_tokens"]
+            record["accepted_draft_tokens"] = spec_metrics[
+                "accepted_draft_tokens"]
         if "proposed_draft_tokens" in spec_metrics:
-            record["proposed_draft_tokens"] = spec_metrics["proposed_draft_tokens"]
+            record["proposed_draft_tokens"] = spec_metrics[
+                "proposed_draft_tokens"]
     record["greedy_match"] = greedy_match
     return record
 
@@ -427,7 +474,8 @@ def run_ttft_sweep(rt, runtime, lengths, reps, tokenizer):
             resp = runtime.handle_request(req)
             ttfts.append((time.perf_counter() - t0) * 1000.0)
             if prompt_tokens is None:
-                prompt_tokens = int(resp.prompt_token_counts[0]) if resp.prompt_token_counts else measured
+                prompt_tokens = int(resp.prompt_token_counts[0]
+                                    ) if resp.prompt_token_counts else measured
         sweep.append({
             "target_tokens": target,
             "prompt_tokens": prompt_tokens,
@@ -446,17 +494,22 @@ def read_spec_metrics(runtime):
     except (AttributeError, RuntimeError):
         return None
     return {
-        "total_iterations": int(getattr(metrics, "total_iterations", 0)),
-        "total_generated_tokens": int(getattr(metrics, "total_generated_tokens", 0)),
-        "accepted_draft_tokens": int(getattr(metrics, "total_accepted_draft_tokens", 0)),
-        "proposed_draft_tokens": int(getattr(metrics, "total_proposed_draft_tokens", 0)),
+        "total_iterations":
+        int(getattr(metrics, "total_iterations", 0)),
+        "total_generated_tokens":
+        int(getattr(metrics, "total_generated_tokens", 0)),
+        "accepted_draft_tokens":
+        int(getattr(metrics, "total_accepted_draft_tokens", 0)),
+        "proposed_draft_tokens":
+        int(getattr(metrics, "total_proposed_draft_tokens", 0)),
     }
 
 
 def load_runtime(rt, args, lora_map):
     """Construct LLMRuntime for a plain or MTP engine."""
     if args.mtp:
-        return rt.LLMRuntime(args.engine, "", lora_map, 1, 1, 1, "", "", None, 0, False, False)
+        return rt.LLMRuntime(args.engine, "", lora_map, 1, 1, 1, "", "", None,
+                             0, False, False)
     return rt.LLMRuntime(args.engine, "", lora_map, "", None, False, False)
 
 
@@ -471,8 +524,25 @@ def run_greedy_check(rt, runtime, base_outputs=None):
         if len(base_outputs) != len(outputs):
             match = 0.0
         else:
-            match = sum(1 for a, b in zip(base_outputs, outputs) if a == b) / len(outputs)
+            match = sum(1 for a, b in zip(base_outputs, outputs)
+                        if a == b) / len(outputs)
     return outputs, match
+
+
+def load_rt_module(build_dir):
+    """Load the pybind runtime module: plugin lib via ctypes, then the module.
+
+    The plugin load is skipped when LORA_BENCH_SKIP_PLUGIN_LOAD=1 so tests can
+    run main() with a fake module; the real bench always loads the plugin.
+    """
+    if os.environ.get("LORA_BENCH_SKIP_PLUGIN_LOAD") != "1":
+        ctypes.CDLL(os.path.join(build_dir, "libNvInfer_edgellm_plugin.so"),
+                    mode=ctypes.RTLD_GLOBAL)
+    if build_dir not in sys.path:
+        sys.path.insert(0, os.path.join(build_dir, "pybind"))
+    import _edgellm_runtime as rt  # noqa: E402  (CUDA/TensorRT - never imported by tests)
+
+    return rt
 
 
 def main(argv=None):
@@ -482,9 +552,7 @@ def main(argv=None):
     lengths = parse_ttft_lengths(args.ttft_lengths)
 
     build_dir = os.path.abspath(args.build_dir)
-    ctypes.CDLL(os.path.join(build_dir, "libNvInfer_edgellm_plugin.so"), mode=ctypes.RTLD_GLOBAL)
-    sys.path.insert(0, os.path.join(build_dir, "pybind"))
-    import _edgellm_runtime as rt  # noqa: E402  (CUDA/TensorRT - never imported by tests)
+    rt = load_rt_module(build_dir)
 
     engine_tokenizer = os.path.join(args.engine, "llm", "tokenizer.json")
     tokenizer = None
@@ -493,7 +561,9 @@ def main(argv=None):
 
         tokenizer = Tokenizer.from_file(engine_tokenizer)
     except Exception:  # noqa: BLE001 - bench continues with estimated counts
-        print(f"WARNING: no tokenizer at {engine_tokenizer}; prompt_tokens will be estimates", file=sys.stderr)
+        print(
+            f"WARNING: no tokenizer at {engine_tokenizer}; prompt_tokens will be estimates",
+            file=sys.stderr)
 
     # lora_weights_map: adapter name -> adapter directory.
     # Tag ordering: base first, then adapters in the order given.
@@ -511,19 +581,21 @@ def main(argv=None):
         try:
             import resource  # noqa: E402
 
-            peak_rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+            peak_rss_mb = resource.getrusage(
+                resource.RUSAGE_SELF).ru_maxrss / 1024.0
         except ImportError:
             pass
 
         # --- tool-prompt TTFT (original probe behavior) --------------------
         req = make_tool_request(rt, TOOL_PROMPT)
         t0 = time.perf_counter()
-        resp = runtime.handle_request(req)
+        runtime.handle_request(req)
         ttft_tool_ms = (time.perf_counter() - t0) * 1000.0
 
         # --- decode ---------------------------------------------------------
         decode_prompt = DECODE_PROMPTS[0]
-        prompt_tokens, generated, seconds, _ = run_decode(rt, runtime, decode_prompt)
+        prompt_tokens, generated, seconds, _ = run_decode(
+            rt, runtime, decode_prompt)
 
         # --- TTFT sweep -----------------------------------------------------
         sweep = run_ttft_sweep(rt, runtime, lengths, args.reps, tokenizer)
@@ -537,15 +609,17 @@ def main(argv=None):
         if args.mtp:
             rt.set_profiling_enabled(True)
             try:
-                _, metrics_generated, _, _ = run_decode(rt, runtime, decode_prompt)
+                _, metrics_generated, _, _ = run_decode(
+                    rt, runtime, decode_prompt)
                 spec_metrics = read_spec_metrics(runtime)
             finally:
                 rt.set_profiling_enabled(False)
             if spec_metrics is None or spec_metrics["total_iterations"] <= 0:
-                print("ERROR: MTP engine reported zero spec-decode iterations "
-                      "(profiling was enabled for the metrics pass); "
-                      "cannot compute tokens_per_verify_step",
-                      file=sys.stderr)
+                print(
+                    "ERROR: MTP engine reported zero spec-decode iterations "
+                    "(profiling was enabled for the metrics pass); "
+                    "cannot compute tokens_per_verify_step",
+                    file=sys.stderr)
                 return 2
             # Counters accumulate across every handle_request on this
             # runtime; the timed runs ran with profiling off, so the deltas
@@ -554,7 +628,9 @@ def main(argv=None):
                 spec_metrics["total_generated_tokens"] = metrics_generated
 
         # --- greedy check ---------------------------------------------------
-        outputs, match = run_greedy_check(rt, runtime, base_outputs=base_outputs)
+        outputs, match = run_greedy_check(rt,
+                                          runtime,
+                                          base_outputs=base_outputs)
         if base_outputs is None:
             base_outputs = outputs
 
@@ -575,13 +651,16 @@ def main(argv=None):
                                  greedy_match=match)
         # --skip-outputs keeps generated texts out of the record; only the
         # per-prompt token counts are retained for the greedy comparison.
-        record["outputs"] = None if args.skip_outputs else [len(o) for o in outputs]
+        record["outputs"] = None if args.skip_outputs else [
+            len(o) for o in outputs
+        ]
         records.append(record)
 
-        print(f"[{tag}] ttft_tool={record['ttft_ms_tool']:.1f}ms "
-              f"decode={record['decode_tok_s']}tok/s "
-              f"tpv={record['tokens_per_verify_step']}",
-              flush=True)
+        print(
+            f"[{tag}] ttft_tool={record['ttft_ms_tool']:.1f}ms "
+            f"decode={record['decode_tok_s']}tok/s "
+            f"tpv={record['tokens_per_verify_step']}",
+            flush=True)
         del runtime
 
     lines = "".join(json.dumps(r) + "\n" for r in records)
