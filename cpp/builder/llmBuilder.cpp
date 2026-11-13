@@ -73,6 +73,51 @@ bool isSpecDecodeDraft(Json const& config, char const* type)
 //! ONNX; dspark uses the DSpark draft) are the only engines that contain a plugin
 //! declaring aliased I/O: DFlashTargetKVCacheUpdatePlugin's present KV pool aliases
 //! its past KV pool. No other engine needs the kALIASED_PLUGIN_IO preview.
+//! True when `layer` is a V3 plugin layer named `pluginName`.
+bool isPluginLayer(nvinfer1::ILayer* layer, char const* pluginName)
+{
+    if (layer == nullptr || layer->getType() != nvinfer1::LayerType::kPLUGIN_V3)
+    {
+        return false;
+    }
+    auto& plugin = static_cast<nvinfer1::IPluginV3Layer*>(layer)->getPlugin();
+    auto* core
+        = static_cast<nvinfer1::IPluginV3OneCore*>(plugin.getCapabilityInterface(nvinfer1::PluginCapabilityType::kCORE));
+    return core != nullptr && std::string(core->getPluginName()) == pluginName;
+}
+
+//! True when the network has LoRA inputs and every layer that reads one is a LoraGroupPlugin,
+//! so every LoRA target is applied in place and skipped when bound at rank 0. A graph that
+//! mixes plugin and MatMul branches returns false.
+bool allLoraBranchesGrouped(nvinfer1::INetworkDefinition const& network)
+{
+    bool sawLoraInput = false;
+    for (int32_t i = 0; i < network.getNbLayers(); ++i)
+    {
+        auto* layer = network.getLayer(i);
+        bool const grouped = isPluginLayer(layer, "LoraGroupPlugin");
+        for (int32_t j = 0; j < layer->getNbInputs(); ++j)
+        {
+            auto const* tensor = layer->getInput(j);
+            if (tensor == nullptr || !tensor->isNetworkInput())
+            {
+                continue;
+            }
+            std::string const name = tensor->getName();
+            if (name.find(".lora_A.") == std::string::npos && name.find(".lora_B.") == std::string::npos)
+            {
+                continue;
+            }
+            sawLoraInput = true;
+            if (!grouped)
+            {
+                return false;
+            }
+        }
+    }
+    return sawLoraInput;
+}
+
 bool usesAliasedPluginIO(Json const& config)
 {
     return isSpecDecodeDraft(config, "dflash") || isSpecDecodeDraft(config, "dflash2")
@@ -391,8 +436,15 @@ bool LLMBuilder::build()
     ELLM_CHECK(getInputRank(*network, binding_names::kInputsEmbeds) == 2,
         "LLMBuilder: inputs_embeds must be rank-2 [physical_tokens, hidden_size]. Re-export the model.");
 
+    // LoraGroupPlugin adds the LoRA residual in place (aliased plugin I/O).
+    bool const loraGroupPlugin = mBuilderConfig.maxLoraRank > 0 && allLoraBranchesGrouped(*network);
+    if (loraGroupPlugin)
+    {
+        LOG_INFO("LoRA branches are LoraGroupPlugin nodes: aliased plugin I/O enabled");
+    }
+
     // Create builder config
-    auto config = createBuilderConfig(builder.get(), usesAliasedPluginIO(mModelConfig));
+    auto config = createBuilderConfig(builder.get(), usesAliasedPluginIO(mModelConfig) || loraGroupPlugin);
     if (!config)
     {
         return false;
