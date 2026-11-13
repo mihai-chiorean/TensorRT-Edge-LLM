@@ -309,6 +309,7 @@ void DecodingInferenceContext::initialize(int32_t batchSize, int32_t maxGenLengt
     diffusionMaxDenoisingSteps = 0;
     activeBatchSize = batchSize;
     loraWeightsName = loraName;
+    loraCacheIdentity.clear();
     stream = cudaStream;
 }
 

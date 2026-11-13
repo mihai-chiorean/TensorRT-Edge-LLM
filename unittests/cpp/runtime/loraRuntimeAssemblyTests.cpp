@@ -145,6 +145,19 @@ TEST_F(LoraRuntimeAssemblyTest, RankFittingAdapterAssembles)
     EXPECT_STREQ(runtime.getSpeculativeDecodingStrategyName(), "vanilla");
 }
 
+//! System-prompt warm-up for an adapter the runtime never loaded is refused, not thrown, so a caller's bad
+//! adapter name cannot take down the process (the request path fails the same way).
+TEST_F(LoraRuntimeAssemblyTest, SystemPromptWarmupForUnknownAdapterIsRefused)
+{
+    std::filesystem::path const adapterPath = mModelDir / "adapter_rank8.safetensors";
+    writeAdapter(adapterPath, kMaxLoraRank, mStream);
+    auto runtime = makeRuntime(makeArtifacts(makeLoraEngine()), "adapter_rank8");
+
+    bool saved = true;
+    EXPECT_NO_THROW(saved = runtime.genAndSaveSystemPromptKVCache("You are a robot.", "missing", mStream));
+    EXPECT_FALSE(saved);
+}
+
 //! The same deployment built without LoRA inputs.
 class RankZeroLoraRuntimeAssemblyTest : public LoraRuntimeAssemblyTest
 {

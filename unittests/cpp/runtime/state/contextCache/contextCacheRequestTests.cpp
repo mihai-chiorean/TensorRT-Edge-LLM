@@ -190,12 +190,13 @@ std::unique_ptr<KVPageTable> makePageTable(HybridCacheManager& cache, cudaStream
     return table;
 }
 
-DecodingInferenceContext makeContext(
-    std::vector<std::vector<int32_t>> inputs, cudaStream_t stream, std::string const& loraName = "")
+DecodingInferenceContext makeContext(std::vector<std::vector<int32_t>> inputs, cudaStream_t stream,
+    std::string const& loraName = "", std::string const& loraCacheIdentity = "")
 {
     DecodingInferenceContext context;
     context.initialize(static_cast<int32_t>(inputs.size()), kMAX_GENERATE_LENGTH, std::nullopt,
         rt::OptionalInputTensors{}, loraName, stream);
+    context.loraCacheIdentity = loraCacheIdentity;
     context.rawBatchedInputIds = std::move(inputs);
     context.outputThinkerEmbeddings = false;
     return context;
@@ -271,26 +272,65 @@ protected:
     std::unique_ptr<ContextCacheCoordinator> mCoordinator;
 };
 
+constexpr char const* kIdentityA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+constexpr char const* kIdentityB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
 TEST_F(ContextCacheRequestTests, ColdPublishThenWarmLookupPreservesLoraIdentity)
 {
-    DecodingInferenceContext producerContext = makeContext({makeTokens(129)}, mStream, "adapter-a");
+    DecodingInferenceContext producerContext = makeContext({makeTokens(129)}, mStream, "adapter-a", kIdentityA);
     auto producer = begin(producerContext);
     ASSERT_TRUE(producer.has_value());
     EXPECT_EQ(producer->prefillStarts(), std::vector<int32_t>{0});
     completeRuntimePrefill(*producer, producerContext);
     ASSERT_TRUE(producer->finish());
 
-    DecodingInferenceContext consumerContext = makeContext({makeTokens(130)}, mStream, "adapter-a");
+    DecodingInferenceContext consumerContext = makeContext({makeTokens(130)}, mStream, "adapter-a", kIdentityA);
     auto consumer = begin(consumerContext);
     ASSERT_TRUE(consumer.has_value());
     EXPECT_EQ(consumer->prefillStarts(), std::vector<int32_t>{kTOKENS_PER_PAGE});
     ASSERT_TRUE(consumer->finish());
 
-    DecodingInferenceContext isolatedContext = makeContext({makeTokens(130)}, mStream, "adapter-b");
+    DecodingInferenceContext isolatedContext = makeContext({makeTokens(130)}, mStream, "adapter-b", kIdentityB);
     auto isolated = begin(isolatedContext);
     ASSERT_TRUE(isolated.has_value());
     EXPECT_EQ(isolated->prefillStarts(), std::vector<int32_t>{0});
     ASSERT_TRUE(isolated->finish());
+}
+
+//! Replacing an adapter under the same name changes its content identity; the KV state the old weights produced
+//! must not be reused, while identical weights under another name may share it.
+TEST_F(ContextCacheRequestTests, ReplacedAdapterUnderSameNameDoesNotReuseKv)
+{
+    DecodingInferenceContext producerContext = makeContext({makeTokens(129)}, mStream, "tool", kIdentityA);
+    auto producer = begin(producerContext);
+    ASSERT_TRUE(producer.has_value());
+    completeRuntimePrefill(*producer, producerContext);
+    ASSERT_TRUE(producer->finish());
+
+    DecodingInferenceContext sameContext = makeContext({makeTokens(130)}, mStream, "tool", kIdentityA);
+    auto same = begin(sameContext);
+    ASSERT_TRUE(same.has_value());
+    EXPECT_EQ(same->prefillStarts(), std::vector<int32_t>{kTOKENS_PER_PAGE});
+    ASSERT_TRUE(same->finish());
+
+    DecodingInferenceContext replacedContext = makeContext({makeTokens(130)}, mStream, "tool", kIdentityB);
+    auto replaced = begin(replacedContext);
+    ASSERT_TRUE(replaced.has_value());
+    EXPECT_EQ(replaced->prefillStarts(), std::vector<int32_t>{0});
+    ASSERT_TRUE(replaced->finish());
+
+    DecodingInferenceContext aliasContext = makeContext({makeTokens(130)}, mStream, "other", kIdentityA);
+    auto alias = begin(aliasContext);
+    ASSERT_TRUE(alias.has_value());
+    EXPECT_EQ(alias->prefillStarts(), std::vector<int32_t>{kTOKENS_PER_PAGE});
+    ASSERT_TRUE(alias->finish());
+}
+
+//! A LoRA request whose identity was never resolved fails closed instead of sharing base or other KV state.
+TEST_F(ContextCacheRequestTests, LoraRequestWithoutIdentityIsRefused)
+{
+    DecodingInferenceContext context = makeContext({makeTokens(129)}, mStream, "tool");
+    EXPECT_THROW(begin(context), std::runtime_error);
 }
 
 TEST_F(ContextCacheRequestTests, RequestLookupPolicyOverridesBatchDefaultPerSequence)

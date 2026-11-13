@@ -453,4 +453,82 @@ TEST_F(LoRAManagerTest, DummyTensorReturnedWhenNoAdapterActive)
     EXPECT_EQ(dummy.getDeviceType(), DeviceType::kGPU);
 }
 
+//! An FP16 GPU tensor whose every element holds the bit pattern @p bits, with element @p poke
+//! (when non-negative) set to @p pokeBits instead.
+rt::Tensor makeFilledGpuTensor(rt::Coords const& shape, std::string const& name, uint16_t bits, int64_t poke = -1,
+    uint16_t pokeBits = 0)
+{
+    std::vector<uint16_t> host(static_cast<size_t>(shape.volume()), bits);
+    if (poke >= 0)
+    {
+        host[static_cast<size_t>(poke)] = pokeBits;
+    }
+    rt::Tensor tensor(shape, DeviceType::kGPU, nvinfer1::DataType::kHALF, name);
+    CUDA_CHECK(cudaMemcpy(tensor.rawPointer(), host.data(), host.size() * sizeof(uint16_t), cudaMemcpyHostToDevice));
+    return tensor;
+}
+
+//! The two-tensor adapter writeAdapterFile() produces (both factors 0x3800), registered directly.
+std::map<std::string, rt::Tensor> filledWeights(int64_t rank, std::string const& aName = "lora_A_layer_0",
+    std::string const& bName = "lora_B_layer_0", int64_t pokeB = -1)
+{
+    std::map<std::string, rt::Tensor> weights;
+    weights.emplace(aName, makeFilledGpuTensor({kHiddenSize, rank}, aName, 0x3800));
+    weights.emplace(bName, makeFilledGpuTensor({rank, kHiddenSize}, bName, 0x3800, pokeB, 0x3C00));
+    return weights;
+}
+
+//! Identity depends on content only: equal weights under two names share it.
+TEST_F(LoRAManagerTest, AdapterIdentityIgnoresAdapterName)
+{
+    LoRAManager mgr(kMaxLoraRank);
+    mgr.addWeights("tool", filledWeights(4));
+    mgr.addWeights("copy", filledWeights(4));
+
+    std::string const& identity = mgr.getAdapterIdentity("tool");
+    EXPECT_EQ(identity.size(), 32u);
+    EXPECT_EQ(identity.find_first_not_of("0123456789abcdef"), std::string::npos);
+    EXPECT_EQ(identity, mgr.getAdapterIdentity("copy"));
+}
+
+//! One changed element is a different adapter: replacing weights under a name must change cache keys.
+TEST_F(LoRAManagerTest, AdapterIdentityChangesWithOneElement)
+{
+    LoRAManager mgr(kMaxLoraRank);
+    mgr.addWeights("v1", filledWeights(4));
+    mgr.addWeights("v2", filledWeights(4, "lora_A_layer_0", "lora_B_layer_0", /*pokeB=*/17));
+
+    EXPECT_NE(mgr.getAdapterIdentity("v1"), mgr.getAdapterIdentity("v2"));
+}
+
+//! The same values bound to different engine inputs are a different adapter.
+TEST_F(LoRAManagerTest, AdapterIdentityChangesWithTensorName)
+{
+    LoRAManager mgr(kMaxLoraRank);
+    mgr.addWeights("layer0", filledWeights(4));
+    mgr.addWeights("layer1", filledWeights(4, "lora_A_layer_1", "lora_B_layer_1"));
+
+    EXPECT_NE(mgr.getAdapterIdentity("layer0"), mgr.getAdapterIdentity("layer1"));
+}
+
+//! A file loaded from disk and the same tensors registered in memory have one identity.
+TEST_F(LoRAManagerTest, AdapterIdentityMatchesBetweenFileAndMemory)
+{
+    auto const dir = makeScratchDir("loraManagerTest");
+    writeAdapterFile(dir / "adapter.safetensors", 4);
+
+    LoRAManager mgr(kMaxLoraRank);
+    mgr.loadWeights("fromFile", dir / "adapter.safetensors", mStream);
+    mgr.addWeights("fromMemory", filledWeights(4));
+
+    EXPECT_EQ(mgr.getAdapterIdentity("fromFile"), mgr.getAdapterIdentity("fromMemory"));
+    std::filesystem::remove_all(dir);
+}
+
+TEST_F(LoRAManagerTest, AdapterIdentityOfUnknownAdapterThrows)
+{
+    LoRAManager mgr(kMaxLoraRank);
+    EXPECT_THROW(mgr.getAdapterIdentity("missing"), std::runtime_error);
+}
+
 } // namespace

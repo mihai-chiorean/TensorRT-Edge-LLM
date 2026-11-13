@@ -535,6 +535,9 @@ private:
     //! false but capture continues for remaining adapters (graceful degrade).
     bool captureBaseGraphWithLoraFanout(InferenceDims const& dims, cudaStream_t stream);
 
+    //! Content identity of the named adapter for cache keys; empty for the base model.
+    std::string resolveLoraCacheIdentity(std::string const& loraWeightsName) const;
+
     //! @brief Build the strategy runtime reference bundle after common resources are allocated.
     void buildDecodingRuntimeContext();
 

@@ -203,6 +203,8 @@ struct DecodingInferenceContext
     int32_t diffusionMaxDenoisingSteps{0}; //!< Optional DiffusionGemma denoise-step override (0 = runtime default)
     int32_t activeBatchSize{};             //!< Current active batch size
     std::string loraWeightsName{""};       //!< LoRA adapter name used by this request
+    //! Content identity of the active LoRA adapter; keys every adapter-dependent cache; empty for the base model.
+    std::string loraCacheIdentity{""};
     cudaStream_t stream{};                 //!< CUDA stream
 
     float temperature{1.0f};              //!< Temperature for sampling
