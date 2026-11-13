@@ -519,10 +519,13 @@ def _read_adapter_config(config_path: str) -> dict:
 def _check_adapter_config(config: dict) -> Tuple[float, int]:
     """Return ``(lora_alpha, r)`` after refusing adapter features the runtime
     does not implement."""
+    # Layer selections are refused whenever set: 0 is a valid layer index.
+    layer_keys = ("layers_to_transform", "layers_pattern")
     unsupported = [
         f"{key} ({reason})"
         for key, reason in _UNSUPPORTED_ADAPTER_FEATURES.items()
-        if config.get(key)
+        if (config.get(key) is not None and config.get(key) != []
+            if key in layer_keys else config.get(key))
     ]
     if config.get("bias", "none") != "none":
         unsupported.append(
