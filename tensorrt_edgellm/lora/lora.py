@@ -1112,6 +1112,7 @@ def process_lora_weights_and_save(
             processed_tensors[f"{stem}.lora_B.weight"] = tensors["B"]
 
     provenance = {
+        "processing_schema_version": 1,
         "source_adapter_dir": os.path.abspath(input_dir),
         "adapter_model_sha256": _sha256(safetensor_path),
         "base_model_name_or_path": config.get("base_model_name_or_path"),

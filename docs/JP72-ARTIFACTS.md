@@ -288,6 +288,24 @@ the same `--lora-targets` flag.
 For the attention+MLP tool adapter (PEFT r 16, alpha 32, 258 modules): 258
 bound, 0 unused, 85 PLE bindings unbound, 69,822,824 bytes FP16.
 
+Package each processed adapter for the engine directory it will run with, after
+the engine is built and staged:
+
+```bash
+# once per engine directory (rerun after any engine, table or tokenizer change)
+tensorrt-edgellm-lora-package base-identity --engine-dir $E/llm
+# per adapter, after copying it to $E/llm/lora_weights/<name>/
+tensorrt-edgellm-lora-package adapter --engine-dir $E/llm \
+  --adapter-dir $E/llm/lora_weights/<name> --version <version>
+# before shipping
+tensorrt-edgellm-lora-package verify --engine-dir $E/llm --full
+```
+
+The server refuses an adapter without a manifest for the deployed base
+identity; see the LoRA section of the experimental server guide. Rebuilding or
+re-exporting the engine changes the identity, so every adapter must be
+packaged again.
+
 ## Target capacity
 
 Capacity is **not** baked into these artifacts. `--max-kv-cache-capacity` in
