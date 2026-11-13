@@ -65,3 +65,23 @@ TEST(TensorMapTest, AllNames)
     auto names = map.allNames();
     EXPECT_EQ(names.size(), 2u);
 }
+
+//! Callers cache name lookups by generation: it must move when a name is added or repointed, and
+//! must not move when a name is set to the tensor it already holds (the per-request LoRA refresh).
+TEST(TensorMapTest, GenerationTracksPointerChangesOnly)
+{
+    Tensor a{Coords{2}, DeviceType::kCPU, nvinfer1::DataType::kFLOAT};
+    Tensor b{Coords{2}, DeviceType::kCPU, nvinfer1::DataType::kFLOAT};
+    TensorMap map;
+    uint64_t const g0 = map.generation();
+    map.set("x", a);
+    uint64_t const g1 = map.generation();
+    EXPECT_NE(g1, g0);
+    map.set("x", a);
+    EXPECT_EQ(map.generation(), g1);
+    map.set("x", b);
+    uint64_t const g2 = map.generation();
+    EXPECT_NE(g2, g1);
+    map.set("y", b);
+    EXPECT_NE(map.generation(), g2);
+}

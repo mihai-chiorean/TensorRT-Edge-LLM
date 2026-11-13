@@ -56,6 +56,7 @@ struct MapBinding
     bool valid{false};
     uintptr_t address{0};
     nvinfer1::Dims dims{};
+    Tensor* tensor{nullptr}; //!< TensorMap entry resolved for the generation in MapBindingCache
 };
 
 /*!
@@ -106,6 +107,12 @@ public:
      */
     bool apply(TensorMap const& map, BindingTarget& target);
 
+    //! @brief Whether the last apply() called any setter.
+    bool lastApplyChanged() const noexcept
+    {
+        return mLastApplyChanged;
+    }
+
     /*!
      * @brief Cached address and dims for the map binding at I/O position @p ioIndex.
      *
@@ -121,8 +128,25 @@ public:
         return mLastFailedBinding;
     }
 
+    //! @brief Applied map bindings, in engine I/O order of the map-bound positions.
+    std::vector<MapBinding> const& bindings() const noexcept
+    {
+        return mMapBindings;
+    }
+
+    //! @brief Position in bindings() of I/O index @p ioIndex, or -1 when registry-bound.
+    int32_t mapIndex(int32_t ioIndex) const noexcept
+    {
+        size_t const index = static_cast<size_t>(ioIndex);
+        return index < mMapBindingIndex.size() ? mMapBindingIndex[index] : -1;
+    }
+
 private:
     char const* mLastFailedBinding{nullptr};
+    bool mLastApplyChanged{false};
+    //! TensorMap and generation the cached Tensor pointers were resolved against.
+    TensorMap const* mResolvedMap{nullptr};
+    uint64_t mResolvedGeneration{0};
     std::vector<MapBinding> mMapBindings;
     //! Per I/O index: position in mMapBindings, or -1 for a registry-bound tensor.
     std::vector<int32_t> mMapBindingIndex;

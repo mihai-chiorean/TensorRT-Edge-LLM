@@ -18,6 +18,7 @@
 #include "runtime/exec/tensorRegistry.h"
 #include "common/checkMacros.h"
 #include "common/logger.h"
+#include "common/trtUtils.h"
 #include <algorithm>
 #include <cstdio>
 #include <stdexcept>
@@ -132,39 +133,64 @@ nvinfer1::Dims TensorRegistry::resolveShape(
     return dims;
 }
 
-bool TensorRegistry::bindAll(
-    nvinfer1::IExecutionContext* ctx, TensorMap const& tensorMap, InferenceDims const& inferenceDims) const
+bool TensorRegistry::bindAll(BindingTarget& target, TensorMap const& tensorMap, InferenceDims const& inferenceDims,
+    BindingCache& cache, bool& changed) const
 {
-    bool success = true;
-    for (auto const& spec : allExpandedSpecs())
+    changed = false;
+    auto const& specs = allExpandedSpecs();
+    if (cache.entries.size() != specs.size())
     {
-        Tensor* tensor = tensorMap.get(spec.name);
+        cache.entries.assign(specs.size(), BindingCache::Entry{});
+        cache.map = nullptr;
+    }
+    bool const resolve = cache.map != &tensorMap || cache.generation != tensorMap.generation();
+    bool success = true;
+    for (size_t i = 0; i < specs.size(); ++i)
+    {
+        auto const& spec = specs[i];
+        auto& entry = cache.entries[i];
+        if (resolve)
+        {
+            entry.tensor = tensorMap.get(spec.name);
+        }
+        Tensor* tensor = entry.tensor;
         if (!tensor)
         {
             LOG_ERROR("tensor '%s' not in tensorMap", spec.name.c_str());
+            entry.valid = false;
             success = false;
             continue;
         }
-        if (!ctx->setTensorAddress(spec.name.c_str(), tensor->rawPointer()))
+        auto const address = reinterpret_cast<uintptr_t>(tensor->rawPointer());
+        nvinfer1::Dims dims{};
+        if (spec.io == TensorIO::kInput)
+        {
+            dims = resolveShape(spec.shape, inferenceDims);
+        }
+        if (entry.valid && entry.address == address && (spec.io != TensorIO::kInput || dimsEqual(entry.dims, dims)))
+        {
+            continue;
+        }
+        entry.valid = false;
+        changed = true;
+        if (!target.setTensorAddress(spec.name.c_str(), tensor->rawPointer()))
         {
             LOG_ERROR("setTensorAddress failed for '%s'", spec.name.c_str());
             success = false;
             continue;
         }
-        if (spec.io == TensorIO::kInput)
+        if (spec.io == TensorIO::kInput && !target.setInputShape(spec.name.c_str(), dims))
         {
-            // Resolve the input shape from symbolic dimensions. This is necessary
-            // because some tensors (e.g. KV cache) are allocated at maxBatchSize
-            // but need their input shape set to activeBatchSize for TRT execution.
-            // Tensors with all-fixed shapes are returned as-is.
-            auto dims = resolveShape(spec.shape, inferenceDims);
-            if (!ctx->setInputShape(spec.name.c_str(), dims))
-            {
-                LOG_ERROR("setInputShape failed for '%s'", spec.name.c_str());
-                success = false;
-            }
+            LOG_ERROR("setInputShape failed for '%s'", spec.name.c_str());
+            success = false;
+            continue;
         }
+        entry.address = address;
+        entry.dims = dims;
+        entry.valid = true;
     }
+    cache.map = success ? &tensorMap : nullptr;
+    cache.generation = tensorMap.generation();
     return success;
 }
 
