@@ -729,6 +729,9 @@ def _process_tensor(tensor: torch.Tensor, key: str, lora_alpha: float,
 
 
 INT8_LORA_FORMAT = "int8_per_channel_v1"
+_FP16_MIN_SUBNORMAL = 2.0**-24
+# Largest FP16 value s with 127 * s still finite once rounded to FP16.
+_INT8_MAX_SCALE = 515.5
 _WEIGHT_FORMATS = ("fp16", "int8")
 
 
@@ -737,14 +740,21 @@ def _quantize_int8_per_column(tensor: torch.Tensor):
     factor; a zero column gets scale 1 and zero codes. Returns
     ``(codes, scales, relative Frobenius error of the dequantized factor)``."""
     weights = tensor.float()
-    scale = weights.abs().amax(dim=0) / 127.0
-    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+    amax = weights.abs().amax(dim=0)
+    scale = amax / 127.0
+    # Keep 127 * scale finite after FP16 rounding (FP16 max 65504) and keep a
+    # tiny non-zero column's scale above the smallest FP16 subnormal.
+    scale = torch.clamp(scale, min=_FP16_MIN_SUBNORMAL, max=_INT8_MAX_SCALE)
+    scale = torch.where(amax > 0, scale, torch.ones_like(scale))
     scale16 = scale.to(torch.float16)
     if not torch.isfinite(scale16).all() or not (scale16 > 0).all():
         raise ValueError("INT8 scale is not a positive finite FP16 value")
     codes = torch.clamp(torch.round(weights / scale16.float()), -127,
                         127).to(torch.int8)
-    dequant = codes.float() * scale16.float()
+    # What the runtime registers: float(code) * float(scale) rounded to FP16.
+    dequant = (codes.float() * scale16.float()).to(torch.float16).float()
+    if not torch.isfinite(dequant).all():
+        raise ValueError("INT8 reconstruction overflows FP16")
     norm = torch.linalg.norm(weights)
     error = float(torch.linalg.norm(dequant - weights) /
                   norm) if norm > 0 else 0.0

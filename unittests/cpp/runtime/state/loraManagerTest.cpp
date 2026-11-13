@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <vector>
 
 using namespace trt_edgellm;
@@ -704,6 +705,37 @@ TEST_F(LoRAManagerTest, MalformedInt8AdaptersThrow)
     mixed.pop_back(); // the B scale
     expectThrow(mixed, "mixedFp16Int8");
 
+    std::filesystem::remove_all(dir);
+}
+
+//! A header whose INT8 payload is shorter than its shape is refused before the loader reads past it.
+TEST_F(LoRAManagerTest, Int8PayloadShorterThanItsShapeThrows)
+{
+    auto const dir = makeScratchDir("loraManagerTest");
+    // lora_A [64, 4] I8 needs 256 bytes but is given 10; lora_B and both scales are well-formed.
+    std::string const header = R"({"lora_A_layer_0":{"dtype":"I8","shape":[64,4],"data_offsets":[0,10]},)"
+                               R"("lora_A_layer_0_scale":{"dtype":"F16","shape":[4],"data_offsets":[10,18]},)"
+                               R"("lora_B_layer_0":{"dtype":"I8","shape":[4,64],"data_offsets":[18,274]},)"
+                               R"("lora_B_layer_0_scale":{"dtype":"F16","shape":[64],"data_offsets":[274,402]}})";
+    uint64_t const headerSize = header.size();
+    std::vector<char> payload(402, 0);
+    for (size_t i = 10; i < 18; i += 2)
+    {
+        payload[i + 1] = 0x3C; // FP16 1.0 scales
+    }
+    for (size_t i = 274; i < 402; i += 2)
+    {
+        payload[i + 1] = 0x3C;
+    }
+    {
+        std::ofstream out(dir / "short.safetensors", std::ios::binary);
+        out.write(reinterpret_cast<char const*>(&headerSize), sizeof(headerSize));
+        out.write(header.data(), static_cast<std::streamsize>(header.size()));
+        out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+    }
+
+    LoRAManager mgr(kMaxLoraRank);
+    EXPECT_THROW(mgr.loadWeights("short", dir / "short.safetensors", mStream), std::runtime_error);
     std::filesystem::remove_all(dir);
 }
 

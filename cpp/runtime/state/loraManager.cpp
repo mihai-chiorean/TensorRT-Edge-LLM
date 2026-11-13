@@ -33,6 +33,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cuda_fp16.h>
+#include <limits>
 #include <memory>
 #include <set>
 #include <stdexcept>
@@ -269,8 +270,12 @@ std::vector<HostFactor> readHostFactors(
         safetensors::TensorMetadata const& scale = *scaleIt->second;
         int64_t const rows = entry->shape[0];
         int64_t const columns = entry->shape[1];
+        ELLM_CHECK(rows > 0 && columns > 0 && rows <= std::numeric_limits<int64_t>::max() / columns
+                && entry->bytes == static_cast<size_t>(rows * columns),
+            "LoRAManager: adapter '" + adapterName + "' INT8 tensor '" + name + "' payload is "
+                + std::to_string(entry->bytes) + " bytes, not rows x columns");
         ELLM_CHECK(scale.dataType == nvinfer1::DataType::kHALF && scale.shape.getNumDims() == 1
-                && scale.shape[0] == columns,
+                && scale.shape[0] == columns && scale.bytes == static_cast<size_t>(columns) * sizeof(uint16_t),
             "LoRAManager: adapter '" + adapterName + "' scale '" + scale.name + "' must be FP16 with "
                 + std::to_string(columns) + " elements");
         auto const* codes = static_cast<int8_t const*>(static_cast<void const*>(payloadOf(*entry)));

@@ -472,9 +472,10 @@ def test_int8_transport_writes_codes_and_per_column_scales(tmp_path):
         codes, scale = tensors[name], tensors[name + "_scale"]
         assert codes.dtype == torch.int8 and codes.shape == weight.shape
         assert scale.dtype == torch.float16 and scale.shape == (weight.shape[-1], )
-        dequant = codes.float() * scale.float()
+        dequant = (codes.float() * scale.float()).half().float()
+        # Rounding to the code grid, then the runtime's FP16 rounding.
         assert torch.all((dequant - weight.float()).abs() <= scale.float() / 2 +
-                         1e-6)
+                         weight.float().abs() * 2.0**-10 + 1e-7)
     record = json.loads((tmp_path / "int8" / "config.json").read_text())
     processing = record["edgellm_lora_processing"]
     assert processing["weight_format"] == "int8_per_channel_v1"
@@ -518,3 +519,20 @@ def test_unknown_weight_format_is_refused(tmp_path):
         process_lora_weights_and_save(str(adapter),
                                       str(tmp_path / "out"),
                                       weight_format="int4")
+
+
+def test_int8_quantization_stays_finite_and_keeps_tiny_columns():
+    from tensorrt_edgellm.lora.lora import _quantize_int8_per_column
+    weight = torch.zeros((4, 3), dtype=torch.float16)
+    weight[0, 0] = 65504.0  # FP16 max
+    weight[1, 1] = 1.0132789611816406e-6  # needs a subnormal scale
+    weight[2, 2] = 1.0
+
+    codes, scales, error = _quantize_int8_per_column(weight)
+
+    dequant = (codes.float() * scales.float()).half()
+    assert torch.isfinite(dequant).all()
+    assert (scales > 0).all()
+    assert dequant[1, 1] != 0
+    assert dequant[2, 2] == 1.0
+    assert error < 0.01
