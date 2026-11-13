@@ -557,3 +557,63 @@ def test_stem_matches_whole_segments(target, selected):
     from tensorrt_edgellm.lora_targets import stem_matches_targets
     assert stem_matches_targets("model.layers.0.self_attn.q_proj",
                                 (target, )) is selected
+
+
+def _mxfp8_dynamo_model(onnx_dir, stem="model.layers.0.mlp.up_proj"):
+    """One MXFP8 linear as the dynamo exporter emits it: activation
+    DynamicQuantize -> Dequantize, weight Dequantize -> Transpose, and a MatMul
+    named ``node_MatMul_3`` that carries no module path."""
+    hidden = gs.Variable("hidden", dtype=np.float16, shape=["tokens", 32])
+    x_f8 = gs.Variable("x_f8", dtype=np.uint8, shape=["tokens", 32])
+    x_scale = gs.Variable("x_scale", dtype=np.uint8, shape=["tokens", 1])
+    x_dq = gs.Variable("x_dq", dtype=np.float16, shape=["tokens", 32])
+    weight = gs.Constant(f"_model.{stem}.weight",
+                         values=np.zeros((64, 32), dtype=np.uint8))
+    weight_scale = gs.Constant("weight_scale",
+                               values=np.zeros((64, 1), dtype=np.uint8))
+    w_dq = gs.Variable("w_dq", dtype=np.float16, shape=[64, 32])
+    w_t = gs.Variable("w_t", dtype=np.float16, shape=[32, 64])
+    output = gs.Variable("output", dtype=np.float16, shape=["tokens", 64])
+    nodes = [
+        gs.Node(op="TRT_MXFP8DynamicQuantize",
+                name="node_TRT_MXFP8DynamicQuantize_0",
+                inputs=[hidden],
+                outputs=[x_f8, x_scale]),
+        gs.Node(op="TRT_MXFP8DequantizeLinear",
+                name="node_TRT_MXFP8DequantizeLinear_1",
+                inputs=[x_f8, x_scale],
+                outputs=[x_dq]),
+        gs.Node(op="TRT_MXFP8DequantizeLinear",
+                name="node_TRT_MXFP8DequantizeLinear_2",
+                inputs=[weight, weight_scale],
+                outputs=[w_dq]),
+        gs.Node(op="Transpose",
+                name="node_Transpose_2",
+                attrs={"perm": [1, 0]},
+                inputs=[w_dq],
+                outputs=[w_t]),
+        gs.Node(op="MatMul",
+                name="node_MatMul_3",
+                inputs=[x_dq, w_t],
+                outputs=[output]),
+    ]
+    graph = gs.Graph(nodes=nodes, inputs=[hidden], outputs=[output])
+    onnx.save(gs.export_onnx(graph), onnx_dir / "model.onnx")
+
+
+def test_mxfp8_lora_inputs_are_named_after_the_weight_module(tmp_path):
+    _mxfp8_dynamo_model(tmp_path)
+
+    insert_lora_and_save(str(tmp_path))
+
+    stems, _ = _lora_input_stems(tmp_path)
+    assert stems == {"model.layers.0.mlp.up_proj"}
+
+
+def test_mxfp8_lora_targets_select_by_module(tmp_path):
+    _mxfp8_dynamo_model(tmp_path)
+
+    insert_lora_and_save(str(tmp_path), lora_targets=("mlp", ))
+
+    stems, _ = _lora_input_stems(tmp_path)
+    assert stems == {"model.layers.0.mlp.up_proj"}
