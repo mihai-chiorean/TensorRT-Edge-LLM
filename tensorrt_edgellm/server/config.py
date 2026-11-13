@@ -378,6 +378,7 @@ class ModelConfig:
         default_factory=ContextCacheConfig)
     ple_config: PleRuntimeConfig = field(default_factory=PleRuntimeConfig)
     enable_in_flight_batching: bool = False
+    require_cuda_graphs: bool = False
     ifb_scheduling_mode: str = "auto"
     max_num_tokens: int = 0
     max_chunk_tokens: int = 0
@@ -431,6 +432,7 @@ class ModelConfig:
             "context_cache_config": self.context_cache_config,
             "ple_config": self.ple_config,
             "enable_in_flight_batching": self.enable_in_flight_batching,
+            "require_cuda_graphs": self.require_cuda_graphs,
             **self.ifb_scheduling_kwargs(),
             "lora_adapters": list(self.lora_adapters),
             "lora_verify": self.lora_verify,
@@ -685,6 +687,13 @@ def create_argument_parser(
         "endpoints refuse).",
     )
     model.add_argument(
+        "--require-cuda-graphs",
+        action="store_true",
+        help=("Fail startup when decoding CUDA graph capture fails (base "
+              "model or any LoRA adapter). Without it the server starts and "
+              "/health lists the failure under degraded."),
+    )
+    model.add_argument(
         "--ifb-scheduling-mode",
         default="auto",
         help="With --enable-in-flight-batching, one of auto (default), mixed, "
@@ -884,6 +893,7 @@ def parse_server_config(argv: Optional[Sequence[str]] = None,
                                     cache_slots=args.ple_cache_slots,
                                     file_path=args.ple_file),
         enable_in_flight_batching=args.enable_in_flight_batching,
+        require_cuda_graphs=args.require_cuda_graphs,
         ifb_scheduling_mode=args.ifb_scheduling_mode,
         max_num_tokens=args.max_num_tokens,
         max_chunk_tokens=args.max_chunk_tokens,

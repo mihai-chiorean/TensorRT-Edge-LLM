@@ -116,6 +116,11 @@ async def health(request: Request):
     engine = client.engine_status()
     healthy = engine is None or engine["serving"]
     lora_info = getattr(client.llm, "lora_adapter_info", None)
+    graph_info = getattr(client.llm, "cuda_graph_info", None)
+    cuda_graphs = graph_info() if graph_info is not None else None
+    degraded = []
+    if cuda_graphs is not None and cuda_graphs.get("captured") is False:
+        degraded.append("cuda_graph_capture_failed")
     body = {
         "status": "healthy" if healthy else "unhealthy",
         "model": client.model_name,
@@ -144,6 +149,8 @@ async def health(request: Request):
             "context_reuse": caps.context_reuse,
             "in_flight_batching": caps.in_flight_batching,
         },
+        "cuda_graphs": cuda_graphs,
+        "degraded": degraded,
     }
     if not healthy:
         # The engine fails every request until the server restarts; 503 lets a liveness probe act on it.

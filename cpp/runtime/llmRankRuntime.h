@@ -565,6 +565,9 @@ public:
     //! Get context-cache metrics, or nullopt when the runtime cache is disabled.
     std::optional<ContextCacheMetrics> getContextCacheMetrics() const noexcept;
 
+    //! Graph counters per profile; safe to call while a request runs (the counters are atomics).
+    CudaGraphStats getCudaGraphStats() const;
+
     //! Get multimodal metrics (returns empty metrics if no multimodal runner)
     metrics::MultimodalMetrics getMultimodalMetrics() const noexcept
     {
@@ -831,6 +834,8 @@ private:
     RuntimeBenchmarkOptions mBenchmarkOptions{};
     DeploymentConfig mDeployment{};                    //!< Parsed base+draft configs + consolidated strategy settings
     std::unique_ptr<EngineExecutor> mBaseExecutor;     //!< Base model TRT wrapper
+    //! Non-owning view of the draft executor, which the decoder registry owns for the runtime's lifetime.
+    EngineExecutor const* mDraftExecutorView{nullptr};
     std::unique_ptr<SharedResources> mSharedResources; //!< KV caches / RoPE / LoRA / context memory
     //! Declared after SharedResources so context-cache ownership is released before the physical buffers.
     std::unique_ptr<ContextCacheCoordinator> mContextCache;

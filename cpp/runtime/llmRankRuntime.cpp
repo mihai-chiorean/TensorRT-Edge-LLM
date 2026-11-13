@@ -300,6 +300,7 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, DeploymentOpti
     mDraftCheckpointDir = std::move(artifacts.draftCheckpointDir);
     ExternalWeightManager preparedWeights = std::move(artifacts.weights);
     std::unique_ptr<EngineExecutor> draftExecutor = std::move(artifacts.draftExecutor);
+    mDraftExecutorView = draftExecutor.get();
     ExternalWeightManager draftWeights = std::move(artifacts.draftWeights);
     auto vocabMap = std::move(artifacts.vocabMap);
 
@@ -917,6 +918,20 @@ void LLMRankRuntime::setActionNoiseSeed(int32_t seed) noexcept
     {
         mActionRunner->setNoiseSeed(seed);
     }
+}
+
+CudaGraphStats LLMRankRuntime::getCudaGraphStats() const
+{
+    CudaGraphStats stats;
+    if (mBaseExecutor)
+    {
+        stats.base = mBaseExecutor->graphCounters();
+    }
+    if (mDraftExecutorView != nullptr)
+    {
+        stats.draft = mDraftExecutorView->graphCounters();
+    }
+    return stats;
 }
 
 std::optional<ContextCacheMetrics> LLMRankRuntime::getContextCacheMetrics() const noexcept
