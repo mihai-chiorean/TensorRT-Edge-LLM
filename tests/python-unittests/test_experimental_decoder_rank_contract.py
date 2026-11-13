@@ -473,3 +473,48 @@ def test_linear_without_lora_targets_adapts_every_projection(monkeypatch):
     assert recorded == [
         "model.layers.0.self_attn.q_proj", "model.layers.0.per_layer_projection"
     ]
+
+
+def _fake_network(names):
+    inputs = [SimpleNamespace(name=name) for name in names]
+    return SimpleNamespace(num_inputs=len(inputs),
+                           get_input=lambda index: inputs[index])
+
+
+def test_lora_target_matching_no_network_input_is_refused():
+    from experimental.builder.core.builder import _check_lora_targets
+    network = _fake_network([
+        "input_ids", "model.layers.0.self_attn.q_proj.lora_A.weight",
+        "model.layers.0.self_attn.q_proj.lora_B.weight"
+    ])
+
+    _check_lora_targets(network, SimpleNamespace(lora_targets=("self_attn", )))
+    _check_lora_targets(network, SimpleNamespace(lora_targets=None))
+    with pytest.raises(ValueError, match="mlp"):
+        _check_lora_targets(network,
+                            SimpleNamespace(lora_targets=("self_attn", "mlp")))
+
+
+def test_speculative_draft_is_built_without_lora_inputs(monkeypatch):
+    import argparse
+
+    from experimental.builder import cli
+    from experimental.builder.core import contracts
+    from experimental.builder.core.config import BundleConfig
+    monkeypatch.setattr(BundleConfig, "from_pretrained",
+                        classmethod(lambda cls, path: SimpleNamespace()))
+    args = argparse.Namespace(spec_type="mtp",
+                              draft_model_dir=None,
+                              model_dir="/base",
+                              max_lora_rank=16,
+                              lora_targets=("self_attn", "mlp"),
+                              tree_base=False)
+
+    plan = cli._speculative_build_plan(args, SimpleNamespace(),
+                                       [contracts.Component.LLM])
+
+    roles = {label: role_args for label, role_args, _, _ in plan}
+    assert roles["spec-base"].max_lora_rank == 16
+    assert roles["spec-base"].lora_targets == ("self_attn", "mlp")
+    assert roles["spec-draft"].max_lora_rank == 0
+    assert roles["spec-draft"].lora_targets is None

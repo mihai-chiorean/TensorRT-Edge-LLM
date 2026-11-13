@@ -195,6 +195,9 @@ def _speculative_build_plan(args: argparse.Namespace, bundle, components):
                                  "dspark") else None),
             target_model_dir=None,
         )
+        # The runtime binds LoRA inputs on the base engine only (one
+        # LoRAManager from the base config), so the draft is built without
+        # them; a draft with LoRA inputs could not be prepared.
         draft_args = _copy_args(
             args,
             model_dir=draft_model_dir,
@@ -202,6 +205,8 @@ def _speculative_build_plan(args: argparse.Namespace, bundle, components):
             tree_base=False,
             draft_model_dir=None,
             target_model_dir=args.model_dir,
+            max_lora_rank=0,
+            lora_targets=None,
         )
         plan.extend((
             ("spec-base", base_args, bundle, component),
