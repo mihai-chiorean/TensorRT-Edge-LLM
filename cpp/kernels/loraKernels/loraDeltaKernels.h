@@ -50,9 +50,9 @@ struct PrefillTargets
  * over [A_0 | A_1 | ...] that reads x once, then one streaming expand + add per target.
  * out_i may equal base_i. Workspace: loraPrefillWorkspaceBytes(maxM, n * roundup16(maxRank)).
  */
-int32_t launchLoraPrefill(void const* x, int64_t M, int32_t K, int32_t n, void const* const* A,
-    void const* const* B, void const* const* base, void* const* out, int32_t const* r, int32_t const* N,
-    void* workspace, cudaStream_t stream) noexcept;
+int32_t launchLoraPrefill(void const* x, int64_t M, int32_t K, int32_t n, void const* const* A, void const* const* B,
+    void const* const* base, void* const* out, int32_t const* r, int32_t const* N, void* workspace,
+    cudaStream_t stream) noexcept;
 
 //! Workspace bytes for launchLoraPrefill with up to maxM rows and `cols` padded rank columns.
 size_t loraPrefillWorkspaceBytes(int64_t maxM, int32_t cols) noexcept;

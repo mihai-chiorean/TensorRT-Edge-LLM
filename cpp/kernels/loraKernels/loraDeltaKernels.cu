@@ -390,8 +390,8 @@ __global__ void __launch_bounds__(kSmallThreads) loraAddSmallTcKernel(half const
 // once and accumulates all column tiles from it, so siblings sharing x read it once.
 // Grid (ceil(M/64), S); 4 warps, each warp owns 16 rows; blockIdx.y owns K range
 // [y*kPer, (y+1)*kPer).
-__global__ void __launch_bounds__(128) loraShrinkWmmaKernel(half const* __restrict__ x, PrefillTargets const t,
-    float* __restrict__ p, int64_t M, int32_t K, int32_t kPer)
+__global__ void __launch_bounds__(128) loraShrinkWmmaKernel(
+    half const* __restrict__ x, PrefillTargets const t, float* __restrict__ p, int64_t M, int32_t K, int32_t kPer)
 {
     using namespace nvcuda;
     constexpr int kMaxTiles = kPrefillMaxCols / 16;
@@ -547,9 +547,9 @@ __global__ void __launch_bounds__(128) loraShrinkWmmaKernel(half const* __restri
 // 16-byte accesses. t for the CTA's rows is reduced from the split-K partials once.
 constexpr int32_t kStreamThreads{128};
 constexpr int32_t kStreamRowsPer{16};
-__global__ void __launch_bounds__(kStreamThreads) loraExpandStreamKernel(half const* __restrict__ base,
-    float const* __restrict__ p, int32_t S, int32_t pStride, int32_t pOff, half const* __restrict__ B,
-    half* __restrict__ out, int64_t M, int32_t N, int32_t r)
+__global__ void __launch_bounds__(kStreamThreads)
+    loraExpandStreamKernel(half const* __restrict__ base, float const* __restrict__ p, int32_t S, int32_t pStride,
+        int32_t pOff, half const* __restrict__ B, half* __restrict__ out, int64_t M, int32_t N, int32_t r)
 {
     __shared__ float tS[kStreamRowsPer][kLoraMaxRank];
     int64_t const row0 = static_cast<int64_t>(blockIdx.y) * kStreamRowsPer;
@@ -578,7 +578,8 @@ __global__ void __launch_bounds__(kStreamThreads) loraExpandStreamKernel(half co
 #pragma unroll
         for (int c = 0; c < 16; ++c)
         {
-            bReg[c] = c < r ? *reinterpret_cast<uint4 const*>(&B[static_cast<size_t>(c) * N + c0]) : make_uint4(0, 0, 0, 0);
+            bReg[c]
+                = c < r ? *reinterpret_cast<uint4 const*>(&B[static_cast<size_t>(c) * N + c0]) : make_uint4(0, 0, 0, 0);
         }
         // Four rows per step: the four base loads are issued before any of them is used.
         constexpr int kU = 4;
@@ -748,9 +749,9 @@ size_t loraPrefillWorkspaceBytes(int64_t maxM, int32_t cols) noexcept
     return alignUp(static_cast<size_t>(std::max<int64_t>(maxM, 128 * 64)) * std::max(cols, 16) * sizeof(float), 256);
 }
 
-int32_t launchLoraPrefill(void const* x, int64_t M, int32_t K, int32_t n, void const* const* A,
-    void const* const* B, void const* const* base, void* const* out, int32_t const* r, int32_t const* N,
-    void* workspace, cudaStream_t stream) noexcept
+int32_t launchLoraPrefill(void const* x, int64_t M, int32_t K, int32_t n, void const* const* A, void const* const* B,
+    void const* const* base, void* const* out, int32_t const* r, int32_t const* N, void* workspace,
+    cudaStream_t stream) noexcept
 {
     if (M <= 0 || n <= 0)
     {

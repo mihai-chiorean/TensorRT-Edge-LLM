@@ -34,13 +34,33 @@ constexpr int32_t kLoraGroupMaxCols{128};
 //! One active LoRA target: out = base + fp16(fp16(x @ A) @ B). out may equal base (in place).
 struct LoraTarget
 {
-    void const* A{nullptr};   //!< [K, r] fp16
-    void const* B{nullptr};   //!< [r, N] fp16
+    void const* A{nullptr};    //!< [K, r] fp16
+    void const* B{nullptr};    //!< [r, N] fp16
     void const* base{nullptr}; //!< [M, N] fp16
-    void* out{nullptr};       //!< [M, N] fp16
+    void* out{nullptr};        //!< [M, N] fp16
     int32_t r{0};
     int32_t N{0};
 };
+
+//! How launchLoraGroup runs a group on a device with `grid` cooperative CTAs and
+//! `smemLimit` bytes of dynamic shared memory per block.
+struct LoraGroupPlan
+{
+    bool fused{false};        //!< single cooperative launch (else per-target / prefill path)
+    int32_t grid{0};          //!< CTAs of the fused launch
+    int32_t tilesPerCta{0};   //!< 16-column output tiles each CTA owns
+    int32_t tilesPerRound{0}; //!< tiles staged in shared memory at once (== tilesPerCta: one round)
+    size_t smemBytes{0};      //!< dynamic shared memory of the fused launch
+};
+
+//! The plan launchLoraGroup uses; depends only on shapes and ranks of `targets`.
+LoraGroupPlan planLoraGroup(
+    int64_t M, int32_t K, LoraTarget const* targets, int32_t nbTargets, int32_t grid, size_t smemLimit) noexcept;
+
+//! launchLoraGroup with explicit device limits instead of the current device's (for tests that
+//! emulate smaller GPUs). `grid` must not exceed the number of co-resident CTAs.
+int32_t launchLoraGroupWithLimits(void const* x, int64_t M, int32_t K, LoraTarget const* targets, int32_t nbTargets,
+    void* workspace, void* state, cudaStream_t stream, int32_t grid, size_t smemLimit) noexcept;
 
 //! Workspace bytes for launchLoraGroup with up to maxM rows and per-target ranks up to maxRank.
 size_t loraGroupWorkspaceBytes(int64_t maxM, int32_t nbTargets, int32_t maxRank) noexcept;

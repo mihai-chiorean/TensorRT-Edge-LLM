@@ -97,8 +97,8 @@ public:
     nvinfer1::PluginFieldCollection const* getFieldNames() noexcept override;
     char const* getPluginNamespace() const noexcept override;
     void setPluginNamespace(char const* pluginNamespace) noexcept;
-    nvinfer1::IPluginV3* createPlugin(char const* name, nvinfer1::PluginFieldCollection const* fc,
-        nvinfer1::TensorRTPhase phase) noexcept override;
+    nvinfer1::IPluginV3* createPlugin(
+        char const* name, nvinfer1::PluginFieldCollection const* fc, nvinfer1::TensorRTPhase phase) noexcept override;
 
 private:
     static nvinfer1::PluginFieldCollection mFieldCollection;

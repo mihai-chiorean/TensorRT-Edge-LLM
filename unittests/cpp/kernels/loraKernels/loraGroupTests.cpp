@@ -202,8 +202,8 @@ TEST_P(LoraGroupTest, MatchesUnfusedFp16Branch)
     cudaGraph_t graph{};
     cudaGraphExec_t exec{};
     CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-    ASSERT_EQ(launchLoraGroup(dx, c.M, c.K, targets.data(), static_cast<int32_t>(targets.size()), workspace, state,
-                  stream),
+    ASSERT_EQ(
+        launchLoraGroup(dx, c.M, c.K, targets.data(), static_cast<int32_t>(targets.size()), workspace, state, stream),
         0);
     CUDA_OK(cudaStreamEndCapture(stream, &graph));
     CUDA_OK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
@@ -268,8 +268,8 @@ TEST(LoraGroupLauncher, NoActiveTargetLaunchesNothing)
 }
 
 //! out = base + fp16(fp16(x @ A) @ B), rounded like the unfused fp16 branch.
-std::vector<float> referenceOut(std::vector<__half> const& x, std::vector<__half> const& A, std::vector<__half> const& B,
-    std::vector<__half> const& base, int32_t M, int32_t K, int32_t N, int32_t r)
+std::vector<float> referenceOut(std::vector<__half> const& x, std::vector<__half> const& A,
+    std::vector<__half> const& B, std::vector<__half> const& base, int32_t M, int32_t K, int32_t N, int32_t r)
 {
     std::vector<float> out(base.size());
     for (size_t e = 0; e < base.size(); ++e)
@@ -432,6 +432,144 @@ TEST(LoraGroupLauncher, FastAndFallbackPathsShareOneStateAcrossReplays)
     cudaFree(dx);
     cudaFree(workspace);
     cudaFree(state);
+    cudaStreamDestroy(stream);
+}
+
+//! Orin NX has 8 SMs: with one CTA per SM the gate/up group's expand tiles do not fit the
+//! 160 KiB kernel budget in one go, and must be staged in rounds instead of falling back to
+//! per-target launches. 16 SMs (AGX Orin) keeps a single round.
+TEST(LoraGroupPlan, GateUpStaysFusedOnEightSms)
+{
+    constexpr size_t kOrinBudget = 160 * 1024;
+    std::vector<LoraTarget> gateUp(2);
+    for (auto& t : gateUp)
+    {
+        t.r = 16;
+        t.N = 10240;
+    }
+    for (int32_t const M : {1, 12, 16})
+    {
+        LoraGroupPlan const nx = planLoraGroup(M, 2560, gateUp.data(), 2, 8, kOrinBudget);
+        EXPECT_TRUE(nx.fused) << "M " << M;
+        EXPECT_LE(nx.smemBytes, kOrinBudget);
+        EXPECT_EQ(nx.tilesPerCta, 160);
+        EXPECT_LT(nx.tilesPerRound, nx.tilesPerCta);
+
+        LoraGroupPlan const agx = planLoraGroup(M, 2560, gateUp.data(), 2, 16, kOrinBudget);
+        EXPECT_TRUE(agx.fused);
+        EXPECT_EQ(agx.tilesPerRound, agx.tilesPerCta);
+    }
+    // Every Gemma 4 E4B group stays fused on 8 SMs.
+    struct Group
+    {
+        int32_t K;
+        std::vector<int32_t> N;
+    };
+    for (Group const& g : {Group{2560, {2048, 512, 512}}, Group{2560, {4096, 1024, 1024}}, Group{2048, {2560}},
+             Group{4096, {2560}}, Group{10240, {2560}}})
+    {
+        std::vector<LoraTarget> targets(g.N.size());
+        for (size_t i = 0; i < g.N.size(); ++i)
+        {
+            targets[i].r = 16;
+            targets[i].N = g.N[i];
+        }
+        LoraGroupPlan const nx
+            = planLoraGroup(12, g.K, targets.data(), static_cast<int32_t>(targets.size()), 8, kOrinBudget);
+        EXPECT_TRUE(nx.fused) << "K " << g.K << " targets " << g.N.size();
+        EXPECT_LE(nx.smemBytes, kOrinBudget);
+    }
+}
+
+//! Runs gate/up through the fused kernel with the grid forced to 8 CTAs (and with a small
+//! shared-memory budget, 96 KiB, to force more rounds) and checks it against the reference.
+TEST(LoraGroupLauncher, MultiRoundExpandMatchesReference)
+{
+    int dev = 0;
+    int optin = 0;
+    CUDA_OK(cudaGetDevice(&dev));
+    CUDA_OK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+    int32_t const M = 12;
+    int32_t const K = 2560;
+    std::vector<int32_t> const N{10240, 10240};
+    std::mt19937 gen(31);
+    std::uniform_real_distribution<float> dist(-1.f, 1.f);
+    auto fill = [&](size_t count, float scale) {
+        std::vector<__half> v(count);
+        for (auto& e : v)
+        {
+            e = __float2half(dist(gen) * scale);
+        }
+        return v;
+    };
+    std::vector<__half> const x = fill(static_cast<size_t>(M) * K, 0.5f);
+    std::vector<std::vector<__half>> A, B, base;
+    for (int32_t const n : N)
+    {
+        A.push_back(fill(static_cast<size_t>(K) * 16, 0.05f));
+        B.push_back(fill(static_cast<size_t>(16) * n, 0.05f));
+        base.push_back(fill(static_cast<size_t>(M) * n, 1.f));
+    }
+    void* dx = nullptr;
+    CUDA_OK(cudaMalloc(&dx, x.size() * 2));
+    CUDA_OK(cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice));
+    std::vector<void*> dA(2), dB(2), dBase(2);
+    std::vector<LoraTarget> targets(2);
+    for (int32_t i = 0; i < 2; ++i)
+    {
+        CUDA_OK(cudaMalloc(&dA[i], A[i].size() * 2));
+        CUDA_OK(cudaMalloc(&dB[i], B[i].size() * 2));
+        CUDA_OK(cudaMalloc(&dBase[i], base[i].size() * 2));
+        CUDA_OK(cudaMemcpy(dA[i], A[i].data(), A[i].size() * 2, cudaMemcpyHostToDevice));
+        CUDA_OK(cudaMemcpy(dB[i], B[i].data(), B[i].size() * 2, cudaMemcpyHostToDevice));
+        targets[i].A = dA[i];
+        targets[i].B = dB[i];
+        targets[i].base = dBase[i];
+        targets[i].out = dBase[i];
+        targets[i].r = 16;
+        targets[i].N = N[i];
+    }
+    void* workspace = nullptr;
+    CUDA_OK(cudaMalloc(&workspace, loraGroupWorkspaceBytes(M, 2, 16)));
+    cudaStream_t stream{};
+    CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    for (size_t const budget : {std::min<size_t>(static_cast<size_t>(optin), 160 * 1024), size_t{96 * 1024}})
+    {
+        LoraGroupPlan const plan = planLoraGroup(M, K, targets.data(), 2, 8, budget);
+        ASSERT_TRUE(plan.fused) << "budget " << budget;
+        ASSERT_LT(plan.tilesPerRound, plan.tilesPerCta) << "budget " << budget;
+        // Fresh barrier state per grid size.
+        void* state = nullptr;
+        CUDA_OK(cudaMalloc(&state, kLoraGroupStateBytes));
+        CUDA_OK(cudaMemset(state, 0, kLoraGroupStateBytes));
+        for (int32_t i = 0; i < 2; ++i)
+        {
+            CUDA_OK(cudaMemcpy(dBase[i], base[i].data(), base[i].size() * 2, cudaMemcpyHostToDevice));
+        }
+        CUDA_OK(cudaDeviceSynchronize());
+        ASSERT_EQ(launchLoraGroupWithLimits(dx, M, K, targets.data(), 2, workspace, state, stream, 8, budget), 0);
+        CUDA_OK(cudaStreamSynchronize(stream));
+        for (int32_t i = 0; i < 2; ++i)
+        {
+            std::vector<float> const want = referenceOut(x, A[i], B[i], base[i], M, K, N[i], 16);
+            std::vector<__half> got(base[i].size());
+            CUDA_OK(cudaMemcpy(got.data(), dBase[i], got.size() * 2, cudaMemcpyDeviceToHost));
+            for (size_t e = 0; e < got.size(); ++e)
+            {
+                ASSERT_NEAR(__half2float(got[e]), want[e], 2e-3f + 2e-3f * std::fabs(want[e]))
+                    << "budget " << budget << " target " << i << " element " << e;
+            }
+        }
+        cudaFree(state);
+    }
+    cudaFree(dx);
+    for (int32_t i = 0; i < 2; ++i)
+    {
+        cudaFree(dA[i]);
+        cudaFree(dB[i]);
+        cudaFree(dBase[i]);
+    }
+    cudaFree(workspace);
     cudaStreamDestroy(stream);
 }
 

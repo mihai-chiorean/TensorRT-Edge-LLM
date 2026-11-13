@@ -36,7 +36,6 @@ namespace
 constexpr char const* kNAME{"LoraGroupPlugin"};
 constexpr char const* kVERSION{"1"};
 
-
 //! Allocates `bytes` of zeroed device memory for persistent plugin state. Safe to call while
 //! another stream on this thread is capturing a CUDA graph: relaxed capture mode admits the
 //! allocation, and the zeroing runs and completes on a private non-blocking stream (no legacy
@@ -257,8 +256,8 @@ int32_t LoraGroupPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensor
         if (r == 0)
         {
             if (mInplace == 0 && M > 0
-                && cudaMemcpyAsync(outputs[i], inputs[i], static_cast<size_t>(M) * N * 2, cudaMemcpyDeviceToDevice,
-                       stream)
+                && cudaMemcpyAsync(
+                       outputs[i], inputs[i], static_cast<size_t>(M) * N * 2, cudaMemcpyDeviceToDevice, stream)
                     != cudaSuccess)
             {
                 return -1;
@@ -282,8 +281,8 @@ int32_t LoraGroupPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensor
     return status;
 }
 
-int32_t LoraGroupPlugin::onShapeChange(
-    PluginTensorDesc const* /*in*/, int32_t /*nbInputs*/, PluginTensorDesc const* /*out*/, int32_t /*nbOutputs*/) noexcept
+int32_t LoraGroupPlugin::onShapeChange(PluginTensorDesc const* /*in*/, int32_t /*nbInputs*/,
+    PluginTensorDesc const* /*out*/, int32_t /*nbOutputs*/) noexcept
 {
     // Normally allocated in attachToContext; this covers a plugin used without one.
     if (mState != nullptr || allocateZeroedState(mState, kernels::kLoraGroupStateBytes))

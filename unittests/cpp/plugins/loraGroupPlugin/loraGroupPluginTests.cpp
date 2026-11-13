@@ -143,8 +143,8 @@ void runEnqueue(int32_t inplace)
         B[i] = randomHalf(static_cast<size_t>(R[i]) * N[i], 0.1f, gen);
         base[i] = randomHalf(static_cast<size_t>(M) * N[i], 1.f, gen);
     }
-    std::array<PluginTensorDesc, 7> in{desc2d(M, N[0]), desc2d(M, N[1]), desc2d(M, K), desc2d(K, R[0]),
-        desc2d(K, R[1]), desc2d(R[0], N[0]), desc2d(R[1], N[1])};
+    std::array<PluginTensorDesc, 7> in{desc2d(M, N[0]), desc2d(M, N[1]), desc2d(M, K), desc2d(K, R[0]), desc2d(K, R[1]),
+        desc2d(R[0], N[0]), desc2d(R[1], N[1])};
     std::array<PluginTensorDesc, 2> outDesc{desc2d(M, N[0]), desc2d(M, N[1])};
     std::array<void*, 7> dIn{toDevice(base[0]), toDevice(base[1]), toDevice(x), toDevice(A[0]), toDevice(A[1]),
         toDevice(B[0]), toDevice(B[1])};
@@ -186,9 +186,8 @@ void runEnqueue(int32_t inplace)
                     s += double(t[r]) * __half2float(B[i][r * N[i] + n]);
                 }
                 float const b = __half2float(base[i][m * N[i] + n]);
-                float const want = R[i] == 0
-                    ? b
-                    : __half2float(__float2half(b + __half2float(__float2half(static_cast<float>(s)))));
+                float const want
+                    = R[i] == 0 ? b : __half2float(__float2half(b + __half2float(__float2half(static_cast<float>(s)))));
                 float const tol = R[i] == 0 ? 0.f : 2e-3f + 2e-3f * std::fabs(want);
                 ASSERT_NEAR(__half2float(got[m * N[i] + n]), want, tol)
                     << "inplace " << inplace << " target " << i << " m " << m << " n " << n;
