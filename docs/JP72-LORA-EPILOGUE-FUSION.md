@@ -1,6 +1,6 @@
 # LoRA fused into the W4A16 GEMM/GEMV epilogue: design and measurements
 
-Status: revised after implementation, 2026-11-13. Fork `main` 5a56baaa. This
+Status: revised after implementation and AGX validation, 2026-11-13. Fork `main` 5a56baaa. This
 is step 4 of the LoRA decode speed-up plan. It builds on the grouped LoRA
 plugin branches, stacked on `main` in this order: `lora-group-plugin` (2ed53e5
 `LoraGroupPlugin`, then b95e8b4 for 8-SM GPUs), `lora-group-insert` (55b3358,
@@ -137,22 +137,26 @@ Decode path, M <= 8 (`loraShrinkKernel`, CUDA cores):
 - Bit-exact against a NumPy emulation of the tree. The tree does not depend on
   the SM count or the grid, so it is the same on the AGX and the NX.
 
-Prefill path, M >= 9 (`loraShrinkPrefillKernel`, tensor cores):
-- WMMA FP16 with FP32 accumulation, 64 rows per block, K chunks of 512,
-  cooperative 64-K tiles with register double buffering. Grid
-  (K / 512, ceil(M / 64)); the last block per row block sums the chunks in
-  order.
+Tensor-core path, M >= 9 (`loraShrinkPrefillKernel`):
+- WMMA FP16 with FP32 accumulation, 64 rows per block, cooperative 64-K tiles
+  with register double buffering. Grid (K chunks, ceil(M / 64)); the last
+  block per row block sums the chunks in order.
+- K chunks: 512 for M > 64. Up to M = 64 (MTP verify, short prompts) they are
+  128 for K <= 4096 and 256 above, so enough blocks run without making the
+  last block's ordered chunk sum too long. Three targets at M = 12, K = 2560:
+  12.0 µs with 128-chunks against 18.5 µs with 512-chunks.
 - Deterministic (fixed order), but the order inside an MMA is the hardware's,
   so the test is a bound against FP64, not a bit-exact emulation.
 - 4 to 5 times faster than the CUDA-core tree at prefill M: three targets at
-  M = 800, K = 2560 take 62.6 µs against 279 µs.
+  M = 800, K = 2560 take 57 to 63 µs against 279 µs.
 
 The launcher skips the kernel when every target's rank is 0, so the adapter-off
 cost of a shrink node is the empty TensorRT node.
 
 Requires K to be a multiple of 64 (all Gemma 4 E4B shapes are). Workspace:
-the partials, sized as the maximum over the M buckets {min(maxM, 4),
-min(maxM, 8), maxM}, because the chunk count changes at the bucket boundary.
+the partials. The chunk count is not monotonic in M or K (the chunk changes at
+the bucket boundaries), so the size is the maximum over the top of every M
+bucket {8, 64, maxM} at the top of every K bucket {4096, maxK}.
 
 ### 3.3 Expand in the epilogue
 
@@ -247,17 +251,24 @@ All on the AGX, same harness or same engine profile as the final design.
 
 ## 4. MTP
 
-- **Verify (base engine).** Verify runs the base engine at M = verify width,
-  at most 8 on the batch-one robot engine. The decode shrink tree and the LoRA
-  GEMM/GEMV variants cover M <= 8, so a verify step costs the same LoRA
-  launches as a plain decode step.
+- **Verify (base engine).** Verify runs the base engine at M = verify width:
+  up to 12 with the runtime's current draft settings (engine built with
+  `--max-verify-tree-size 16`). M <= 8 uses the decode shrink tree and the
+  GEMV variants; M = 9 to 16 uses the tensor-core shrink with short K chunks
+  (3.2) and the GEMM variants. A verify step costs the same LoRA launches as a
+  plain decode step.
 - **Draft.** The assistant draft engine has no LoRA inputs (#75 designs draft
   adapters separately). Use AGX-built drafts; NX-built MTP drafts are
   currently broken for reasons unrelated to this work.
 - **Equality.** MTP output is the greedy output of the verify computation,
   not necessarily token-identical to non-speculative decode (different kernels
-  at different M, as today without LoRA). Measured, not assumed (section 6).
-- MTP throughput with the fused engine has not been measured yet.
+  at different M, as today without LoRA). Measured in section 6: the fused
+  and grouped MTP engines diverge from their own autoregressive output on the
+  same near-tie prompts.
+- **Throughput.** At parity with the grouped plugin within run-to-run noise,
+  not better (section 7.4). The verify step runs gate/up at M of about 12,
+  where the CUDA-core expand costs +5.5 µs per kernel; that is what the
+  tensor-core expand follow-up targets.
 
 ## 5. Engine, plugin and adapter interfaces
 
@@ -320,7 +331,7 @@ Bit equality with the grouped plugin or the MatMul branches is not possible
 (different summation order inside t and d). The strategy proves what can be
 proven exactly and measures the rest.
 
-Done (kernel and plugin level, AGX):
+Kernel and plugin level (AGX):
 1. **Base untouched.** At rank 0 the plugin output equals
    `Int4GroupwiseGemmPluginV2`, bit for bit, on the GEMM and GEMV routes.
 2. **t exactly, M <= 8.** The NumPy emulation of the decode tree reproduces
@@ -329,17 +340,50 @@ Done (kernel and plugin level, AGX):
    against FP64 with a tolerance.
 3. **Output exactly.** From the kernel's own `t16`, a host epilogue (FMA in
    rank order, then the FP32 add) reproduces every LoRA variant's output bit
-   for bit across GEMM tiles, split-K, GEMV M = 1..8, M in {1, 5, 8, 16, 17,
-   32, 64, 65, 100, 200, 300, 800}, and ranks 7, 8 and 16.
-4. **Plugin tests.** Shrink plugin with three targets at ranks 16, 0 and 8
-   and M = 1, 5, 80; GEMM plugin rank cap and serialization.
+   for bit across GEMM tiles, split-K, GEMV M = 1..8, M in {1, 5, 8, 9, 12,
+   16, 17, 32, 64, 65, 200, 300, 800}, and ranks 1, 7, 8 and 16.
+4. **Replays and counters.** CUDA-graph replays reproduce the eager output
+   bit for bit and leave the shrink counters at zero; a replay after B
+   changes follows the new B. The shrink plugin test runs decode and
+   tensor-core M buckets alternately on one instance with poisoned outputs
+   before each launch, so a counter left non-zero fails.
+5. **compute-sanitizer: not run.** The AGX user is not in the `debug` group
+   that owns `/dev/nvhost-dbg-gpu`, so every tool stops with "GPU debugging
+   features are disabled". It needs that group membership (an admin step).
 
-Still to run (engine level, AGX then NX): adapter-off output against rank 0;
-adapter-on greedy equality on the 9-prompt tool set and the 66-check golden
-set against the grouped and MatMul engines, with first-divergence position and
-top-2 margin; MTP against autoregressive decode; cross-device equality of an
-AGX-built engine run on the NX; repeated-replay and `compute-sanitizer`
-checks of the shrink counters.
+Engine level (AGX, greedy, top-5 logprobs). The golden set is 22 prompts
+(4 with an image; a fixed test JPEG stands in for the camera frame, so the
+vision checks test equality, not scene accuracy) x 3 repeats = 66 records and
+114 checks; the tool set is 9 prompts with three tools.
+
+| Comparison | Tool set | Golden records | Golden checks |
+|---|---:|---:|---:|
+| fused, adapter off vs rank 0 | 9/9 | 66/66 | 114/114 both |
+| fused vs grouped, adapter on | 9/9 | 66/66 | 114/114 both |
+| fused vs unfused MatMul, adapter on | 8/9 | 66/66 | 114/114 both |
+| grouped vs unfused MatMul, adapter on | 8/9 | 66/66 | 114/114 both |
+| fused MTP vs fused autoregressive, adapter on | 8/9 | 21/22 | 38/38 |
+| grouped MTP vs grouped autoregressive, adapter on | 8/9 | 20/22 | 38/38 |
+| fused MTP vs grouped MTP, adapter on | 9/9 | 21/22 | 38/38 both |
+
+Every divergence is at a near tie: the top-2 log-probability margin at the
+first differing token, in at least one of the two engines, is 0.0 to 0.0087
+on the tool set, 0.0077 on `safety-pii`, and 0.025 to 0.043 on
+`safety-secret` for MTP against autoregressive, where both MTP engines
+diverge at the same token. The same tool-set prompt diverges between the
+grouped and MatMul engines. Counts are for the current fused build; an
+earlier build matched the same way except for one golden record that flipped
+on run-to-run noise (below).
+
+Run-to-run noise. Every engine, rank 0 included, shows run-to-run log-prob
+differences of about 1e-5 on most prompts with identical inputs, so a near
+tie can flip between repeats of the same engine (one of 66 records did, on the
+fused and on the grouped engine). It is not caused by the LoRA kernels: the
+adapter-off fused engine runs no LoRA kernel and shows it, and so does the
+rank-0 engine. Its source is in the base engine and is not investigated here.
+
+Still to run: cross-device equality of an AGX-built engine on the NX, and
+compute-sanitizer once the debug group is granted.
 
 ## 7. Measurements (AGX Orin, MAXN)
 
@@ -384,6 +428,16 @@ M = 800 (gate/up 1805 -> 1946 µs, down 1840 -> 1913 µs) and more at mid M
 (+29% for q at M = 300, rank 8). It runs on CUDA cores; moving it onto the MMA
 is the next prefill item.
 
+A second session after the small-M shrink change, with both fused engines
+rebuilt, gave: decode r0 46.24, grouped 44.34 off / 41.07 on, fused 44.54 off /
+42.00 on tok/s (fused 90.8% of rank 0, grouped 88.8%). TTFT short: grouped
++8.7 ms, fused +6.4 ms with the adapter; ~1,600 tokens: grouped 521.2 -> 586.4
+ms (+65.2), fused 559.3 -> 580.3 ms (+21.0), rank 0 518.0 ms. The rebuilt fused
+engine's adapter-off long TTFT moved from 476.6 to 559.3 ms with no change to
+any kernel it runs with the adapter off, so the cross-engine long-prompt
+differences are build-to-build tactic selection, not LoRA. The within-engine
+LoRA cost (+21 to +27 ms fused, +65 to +67 ms grouped) is stable.
+
 ### 7.3 Adapter-off overhead (not a kernel cost)
 
 Both LoRA engines run 0.8 to 0.9 ms per token slower than rank 0 with the
@@ -394,6 +448,23 @@ the final norm grows from 899 µs to 1,674 µs. It is the same on the grouped
 and fused engines, so it comes from the runtime's LoRA handling, not from
 either plugin. It has been handed to the runtime work separately. Removing it
 would raise the fused adapter-on figure from 90.6% to about 93.8% of rank 0.
+
+### 7.4 MTP (AGX-built draft, verify tree 16)
+
+| Engine | Off, count / story tok/s | On, count / story tok/s |
+|---|---:|---:|
+| rank 0 MTP | 175.2 / 60.8 | - |
+| grouped MTP | 171.9 / 60.3 | 157.1 / 57.7 |
+| fused MTP | 167.1 / 60.2 | 156.5 / 56.4 |
+
+Same session. Before the small-M chunk change the fused MTP engine was 5.4%
+(count) and 3.6% (story) slower than grouped with the adapter on; with it the
+two are within run-to-run noise (MTP rates moved by up to 4% between sessions
+for the same engine). The nsys diff of the verify steps showed the remaining
+gap: gate/up at M of about 12 cost +6.7 µs per kernel with the CUDA-core
+expand (+5.5 µs in the microbenchmark), against +3.4 µs at M = 1. Vectorizing
+the expand's shared-memory loads did not change it, so the cost is the FMA
+chain itself; the tensor-core expand is the follow-up for it.
 
 ## 8. Why 97 to 98% did not hold, and the realistic floor
 
@@ -463,15 +534,16 @@ drafts.
 | LoRA GEMM and GEMV variants, smem expand epilogue | Built; bit-exact tests pass on the AGX |
 | `LoraShrinkPlugin`, decode tree and tensor-core prefill | Built; tests pass |
 | `Int4GroupwiseGemmLoraPlugin`, `insert-lora --lora-fused-int4`, builder predicates | Built; plugin and insertion tests pass |
-| AGX decode and TTFT | Measured (section 7) |
-| Engine-level equality, sanitizer, MTP | To run |
-| Expand on MMA for prefill M | Next |
+| AGX decode, TTFT and MTP | Measured (section 7) |
+| Engine-level equality | Done on the AGX (section 6) |
+| compute-sanitizer | Blocked: needs the `debug` group on the AGX |
+| Expand on tensor cores (prefill and MTP verify M) | Separate follow-up |
 | INT8 factors | With step 3 |
 | NX | Batched window to be scheduled |
 
-The implementation branch will be split into reviewable PRs (kernels, shrink
-plugin, GEMM plugin, insertion and builder) with the debug knobs and
-superseded variants removed.
+The implementation is split into three stacked PRs on #80: the shrink
+plugin, the INT4 expand epilogue and its plugin form, then insertion and the
+builder (#85, #86, #87, draft).
 
 ## 11. Risks
 
