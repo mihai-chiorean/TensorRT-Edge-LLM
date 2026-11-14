@@ -374,6 +374,370 @@ __global__ void __launch_bounds__(kThreads, 1) loraGroupSmallKernel(GroupParams 
     __syncthreads();
 }
 
+// ---------------------------------------------------------------------------------------------
+// Short prefill (kLoraSmallMaxM < M <= kLoraGroupMidMaxM): one cooperative launch per group.
+//
+// Same split as loraGroupSmallKernel (phase 1: split-K shrink over one CTA per SM; grid barrier;
+// phase 2: every CTA reduces t and expands its own 16-column output tiles), with RT = M/16
+// rounded up to 2 or 4 WMMA row tiles. x and A are too large to stage whole at these widths, so
+// they stream through a ring of `stages` K chunks (every chunk is in flight at entry when the
+// ring holds them all); B tiles are staged at entry as before; base is not staged: each lane
+// loads its 16-byte slice of every row tile of a tile straight into registers before the MMA.
+// ---------------------------------------------------------------------------------------------
+
+struct MidLayout
+{
+    int32_t xcLd, acLd, tsLd;
+    size_t stage, xc, ac, ring, scr, ts, bs, total;
+};
+
+__host__ __device__ inline int32_t midChunkRows(int32_t rowTiles)
+{
+    // kWarps = rowTiles x (kWarps / rowTiles) K lanes; one 16-row K step per warp per chunk.
+    return 16 * (kWarps / rowTiles);
+}
+
+__host__ __device__ inline MidLayout midLayout(
+    int32_t rowTiles, int32_t cols, int32_t stages, int32_t tileCap, int32_t rtMax)
+{
+    MidLayout L{};
+    int32_t const kc = midChunkRows(rowTiles);
+    L.xcLd = kc + 8;
+    L.acLd = cols + 8;
+    L.tsLd = cols + 8;
+    L.xc = 0;
+    L.ac = align128(size_t(16) * rowTiles * L.xcLd * 2);
+    L.stage = align128(L.ac + size_t(kc) * L.acLd * 2);
+    size_t off = 0;
+    off += L.stage * stages;
+    L.ring = 0;
+    L.scr = align128(off);
+    off = L.scr + size_t(kWarps) * 256 * 4;
+    L.ts = align128(off);
+    off = L.ts + size_t(16) * rowTiles * L.tsLd * 2;
+    L.bs = align128(off);
+    off = L.bs + size_t(tileCap) * rtMax * 16 * 16 * 2;
+    L.total = align128(off);
+    return L;
+}
+
+//! cp.async.wait_group with a run-time count (ring depth is a launch parameter).
+__device__ __forceinline__ void cpAsyncWaitN(int32_t n)
+{
+    switch (n)
+    {
+    case 0: cpAsyncWait<0>(); break;
+    case 1: cpAsyncWait<1>(); break;
+    case 2: cpAsyncWait<2>(); break;
+    case 3: cpAsyncWait<3>(); break;
+    case 4: cpAsyncWait<4>(); break;
+    default: cpAsyncWait<0>(); break; // conservative: wait for everything
+    }
+}
+
+template <int RT>
+__global__ void __launch_bounds__(kThreads, 1) loraGroupMidKernel(GroupParams const p, int32_t const stages)
+{
+    using namespace nvcuda;
+    static_assert(kWarps % RT == 0, "every row tile needs the same number of K lanes");
+    constexpr int32_t kWk = kWarps / RT; // warps per row tile along K
+    constexpr int32_t kKc = 16 * kWk;    // K rows per chunk
+    constexpr int32_t kRows = 16 * RT;   // padded rows
+    constexpr int32_t kMaxCt = kLoraGroupMaxCols / 16;
+    extern __shared__ __align__(128) unsigned char smem[];
+    int32_t const cols = p.colOff[p.n];
+    MidLayout const L = midLayout(RT, cols, stages, p.tileCap, p.rtMax);
+    float* scr = reinterpret_cast<float*>(smem + L.scr);
+    half* ts = reinterpret_cast<half*>(smem + L.ts);
+    half* bs = reinterpret_cast<half*>(smem + L.bs);
+
+    int32_t const tid = threadIdx.x;
+    int32_t const warp = tid / 32;
+    int32_t const lane = tid % 32;
+    int32_t const G = gridDim.x;
+    int32_t const k0 = blockIdx.x * p.kPer;
+    int32_t const kLen = max(0, min(p.K, k0 + p.kPer) - k0);
+    int32_t const nChunks = (kLen + kKc - 1) / kKc;
+    int32_t const totalTiles = p.tileOff[p.n];
+    int32_t const t0 = blockIdx.x * p.tilesPer;
+    int32_t const nT = max(0, min(totalTiles, t0 + p.tilesPer) - t0);
+    int32_t const bRows = p.rtMax * 16;
+
+    // x rows [0, kRows) (rows >= M zero) and A rows of K chunk c into ring stage c % stages.
+    auto stageChunk = [&](int32_t c) {
+        unsigned char* st = smem + L.ring + static_cast<size_t>(c % stages) * L.stage;
+        half* xc = reinterpret_cast<half*>(st + L.xc);
+        half* ac = reinterpret_cast<half*>(st + L.ac);
+        int32_t const kc0 = c * kKc; // relative to k0
+        constexpr int32_t xChunks = kKc / 8;
+        for (int32_t i = tid; i < kRows * xChunks; i += kThreads)
+        {
+            int32_t const m = i / xChunks;
+            int32_t const kk = (i % xChunks) * 8;
+            bool const ok = m < p.M && kc0 + kk < kLen;
+            cpAsync16(&xc[m * L.xcLd + kk], ok ? &p.x[static_cast<size_t>(m) * p.K + k0 + kc0 + kk] : p.x, ok);
+        }
+        int32_t const aChunks = cols / 8;
+        for (int32_t i = tid; i < kKc * aChunks; i += kThreads)
+        {
+            int32_t const kk = i / aChunks;
+            int32_t const cc = (i % aChunks) * 8;
+            int32_t ti = 0;
+            while (ti + 1 < p.n && cc >= p.colOff[ti + 1])
+            {
+                ++ti;
+            }
+            int32_t const c = cc - p.colOff[ti];
+            int32_t const r = p.r[ti];
+            bool const ok = kc0 + kk < kLen && c < r;
+            cpAsync16(&ac[kk * L.acLd + cc], ok ? &p.A[ti][static_cast<size_t>(k0 + kc0 + kk) * r + c] : p.x, ok);
+        }
+    };
+    // B rows of tiles [first, first + count) of this CTA (base is read in phase 2).
+    auto stageB = [&](int32_t first, int32_t count) {
+        int32_t const rowLen = count * 2;
+        for (int32_t i = tid; i < count * bRows * 2; i += kThreads)
+        {
+            int32_t const row = i / rowLen;
+            int32_t const j = i - row * rowLen;
+            int32_t const li = j >> 1;
+            int32_t const h = (j & 1) * 8;
+            int32_t const gt = t0 + first + li;
+            int32_t const ti = targetOfTile(p, gt);
+            int32_t const N = p.N[ti];
+            int32_t const n0 = (gt - p.tileOff[ti]) * 16;
+            bool const ok = row < p.r[ti] && n0 + h < N;
+            cpAsync16(&bs[(static_cast<size_t>(li) * bRows + row) * 16 + h],
+                ok ? &p.B[ti][static_cast<size_t>(row) * N + n0 + h] : p.x, ok);
+        }
+    };
+
+    // ---- Entry: the first `stages` chunks, then the first round of B tiles. ----
+    int32_t const pre = min(stages, nChunks);
+    for (int32_t c = 0; c < pre; ++c)
+    {
+        stageChunk(c);
+        cpAsyncCommit();
+    }
+    stageB(0, min(nT, p.tileCap));
+    cpAsyncCommit();
+
+    // ---- Phase 1: shrink over the ring. Warp w owns row tile w / kWk and K lane w % kWk. ----
+    int32_t const myRt = warp / kWk;
+    int32_t const myK = (warp % kWk) * 16;
+    int32_t const ct = cols / 16;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[kMaxCt];
+#pragma unroll
+    for (int j = 0; j < kMaxCt; ++j)
+    {
+        wmma::fill_fragment(acc[j], 0.f);
+    }
+    for (int32_t c = 0; c < nChunks; ++c)
+    {
+        // Groups committed after chunk c: the rest of the ring window, B, and refills so far.
+        int32_t const committed = min(nChunks, c + stages);
+        int32_t const pos = c < stages ? c : c + 1;
+        cpAsyncWaitN(committed - pos);
+        __syncthreads();
+        unsigned char const* st = smem + L.ring + static_cast<size_t>(c % stages) * L.stage;
+        half const* xc = reinterpret_cast<half const*>(st + L.xc);
+        half const* ac = reinterpret_cast<half const*>(st + L.ac);
+        if (c * kKc + myK < kLen)
+        {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa;
+            wmma::load_matrix_sync(fa, &xc[myRt * 16 * L.xcLd + myK], L.xcLd);
+#pragma unroll
+            for (int j = 0; j < kMaxCt; ++j)
+            {
+                if (j < ct)
+                {
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> fb;
+                    wmma::load_matrix_sync(fb, &ac[myK * L.acLd + j * 16], L.acLd);
+                    wmma::mma_sync(acc[j], fa, fb, acc[j]);
+                }
+            }
+        }
+        __syncthreads();
+        if (c + stages < nChunks)
+        {
+            stageChunk(c + stages);
+            cpAsyncCommit();
+        }
+    }
+    // Sum the kWk K lanes of each row tile, one 16-column tile at a time, into part[g][m][c].
+    float* wScr = scr + static_cast<size_t>(warp) * 256;
+#pragma unroll
+    for (int j = 0; j < kMaxCt; ++j)
+    {
+        if (j < ct)
+        {
+            wmma::store_matrix_sync(wScr, acc[j], 16, wmma::mem_row_major);
+            __syncthreads();
+            for (int32_t i = tid; i < kRows * 16; i += kThreads)
+            {
+                int32_t const m = i / 16;
+                int32_t const cc = i % 16;
+                if (m < p.M)
+                {
+                    int32_t const rt = m / 16;
+                    float s = 0.f;
+#pragma unroll
+                    for (int w = 0; w < kWk; ++w)
+                    {
+                        s += scr[(rt * kWk + w) * 256 + (m % 16) * 16 + cc];
+                    }
+                    p.part[(static_cast<size_t>(blockIdx.x) * p.M + m) * cols + j * 16 + cc] = s;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    // Base slice of CTA tile `tile` (all row tiles) for this lane: row l / 2, 8 columns at (l % 2) * 8.
+    // Out of range (no such tile, rows >= M, columns >= N) reads nothing and stays zero.
+    int32_t const lr = lane / 2;
+    int32_t const lc = (lane % 2) * 8;
+    auto loadBase = [&](int32_t tile, uint4* v) {
+#pragma unroll
+        for (int rt = 0; rt < RT; ++rt)
+        {
+            v[rt] = make_uint4(0, 0, 0, 0);
+        }
+        if (tile >= nT)
+        {
+            return;
+        }
+        int32_t const gt = t0 + tile;
+        int32_t const ti = targetOfTile(p, gt);
+        int32_t const N = p.N[ti];
+        int32_t const n0 = (gt - p.tileOff[ti]) * 16;
+        if (n0 + lc >= N)
+        {
+            return;
+        }
+        half const* base = p.base[ti];
+#pragma unroll
+        for (int rt = 0; rt < RT; ++rt)
+        {
+            int32_t const m = rt * 16 + lr;
+            if (m < p.M)
+            {
+                v[rt] = *reinterpret_cast<uint4 const*>(&base[static_cast<size_t>(m) * N + n0 + lc]);
+            }
+        }
+    };
+    // The first tile's base does not depend on t: its loads overlap the barrier wait.
+    uint4 bv[RT];
+    loadBase(warp, bv);
+
+    gridBarrier(p.counter);
+    cpAsyncWait<0>();
+    __syncthreads();
+
+    // ---- Phase 2: t = fp16(sum of partials) for the columns this CTA's tiles use. ----
+    int32_t cLo = 0;
+    int32_t cHi = 0;
+    if (nT > 0)
+    {
+        cLo = p.colOff[targetOfTile(p, t0)];
+        cHi = p.colOff[targetOfTile(p, t0 + nT - 1) + 1];
+    }
+    int32_t const w = cHi - cLo;
+    for (int32_t i = tid; i < kRows * w; i += kThreads)
+    {
+        int32_t const m = i / w;
+        int32_t const c = cLo + i % w;
+        float s = 0.f;
+        if (m < p.M)
+        {
+            float v[kMaxBarrierGrid];
+#pragma unroll
+            for (int g = 0; g < kMaxBarrierGrid; ++g)
+            {
+                v[g] = g < G ? __ldcg(&p.part[(static_cast<size_t>(g) * p.M + m) * cols + c]) : 0.f;
+            }
+#pragma unroll
+            for (int g = 0; g < kMaxBarrierGrid; ++g)
+            {
+                s += v[g];
+            }
+        }
+        ts[m * L.tsLd + c] = __float2half_rn(s);
+    }
+    __syncthreads();
+
+    // Expand + add: warp per tile; lane l owns row l / 2 and columns (l % 2) * 8 .. + 8 of each
+    // 16 x 16 row tile. Base is the bandwidth term here (M rows of every output column, read and
+    // written once), so each warp keeps two tiles' base slices in flight: the next tile's loads are
+    // issued before the current tile's MMA, and the first tile's before the grid barrier above.
+    for (int32_t r0 = 0; r0 < nT; r0 += p.tileCap)
+    {
+        int32_t const nR = min(p.tileCap, nT - r0);
+        if (r0 > 0)
+        {
+            __syncthreads();
+            stageB(r0, nR);
+            cpAsyncCommit();
+            cpAsyncWait<0>();
+            __syncthreads();
+            loadBase(r0 + warp, bv);
+        }
+        for (int32_t li = warp; li < nR; li += kWarps)
+        {
+            uint4 bvNext[RT];
+            if (li + kWarps < nR)
+            {
+                loadBase(r0 + li + kWarps, bvNext);
+            }
+            int32_t const gt = t0 + r0 + li;
+            int32_t const ti = targetOfTile(p, gt);
+            int32_t const N = p.N[ti];
+            int32_t const n0 = (gt - p.tileOff[ti]) * 16;
+            int32_t const rtT = (p.colOff[ti + 1] - p.colOff[ti]) / 16;
+            half const* bt = bs + static_cast<size_t>(li) * p.rtMax * 256;
+            half* out = p.out[ti];
+            bool const colOk = n0 + lc < N;
+#pragma unroll
+            for (int rt = 0; rt < RT; ++rt)
+            {
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> d;
+                wmma::fill_fragment(d, 0.f);
+                for (int32_t j = 0; j < rtT; ++j)
+                {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa;
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> fb;
+                    wmma::load_matrix_sync(fa, &ts[rt * 16 * L.tsLd + p.colOff[ti] + j * 16], L.tsLd);
+                    wmma::load_matrix_sync(fb, &bt[j * 256], 16);
+                    wmma::mma_sync(d, fa, fb, d);
+                }
+                wmma::store_matrix_sync(wScr, d, 16, wmma::mem_row_major);
+                __syncwarp();
+                int32_t const m = rt * 16 + lr;
+                if (colOk && m < p.M)
+                {
+                    half2 const* bh = reinterpret_cast<half2 const*>(&bv[rt]);
+                    uint4 ov;
+                    half2* oh = reinterpret_cast<half2*>(&ov);
+#pragma unroll
+                    for (int e = 0; e < 4; ++e)
+                    {
+                        float2 const b = __half22float2(bh[e]);
+                        oh[e] = __floats2half2_rn(b.x + roundHalf(wScr[lr * 16 + lc + 2 * e]),
+                            b.y + roundHalf(wScr[lr * 16 + lc + 2 * e + 1]));
+                    }
+                    *reinterpret_cast<uint4*>(&out[static_cast<size_t>(m) * N + n0 + lc]) = ov;
+                }
+                __syncwarp();
+            }
+#pragma unroll
+            for (int rt = 0; rt < RT; ++rt)
+            {
+                bv[rt] = bvNext[rt];
+            }
+        }
+    }
+}
+
 struct DeviceLimits
 {
     int32_t grid{-1};    //!< cooperative grid: one CTA per SM, clamped to kMaxBarrierGrid
@@ -422,7 +786,9 @@ DeviceLimits deviceLimits()
 
 size_t loraGroupWorkspaceBytes(int64_t maxM, int32_t nbTargets, int32_t maxRank) noexcept
 {
-    size_t const part = static_cast<size_t>(kMaxGrid) * 16 * kLoraGroupMaxCols * sizeof(float);
+    size_t const part
+        = std::max(static_cast<size_t>(kMaxGrid) * 16, static_cast<size_t>(kMaxBarrierGrid) * kLoraGroupMidMaxM)
+        * kLoraGroupMaxCols * sizeof(float);
     int32_t const rp16 = (std::max(maxRank, 1) + 15) / 16 * 16;
     int32_t const cols = std::min(nbTargets * rp16, kPrefillMaxCols);
     return std::max({part, loraAddWorkspaceBytes(maxM, maxRank), loraPrefillWorkspaceBytes(maxM, cols)});
@@ -432,7 +798,11 @@ LoraGroupPlan planLoraGroup(
     int64_t M, int32_t K, LoraTarget const* targets, int32_t nbTargets, int32_t grid, size_t smemLimit) noexcept
 {
     LoraGroupPlan plan{};
-    if (grid <= 0 || nbTargets <= 0 || nbTargets > kLoraGroupMaxTargets || M <= 0 || M > 16 || K % 8 != 0)
+    // One launch for short prefills up to kLoraGroupMidMaxM rows on 16+ SMs, up to 32 rows on smaller
+    // grids: with half the CTAs each one streams twice the base rows, and above 32 rows the
+    // shrink + expand path measured faster for gate/up, down and o (8-CTA grid emulated on AGX Orin).
+    int32_t const maxM = grid >= 16 ? kLoraGroupMidMaxM : 32;
+    if (grid <= 0 || nbTargets <= 0 || nbTargets > kLoraGroupMaxTargets || M <= 0 || M > maxM || K % 8 != 0)
     {
         return plan;
     }
@@ -458,6 +828,46 @@ LoraGroupPlan planLoraGroup(
     int32_t kPer = (K + grid - 1) / grid;
     kPer = (kPer + 15) / 16 * 16;
     int32_t const tilesPer = (tiles + grid - 1) / grid;
+    if (M > 16)
+    {
+        // Short prefill: 2 or 4 row tiles; the deepest K ring (up to every chunk, at most 4) with
+        // all tiles staged, else a 2-deep ring (1-deep as a last resort) with the largest round of
+        // tiles that fits.
+        int32_t const rowTiles = M <= 32 ? 2 : 4;
+        int32_t const kc = midChunkRows(rowTiles);
+        int32_t const nChunks = std::max(1, (kPer + kc - 1) / kc);
+        int32_t stages = std::min(nChunks, 4);
+        while (stages > 2 && midLayout(rowTiles, cols, stages, tilesPer, rtMax).total > smemLimit)
+        {
+            --stages;
+        }
+        auto const fitCap = [&](int32_t ring) {
+            int32_t cap = tilesPer;
+            while (cap > 0 && midLayout(rowTiles, cols, ring, cap, rtMax).total > smemLimit)
+            {
+                cap = cap > kWarps ? std::max(kWarps, cap - kWarps) : cap - 1;
+            }
+            return cap;
+        };
+        int32_t cap = fitCap(stages);
+        if (cap <= 0 && stages > 1)
+        {
+            stages = 1;
+            cap = fitCap(stages);
+        }
+        if (cap <= 0)
+        {
+            return plan;
+        }
+        plan.fused = true;
+        plan.grid = grid;
+        plan.tilesPerCta = tilesPer;
+        plan.tilesPerRound = cap;
+        plan.rowTiles = rowTiles;
+        plan.stages = stages;
+        plan.smemBytes = midLayout(rowTiles, cols, stages, cap, rtMax).total;
+        return plan;
+    }
     // Stage every tile at once when it fits; otherwise the largest round that does (at least one
     // tile per warp keeps every warp busy in each round).
     int32_t cap = tilesPer;
@@ -473,6 +883,7 @@ LoraGroupPlan planLoraGroup(
     plan.grid = grid;
     plan.tilesPerCta = tilesPer;
     plan.tilesPerRound = cap;
+    plan.rowTiles = 1;
     plan.smemBytes = smemLayout(kPer, cols, cap, rtMax).total;
     return plan;
 }
@@ -535,11 +946,22 @@ int32_t launchLoraGroupWithLimits(void const* x, int64_t M, int32_t K, LoraTarge
         // Word 0 of the state: this kernel's barrier. The per-target small-M fallback below uses
         // its own word, because its grid size differs and a shared counter would desynchronize.
         p.counter = static_cast<unsigned long long*>(state);
+        void const* kernel = reinterpret_cast<void const*>(loraGroupSmallKernel);
+        int32_t stages = 0;
+        if (plan.rowTiles > 1)
+        {
+            // Short prefill: its own barrier word (same grid as the small kernel, kept separate
+            // so the two paths never depend on each other's launch count).
+            kernel = plan.rowTiles == 2 ? reinterpret_cast<void const*>(loraGroupMidKernel<2>)
+                                        : reinterpret_cast<void const*>(loraGroupMidKernel<4>);
+            stages = plan.stages;
+            p.counter = reinterpret_cast<unsigned long long*>(static_cast<char*>(state) + kLoraMidCounterOffset);
+        }
         // The opt-in above 48 KB is per context: set it for the current one before launching.
         // It is a host-side function attribute, legal during stream capture.
         if (plan.smemBytes > 48 * 1024
             && cudaFuncSetAttribute(
-                   loraGroupSmallKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(plan.smemBytes))
+                   kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(plan.smemBytes))
                 != cudaSuccess)
         {
             (void) cudaGetLastError();
@@ -557,6 +979,14 @@ int32_t launchLoraGroupWithLimits(void const* x, int64_t M, int32_t K, LoraTarge
             attr[0].val.cooperative = 1;
             cfg.attrs = attr;
             cfg.numAttrs = 1;
+            if (plan.rowTiles == 2)
+            {
+                return cudaLaunchKernelEx(&cfg, loraGroupMidKernel<2>, p, stages) == cudaSuccess ? 0 : -1;
+            }
+            if (plan.rowTiles == 4)
+            {
+                return cudaLaunchKernelEx(&cfg, loraGroupMidKernel<4>, p, stages) == cudaSuccess ? 0 : -1;
+            }
             return cudaLaunchKernelEx(&cfg, loraGroupSmallKernel, p) == cudaSuccess ? 0 : -1;
         }
     }
