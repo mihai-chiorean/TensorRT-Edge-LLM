@@ -18,6 +18,7 @@
 #pragma once
 
 #include "common/tensor.h"
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -84,8 +85,19 @@ public:
         return mTensors.size();
     }
 
+    //! @brief Changes whenever set() adds a name or points an existing name at another Tensor, so
+    //! callers can cache name lookups. Setting a name to the Tensor it already holds keeps it.
+    //! Values come from one process-wide counter: two maps share a generation only when one is a
+    //! copy of the other's current contents, so caching by (map address, generation) survives
+    //! assignment between maps.
+    uint64_t generation() const noexcept
+    {
+        return mGeneration;
+    }
+
 private:
     std::unordered_map<std::string, Tensor*> mTensors;
+    uint64_t mGeneration{0};
 };
 
 } // namespace rt

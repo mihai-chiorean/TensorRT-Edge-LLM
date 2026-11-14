@@ -19,6 +19,7 @@
 
 #include "common/tensor.h"
 #include "runtime/config/inferenceDims.h"
+#include "runtime/exec/mapBindingCache.h"
 #include "runtime/exec/tensorMap.h"
 #include <NvInferRuntime.h>
 #include <cstdint>
@@ -72,19 +73,44 @@ public:
      */
     void addTensor(TensorSpec spec);
 
+    //! What bindAll() last applied to a target, per expanded spec, so unchanged bindings skip the
+    //! setters. Owned by the caller next to the context it describes.
+    struct BindingCache
+    {
+        struct Entry
+        {
+            Tensor* tensor{nullptr};
+            uintptr_t address{0};
+            nvinfer1::Dims dims{};
+            bool valid{false};
+        };
+        std::vector<Entry> entries;
+        TensorMap const* map{nullptr}; //!< TensorMap and generation the tensor pointers came from
+        uint64_t generation{0};
+
+        void invalidate() noexcept
+        {
+            entries.clear();
+            map = nullptr;
+        }
+    };
+
     /*!
-     * @brief Bind all registered tensors to a TRT execution context.
+     * @brief Bind all registered tensors through @p target, calling a setter only for bindings
+     * whose address or resolved input shape differs from @p cache.
      *
-     * Resolves symbolic shapes from @p inferenceDims, then calls
-     * @c setTensorAddress and (for inputs) @c setInputShape on each tensor.
+     * Resolves symbolic shapes from @p inferenceDims; inputs get setTensorAddress and
+     * setInputShape, outputs setTensorAddress.
      *
-     * @param ctx TRT execution context
+     * @param target Binding surface (the TRT execution context in production)
      * @param tensorMap Name-to-tensor mapping
      * @param inferenceDims Current symbolic dimension values
+     * @param cache What the previous call applied to the same target
+     * @param[out] changed True if any setter was called
      * @return True if all tensors were bound successfully
      */
-    bool bindAll(
-        nvinfer1::IExecutionContext* ctx, TensorMap const& tensorMap, InferenceDims const& inferenceDims) const;
+    bool bindAll(BindingTarget& target, TensorMap const& tensorMap, InferenceDims const& inferenceDims,
+        BindingCache& cache, bool& changed) const;
 
     /*!
      * @brief Return the set of `InferenceDims` members referenced by any symbolic
