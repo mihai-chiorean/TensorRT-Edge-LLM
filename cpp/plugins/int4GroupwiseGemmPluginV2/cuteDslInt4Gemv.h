@@ -27,6 +27,8 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
+#include "cuteDslInt4Gemm.h"
+
 namespace trt_edgellm
 {
 namespace plugins
@@ -49,6 +51,12 @@ bool cuteDslInt4GemvSupported(int32_t M);
 //! success, -1 if M or groupSize is unsupported or a launch fails.
 int32_t cuteDslInt4GemvLaunch(int32_t M, void const* A, void const* fragW, void const* scales, void* Out, int32_t N,
     int32_t K, int32_t groupSize, cudaStream_t stream);
+
+#ifdef CUTE_DSL_INT4_FP16_GEMM_LORA_ENABLED
+//! The decode GEMV with the dynamic-LoRA epilogue; M <= 8 (one 8-row M-tile).
+int32_t cuteDslInt4GemvLoraLaunch(int32_t M, void const* A, void const* fragW, void const* scales, void* Out,
+    CuteDslInt4LoraArgs const& lora, int32_t N, int32_t K, int32_t groupSize, cudaStream_t stream);
+#endif
 
 } // namespace plugins
 } // namespace trt_edgellm

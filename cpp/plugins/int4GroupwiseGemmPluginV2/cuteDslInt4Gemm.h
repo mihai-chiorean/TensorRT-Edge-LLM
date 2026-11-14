@@ -22,9 +22,21 @@
 // cuteDSL fragment layout (repacked at export time, bN=128 pinned), so there is
 // no runtime repack and no cached second buffer. Gated on the cuteDSL artifact
 // being built with the int4_fp16_gemm group.
-#ifdef CUTE_DSL_INT4_FP16_GEMM_ENABLED
 
 #include <cstdint>
+
+namespace trt_edgellm
+{
+namespace plugins
+{
+//! Largest LoRA rank the fused expand epilogue serves. Defined in every build, so the plugin's
+//! shape checks compile without the CuTe DSL artifact.
+inline constexpr int32_t kCuteDslInt4LoraMaxRank{16};
+} // namespace plugins
+} // namespace trt_edgellm
+
+#ifdef CUTE_DSL_INT4_FP16_GEMM_ENABLED
+
 #include <cuda_runtime.h>
 
 namespace trt_edgellm
@@ -78,6 +90,21 @@ int64_t cuteDslInt4LockCount(int32_t M, int32_t N, int32_t bM, int32_t bN);
 //! swizzle: grouped-M width. Returns 0 on success.
 int32_t cuteDslInt4GemmLaunch(CuteDslInt4Variant const& v, void const* A, void const* fragW, void const* scales,
     void* C, void* locks, int32_t M, int32_t N, int32_t K, int32_t groupSize, int32_t swizzle, cudaStream_t stream);
+
+//! Dynamic-LoRA operands of the `*_lora_*` variants (kernelSrcs/int4_fp16_gemm_cutedsl/int4_lora.py):
+//! t [M, 16] fp16 = fp16(x @ A) from LoraShrinkPlugin (zero past the rank), b [rank, N] fp16.
+struct CuteDslInt4LoraArgs
+{
+    void const* t;
+    void const* b;
+    int32_t rank;
+};
+
+#ifdef CUTE_DSL_INT4_FP16_GEMM_LORA_ENABLED
+int32_t cuteDslInt4GemmLoraLaunch(CuteDslInt4Variant const& v, void const* A, void const* fragW, void const* scales,
+    void* C, void* locks, CuteDslInt4LoraArgs const& lora, int32_t M, int32_t N, int32_t K, int32_t groupSize,
+    int32_t swizzle, cudaStream_t stream);
+#endif
 
 } // namespace plugins
 } // namespace trt_edgellm

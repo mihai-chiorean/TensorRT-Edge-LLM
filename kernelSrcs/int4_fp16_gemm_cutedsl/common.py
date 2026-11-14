@@ -78,6 +78,12 @@ def make_lock_placeholder(*, assumed_align: int = 16):
     )
 
 
+def make_lora_placeholders():
+    """Storage-free descriptors for the LoRA operands of the ``*Lora*`` variants:
+    ``(mT [M, 16] fp16, mLB [rank, N] fp16)``."""
+    return make_row_major_2d_placeholder(cutlass.Float16), make_row_major_2d_placeholder(cutlass.Float16)
+
+
 def export_compiled_kernel(
     compiled_kernel, *, output_dir: str, file_name: str, function_prefix: str, tag: str
 ):

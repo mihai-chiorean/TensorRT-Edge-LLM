@@ -545,6 +545,22 @@ function(cute_dsl_setup)
     )
   endif()
 
+  # Dynamic-LoRA epilogue variants (int4_lora.py) exist only in regenerated artifacts.
+  list(FIND _variants "int4_fp16_gemm_lora_16x128x64_s3_sk1" _int4_lora_idx)
+  list(FIND _variants "int4_fp16_gemv_lora_m1" _int4_gemv_lora_idx)
+  if(NOT ${_int4_lora_idx} EQUAL -1
+     AND NOT ${_int4_gemv_lora_idx} EQUAL -1
+     AND "int4_fp16_gemm" IN_LIST _active_groups)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(${_tgt}
+                                 PRIVATE "CUTE_DSL_INT4_FP16_GEMM_LORA_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: INT4 W4A16 LoRA epilogue variants found - CUTE_DSL_INT4_FP16_GEMM_LORA_ENABLED set"
+    )
+  endif()
+
   # Variant-specific GDN paths require the runner enabled by the gdn group;
   # artifact availability alone must not activate them.
   list(FIND _variants "gdn_prefill_blackwell" _bw_idx)

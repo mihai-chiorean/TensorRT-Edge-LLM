@@ -61,6 +61,25 @@ namespace
     X(int4_fp16_gemv_m7##SUFFIX, 7)                                                                                    \
     X(int4_fp16_gemv_m8##SUFFIX, 8)
 #define INT4_FP16_GEMV_VARIANTS_G128(X) INT4_FP16_GEMV_VARIANTS_G(X, )
+#define INT4_FP16_GEMV_LORA_VARIANTS_G(X, SUFFIX)                                                                      \
+    X(int4_fp16_gemv_lora_m1##SUFFIX, 1)                                                                               \
+    X(int4_fp16_gemv_lora_m2##SUFFIX, 2)                                                                               \
+    X(int4_fp16_gemv_lora_m3##SUFFIX, 3)                                                                               \
+    X(int4_fp16_gemv_lora_m4##SUFFIX, 4)                                                                               \
+    X(int4_fp16_gemv_lora_m5##SUFFIX, 5)                                                                               \
+    X(int4_fp16_gemv_lora_m6##SUFFIX, 6)                                                                               \
+    X(int4_fp16_gemv_lora_m7##SUFFIX, 7)                                                                               \
+    X(int4_fp16_gemv_lora_m8##SUFFIX, 8)
+#ifdef CUTE_DSL_INT4_FP16_GEMM_LORA_ENABLED
+#define INT4_FP16_GEMV_LORA_VARIANTS_G128(X) INT4_FP16_GEMV_LORA_VARIANTS_G(X, )
+#else
+#define INT4_FP16_GEMV_LORA_VARIANTS_G128(X)
+#endif
+#if defined(CUTE_DSL_INT4_FP16_GEMM_G32_ENABLED) && defined(CUTE_DSL_INT4_FP16_GEMM_LORA_ENABLED)
+#define INT4_FP16_GEMV_LORA_VARIANTS_G32(X) INT4_FP16_GEMV_LORA_VARIANTS_G(X, _g32)
+#else
+#define INT4_FP16_GEMV_LORA_VARIANTS_G32(X)
+#endif
 #ifdef CUTE_DSL_INT4_FP16_GEMM_G32_ENABLED
 #define INT4_FP16_GEMV_VARIANTS_G32(X) INT4_FP16_GEMV_VARIANTS_G(X, _g32)
 #else
@@ -71,6 +90,8 @@ namespace
 #define DECL_MODULE(prefix, M) prefix##_Kernel_Module_t g_##prefix{};
 INT4_FP16_GEMV_VARIANTS_G128(DECL_MODULE)
 INT4_FP16_GEMV_VARIANTS_G32(DECL_MODULE)
+INT4_FP16_GEMV_LORA_VARIANTS_G128(DECL_MODULE)
+INT4_FP16_GEMV_LORA_VARIANTS_G32(DECL_MODULE)
 #undef DECL_MODULE
 
 bool gLoadedG128 = false;
@@ -88,6 +109,7 @@ bool loadModulesG128()
 {
     bool ok = true;
     INT4_FP16_GEMV_VARIANTS_G128(LOAD_MODULE)
+    INT4_FP16_GEMV_LORA_VARIANTS_G128(LOAD_MODULE)
     return ok;
 }
 
@@ -95,6 +117,7 @@ bool loadModulesG32()
 {
     bool ok = true;
     INT4_FP16_GEMV_VARIANTS_G32(LOAD_MODULE)
+    INT4_FP16_GEMV_LORA_VARIANTS_G32(LOAD_MODULE)
     return ok;
 }
 #undef LOAD_MODULE
@@ -173,8 +196,52 @@ int32_t cuteDslInt4GemvLaunch(int32_t M, void const* A, void const* fragW, void 
     return -1; // M outside [1, kGemvMaxM]
 }
 
+#ifdef CUTE_DSL_INT4_FP16_GEMM_LORA_ENABLED
+int32_t cuteDslInt4GemvLoraLaunch(int32_t M, void const* A, void const* fragW, void const* scales, void* Out,
+    CuteDslInt4LoraArgs const& lora, int32_t N, int32_t K, int32_t groupSize, cudaStream_t stream)
+{
+    bool const loaded = (groupSize == 32) ? gLoadedG32 : (groupSize == 128) ? gLoadedG128 : false;
+    if (!loaded || lora.rank < 1 || lora.rank > kCuteDslInt4LoraMaxRank)
+    {
+        return -1;
+    }
+    int32_t const qwRows = divUp(N, kBN) * divUp(K, kBK) * (kBK / 16) * (kBN / 64);
+    int32_t const scaleRows = divUp(K, groupSize);
+#define DISPATCH(prefix, VM)                                                                                           \
+    if (M == (VM))                                                                                                     \
+    {                                                                                                                  \
+        prefix##_Tensor_mA_t tA{};                                                                                     \
+        SET_2D(tA, A, M, K);                                                                                           \
+        prefix##_Tensor_mQW_t tW{};                                                                                    \
+        SET_2D(tW, fragW, qwRows, 128);                                                                                \
+        prefix##_Tensor_mScales_t tS{};                                                                                \
+        SET_2D(tS, scales, scaleRows, N);                                                                              \
+        prefix##_Tensor_mOut_t tOut{};                                                                                 \
+        SET_2D(tOut, Out, M, N);                                                                                       \
+        prefix##_Tensor_mT_t tT{};                                                                                     \
+        SET_2D(tT, lora.t, M, kCuteDslInt4LoraMaxRank);                                                                \
+        prefix##_Tensor_mLB_t tLB{};                                                                                   \
+        SET_2D(tLB, lora.b, lora.rank, N);                                                                             \
+        return cute_dsl_##prefix##_wrapper(&g_##prefix, &tA, &tW, &tS, &tOut, &tT, &tLB, lora.rank, stream);           \
+    }
+    if (groupSize == 32)
+    {
+        INT4_FP16_GEMV_LORA_VARIANTS_G32(DISPATCH)
+    }
+    else
+    {
+        INT4_FP16_GEMV_LORA_VARIANTS_G128(DISPATCH)
+    }
+#undef DISPATCH
+    return -1;
+}
+#endif // CUTE_DSL_INT4_FP16_GEMM_LORA_ENABLED
+
 #undef SET_2D
 #undef INT4_FP16_GEMV_VARIANTS_G
+#undef INT4_FP16_GEMV_LORA_VARIANTS_G
+#undef INT4_FP16_GEMV_LORA_VARIANTS_G128
+#undef INT4_FP16_GEMV_LORA_VARIANTS_G32
 #undef INT4_FP16_GEMV_VARIANTS_G128
 #undef INT4_FP16_GEMV_VARIANTS_G32
 #undef INT4_FP16_GEMV_VARIANTS
