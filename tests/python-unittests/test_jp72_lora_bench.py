@@ -162,6 +162,19 @@ class FakeRtModule(types.ModuleType):
                 raise TypeError(
                     "context_cache_config: the pybind binding requires a "
                     "ContextCacheConfig, not None")
+            # ModelArtifacts::loadFromEngineDir reads config.json (plain) or
+            # base_config.json (MTP) from engine_dir itself; a bundle root
+            # without /llm makes the runtime fail to open its runtime config.
+            engine_dir = pathlib.Path(got[params.index("engine_dir")])
+            if engine_dir.name != "llm":
+                raise TypeError(
+                    f"engine_dir: expected the <bundle>/llm directory, got "
+                    f"{engine_dir}")
+            expected_config = "base_config.json" if kind == "MTP" \
+                else "config.json"
+            if not (engine_dir / expected_config).is_file():
+                raise TypeError(
+                    f"engine_dir: {expected_config} not found in {engine_dir}")
 
         class LLMRuntime:
 
@@ -237,6 +250,11 @@ def bench_env(monkeypatch, tmp_path):
     (engine_dir / "visual").mkdir()
     (engine_dir / "llm" / "tokenizer.json").write_text(
         (tmp_path / "tokenizer.json").read_text(), encoding="utf-8")
+    # The fake runtime checks that the LLM engine dir carries the runtime
+    # config the real one loads (config.json plain / base_config.json MTP).
+    (engine_dir / "llm" / "config.json").write_text("{}", encoding="utf-8")
+    (engine_dir / "llm" / "base_config.json").write_text("{}",
+                                                         encoding="utf-8")
 
     module = load_lora_bench()
 
@@ -272,13 +290,14 @@ def ctor_args_dict(args, params):
 
 def test_mtp_constructor_matches_pybind_signature(bench_env):
     """The MTP path must call the 12-arg pybind constructor with a real
-    ContextCacheConfig, <engine>/visual and the benchmarked 2/5/12 shape."""
+    ContextCacheConfig, <engine>/llm, <engine>/visual, the benchmarked
+    2/5/12 shape and host-mapped embedding tables (as the probe did)."""
     module, run, state, engine_dir = bench_env
     rc = run(["--engine", str(engine_dir), "--mtp"] + BASE_ARGS)
     assert rc == 0
 
     args = ctor_args_dict(last_ctor_call(state), MTP_CTOR_PARAMS)
-    assert args["engine_dir"] == str(engine_dir)
+    assert args["engine_dir"] == str(engine_dir / "llm")
     assert args["multimodal_engine_dir"] == str(engine_dir / "visual")
     assert args["draft_top_k"] == module.DEFAULT_DRAFT_TOP_K == 2
     assert args["draft_step"] == module.DEFAULT_DRAFT_STEP == 5
@@ -288,19 +307,20 @@ def test_mtp_constructor_matches_pybind_signature(bench_env):
     assert isinstance(args["context_cache_config"], FakeContextCacheConfig)
     assert args["context_cache_config"].enabled is True
     assert args["dflash_block_size"] == 0
-    assert args["host_embedding_tables"] is False
+    assert args["host_embedding_tables"] is True
     assert args["host_ple_table"] is False
 
 
 def test_plain_constructor_matches_pybind_signature(bench_env):
-    """The plain path must call the 7-arg pybind constructor."""
+    """The plain path must call the 7-arg pybind constructor with
+    <engine>/llm and device-side embedding tables."""
     module, run, state, engine_dir = bench_env
     state["mtp"] = False
     rc = run(["--engine", str(engine_dir)] + BASE_ARGS)
     assert rc == 0
 
     args = ctor_args_dict(last_ctor_call(state), PLAIN_CTOR_PARAMS)
-    assert args["engine_dir"] == str(engine_dir)
+    assert args["engine_dir"] == str(engine_dir / "llm")
     assert args["multimodal_engine_dir"] == str(engine_dir / "visual")
     assert args["checkpoint_dir"] == ""
     assert isinstance(args["context_cache_config"], FakeContextCacheConfig)
@@ -309,14 +329,28 @@ def test_plain_constructor_matches_pybind_signature(bench_env):
     assert args["host_ple_table"] is False
 
 
+def test_device_embedding_tables_flag_opts_out_for_mtp(bench_env):
+    """--device-embedding-tables must pass host_embedding_tables=False on the
+    MTP path (default stays True, mirroring the original probe)."""
+    module, run, state, engine_dir = bench_env
+    rc = run(
+        ["--engine",
+         str(engine_dir), "--mtp", "--device-embedding-tables"] + BASE_ARGS)
+    assert rc == 0
+    args = ctor_args_dict(last_ctor_call(state), MTP_CTOR_PARAMS)
+    assert args["host_embedding_tables"] is False
+
+
 def test_visual_dir_falls_back_to_empty_when_missing(bench_env, tmp_path):
-    """No <engine>/visual directory: the pybind default '' must be passed."""
+    """No <engine>/visual directory: the pybind default '' must be passed,
+    while engine_dir stays <engine>/llm."""
     module, run, state, engine_dir = bench_env
     (engine_dir / "visual").rmdir()
     rc = run(["--engine", str(engine_dir), "--mtp"] + BASE_ARGS)
     assert rc == 0
     args = ctor_args_dict(last_ctor_call(state), MTP_CTOR_PARAMS)
     assert args["multimodal_engine_dir"] == ""
+    assert args["engine_dir"] == str(engine_dir / "llm")
 
 
 def test_no_reuse_disables_context_cache(bench_env):

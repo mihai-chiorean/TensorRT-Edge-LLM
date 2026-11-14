@@ -33,6 +33,7 @@
 #       --build-dir "$B" -- \
 #       base:/data/engines/gemma4:plain \
 #       mtp:/data/engines/gemma4-mtp:mtp:adapterA=/data/adapters/a
+# engine_dir is the bundle root holding llm/ (and visual/ when present).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -62,7 +63,8 @@ Usage: lora_nx_measure.sh --expect-serial SERIAL --out DIR [--build-dir DIR]
 
   ENGINE SPEC: tag:engine_dir:mtp|plain[:adapter=path]
     tag          short name used for the log files
-    engine_dir   directory passed to lora_bench.py --engine
+    engine_dir   engine bundle directory passed to lora_bench.py --engine
+                 (the bench loads the LLM engine from <bundle>/llm)
     mtp|plain    whether --mtp is passed
     adapter=path optional NAME=PATH pair; may repeat after further colons
                  (e.g. tag:dir:mtp:a=/x:b=/y); every adapter=path field is

@@ -172,9 +172,10 @@ def parse_args(argv=None):
         prog="lora_bench.py",
         description=
         "LoRA/MTP engine bench (Jetson; touches CUDA via the pybind runtime).")
-    parser.add_argument("--engine",
-                        required=True,
-                        help="Engine directory (base+draft for --mtp).")
+    parser.add_argument(
+        "--engine",
+        required=True,
+        help="Engine bundle directory containing llm/ (base+draft for --mtp).")
     parser.add_argument(
         "--mtp",
         action="store_true",
@@ -225,6 +226,14 @@ def parse_args(argv=None):
         type=int,
         default=DEFAULT_VERIFY_TREE_SIZE,
         help="MTP verify tree size (--mtp only; default: %(default)s).")
+    parser.add_argument(
+        "--device-embedding-tables",
+        action="store_true",
+        help=
+        "MTP only: keep the embedding tables on device instead of host-mapped "
+        "(the default mirrors the original probe, which passed True for "
+        "host_embedding_tables and matches --host-embedding-tables in the "
+        "server).")
     parser.add_argument(
         "--out",
         metavar="FILE.jsonl",
@@ -539,24 +548,30 @@ def read_spec_metrics(runtime):
 def load_runtime(rt, args, lora_map):
     """Construct LLMRuntime for a plain or MTP engine.
 
-    Mirrors the original probe and the production runtime wiring: the
+    Mirrors the original probe and the production runtime wiring: the LLM
+    engine dir is ``<engine>/llm`` (the runtime loads ``config.json`` /
+    ``base_config.json`` relative to it, not the bundle root), the
     multimodal dir is ``<engine>/visual`` when present (empty string
     otherwise, the pybind default for text-only engines), the context cache
     config is always a real ``rt.ContextCacheConfig`` (``None`` fails the
-    pybind constructor), and the MTP drafting shape defaults to the
-    benchmarked top-2 / 5-step / verify-12 tree, overridable by flags.
+    pybind constructor), MTP defaults to host-mapped embedding tables like
+    the original probe (``--device-embedding-tables`` opts out), and the
+    MTP drafting shape defaults to the benchmarked top-2 / 5-step /
+    verify-12 tree, overridable by flags.
     """
+    engine_dir = os.path.join(args.engine, "llm")
     visual_dir = os.path.join(args.engine, "visual")
     if not os.path.isdir(visual_dir):
         visual_dir = ""
     cc = rt.ContextCacheConfig()
     cc.enabled = not args.no_reuse
+    host_embedding_tables = args.mtp and not args.device_embedding_tables
     if args.mtp:
-        return rt.LLMRuntime(args.engine, visual_dir, lora_map,
+        return rt.LLMRuntime(engine_dir, visual_dir, lora_map,
                              args.draft_top_k, args.draft_step,
-                             args.verify_tree_size, "", "", cc, 0, False,
-                             False)
-    return rt.LLMRuntime(args.engine, visual_dir, lora_map, "", cc, False,
+                             args.verify_tree_size, "", "", cc, 0,
+                             host_embedding_tables, False)
+    return rt.LLMRuntime(engine_dir, visual_dir, lora_map, "", cc, False,
                          False)
 
 
