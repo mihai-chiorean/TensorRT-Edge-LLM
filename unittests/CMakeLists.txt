@@ -251,6 +251,8 @@ edgellm_add_unit_test(
   cpp/kernels/audioAttentionKernels
   cpp/kernels/sparseAttention)
 
+edgellm_add_unit_test(NAME unitTestLoraGroup DIRS cpp/kernels/loraKernels)
+
 edgellm_add_unit_test(NAME unitTestKernelsMoe DIRS cpp/kernels/moe)
 
 edgellm_add_unit_test(NAME unitTestKernelsW2A16Gemm DIRS cpp/kernels/gemm)
@@ -314,6 +316,7 @@ edgellm_add_unit_test(
   unitTestPlugins
   DIRS
   cpp/plugins/int4GroupwiseGemmPlugin
+  cpp/plugins/loraGroupPlugin
   cpp/plugins/nvfp4A16GemmPlugin
   cpp/plugins/nvfp4A16BlackwellMoePlugin
   cpp/plugins/allReducePlugin
