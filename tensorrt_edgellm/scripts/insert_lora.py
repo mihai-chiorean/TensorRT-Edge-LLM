@@ -63,6 +63,14 @@ def main(argv=None, *, prog="tensorrt-edgellm-insert-lora") -> None:
         action="store_true",
         help=("Emit grouped, in-place LoraGroupPlugin nodes instead of "
               "MatMul/MatMul/Add branches (needs the matching plugin library)."))
+    parser.add_argument(
+        "--lora-fused-int4",
+        "--lora_fused_int4",
+        action="store_true",
+        help=("Fuse the LoRA branch of every INT4 (Int4GroupwiseGemmPluginV2) "
+              "GEMM into the GEMM's epilogue (Int4GroupwiseGemmLoraPlugin, "
+              "rank <= 16; needs a CuTe DSL artifact with the LoRA variants). "
+              "Other targets keep the branch chosen above."))
 
     args = parser.parse_args(argv)
     from tensorrt_edgellm.lora_targets import parse_lora_targets
@@ -77,7 +85,8 @@ def main(argv=None, *, prog="tensorrt-edgellm-insert-lora") -> None:
         # Insert LoRA patterns
         insert_lora_and_save(onnx_dir=args.onnx_dir,
                              lora_targets=lora_targets,
-                             lora_group_plugin=args.lora_group_plugin)
+                             lora_group_plugin=args.lora_group_plugin,
+                             lora_fused_int4=args.lora_fused_int4)
 
         print("LoRA insertion completed successfully!")
 
