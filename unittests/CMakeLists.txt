@@ -171,6 +171,8 @@ edgellm_add_unit_test(
   NAME unitTestKernelsAttention DIRS cpp/kernels/contextAttentionKernels
   cpp/kernels/decodeAttentionKernels cpp/kernels/audioAttentionKernels)
 
+edgellm_add_unit_test(NAME unitTestLoraGroup DIRS cpp/kernels/loraKernels)
+
 edgellm_add_unit_test(NAME unitTestKernelsMoe DIRS cpp/kernels/moe)
 
 # CuTe DSL AOT wrappers lower extended launches through the runtime's
@@ -221,6 +223,7 @@ edgellm_add_unit_test(
   unitTestPlugins
   DIRS
   cpp/plugins/int4GroupwiseGemmPlugin
+  cpp/plugins/loraGroupPlugin
   cpp/plugins/nvfp4A16GemmPlugin
   cpp/plugins/nvfp4A16BlackwellMoePlugin
   cpp/plugins/allReducePlugin)
