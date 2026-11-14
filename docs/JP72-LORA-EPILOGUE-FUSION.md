@@ -347,9 +347,13 @@ Kernel and plugin level (AGX):
    changes follows the new B. The shrink plugin test runs decode and
    tensor-core M buckets alternately on one instance with poisoned outputs
    before each launch, so a counter left non-zero fails.
-5. **compute-sanitizer: not run.** The AGX user is not in the `debug` group
-   that owns `/dev/nvhost-dbg-gpu`, so every tool stops with "GPU debugging
-   features are disabled". It needs that group membership (an admin step).
+5. **compute-sanitizer (AGX):**
+   - memcheck is clean on the plugin unit tests. On the shrink kernels, memcheck, synccheck and racecheck report no errors.
+   - Under racecheck, the shrink kernels' results are wrong and their counters are left non-zero. Racecheck itself reports zero hazards.
+   - The textbook threadfence reduction runs correctly under racecheck.
+   - Without the sanitizer, 2,700 back-to-back shrink launches across nine shapes stay bit-identical with zero counters. The graph-replay checks also pass.
+   - The cause of the racecheck-only behaviour is open. It is not a confirmed bug.
+   - An engine-level run under the sanitizer did not get past runtime initialisation in 45 minutes.
 
 Engine level (AGX, greedy, top-5 logprobs). The golden set is 22 prompts
 (4 with an image; a fixed test JPEG stands in for the camera frame, so the
@@ -382,8 +386,7 @@ fused and on the grouped engine). It is not caused by the LoRA kernels: the
 adapter-off fused engine runs no LoRA kernel and shows it, and so does the
 rank-0 engine. Its source is in the base engine and is not investigated here.
 
-Still to run: cross-device equality of an AGX-built engine on the NX, and
-compute-sanitizer once the debug group is granted.
+Cross-device and NX results are in section 9.
 
 ## 7. Measurements (AGX Orin, MAXN)
 
@@ -508,24 +511,34 @@ not own and is not proposed here.
 
 ## 9. Orin NX (SM87, 8 SMs, 102.4 GB/s)
 
-Not measured yet. What carries over from the AGX:
-- No SM-count tuning. The shrink tree, chunking and variants depend only on
-  the shape; the decode tree gives the same `t16` on 8 and 16 SMs.
-- No residency requirement: the GEMM has no inter-CTA wait, and the shrink's
-  last-block reduction needs none either.
-- Shared memory: +4.6 KB per bM = 16 GEMM CTA (within the SM87 budget at the
-  register-capped occupancy); GEMV +0.8 KB.
-- The shrink is latency-bound, and the NX at 25 W runs a lower clock, so its
-  fixed costs should be relatively larger than on the AGX. A rough expectation
-  is a LoRA cost of 2.0 to 2.5 ms per token against the grouped plugin's
-  2.94 ms, on a base step of about 43 ms (about 94 to 95% before any host
-  overhead). This is an estimate to be replaced by the NX measurement.
-- The prefill gain should carry over in proportion: the grouped plugin adds
-  81 ms at 800 tokens and 159 ms at 1,600 tokens on the NX.
+Measured 2026-11-14 on the robot's Orin NX 16 GB:
+- Setup: 40 W mode with jetson_clocks pinned, services stopped. Binaries were built at #87 with `ENABLE_CUTE_DSL=ALL`. All engines were built on the NX in one session. MTP uses the AGX-built draft.
 
-The NX measurements will be batched into one supervised window: decode off
-and on, TTFT at 20/800/1600, for rank 0, grouped and fused, with AGX-built MTP
-drafts.
+| Engine | Decode off (tok/s) | Decode on (tok/s) | On vs rank 0 | LoRA cost, same engine |
+|---|---:|---:|---:|---:|
+| rank 0 | 30.18 | - | 100% | - |
+| grouped | 29.63 | 27.28 | 90.4% | 2.91 ms/token |
+| fused | 29.55 | 28.03 | 92.9% | 1.84 ms/token |
+
+- TTFT with the adapter, as the increase over the same engine with the adapter off:
+
+  | Engine | 20 tokens | 800 tokens | 1600 tokens |
+  |---|---:|---:|---:|
+  | grouped | +9.5 ms | +83.1 ms | +139.3 ms |
+  | fused | +6.9 ms | +47.1 ms | +102.7 ms |
+
+- The fused prefill gain is smaller on the NX than on the AGX: about 26% less LoRA prefill cost at 1600 tokens, against about 65% on the AGX. The CUDA-core expand costs relatively more on 8 SMs. The tensor-core expand follow-up targets it.
+- MTP with the adapter: fused 101.8 / 36.7 tok/s (count / story) against grouped 102.3 / 36.9, and rank 0 at 110.1 / 40.0. That is parity, not a gain.
+- Equality:
+  - Golden checks pass 38/38 on every engine.
+  - Fused with the adapter off equals rank 0 on 9/9 tool prompts and 22/22 golden prompts.
+  - Fused against grouped with the adapter on: 8/9 tool prompts and 22/22 golden prompts. The one difference is a near tie.
+  - The AGX-built fused engine run on the NX against the same engine on the AGX: 9/9 tool prompts and 20/22 golden prompts. One difference is the `safety-pii` near tie. The other is a vision prompt: the visual engine differs between the two devices.
+  - Log-probabilities are not bit-identical across devices. With the run-to-run noise in section 6, bit equality across devices cannot be shown.
+- Memory and swap:
+  - Decode jobs peaked at about 10.0 GiB (cgroup), with at least 4.0 GiB available.
+  - Engine builds peaked at 8.6 to 9.2 GiB.
+  - Swap stayed at about 0.9 to 1.1 GiB throughout.
 
 ## 10. Status and next steps
 
@@ -536,10 +549,10 @@ drafts.
 | `Int4GroupwiseGemmLoraPlugin`, `insert-lora --lora-fused-int4`, builder predicates | Built; plugin and insertion tests pass |
 | AGX decode, TTFT and MTP | Measured (section 7) |
 | Engine-level equality | Done on the AGX (section 6) |
-| compute-sanitizer | Blocked: needs the `debug` group on the AGX |
+| compute-sanitizer | Results below |
 | Expand on tensor cores (prefill and MTP verify M) | Separate follow-up |
 | INT8 factors | With step 3 |
-| NX | Batched window to be scheduled |
+| NX | Measured (section 9) |
 
 The implementation is split into three stacked PRs on #80: the shrink
 plugin, the INT4 expand epilogue and its plugin form, then insertion and the
