@@ -194,6 +194,10 @@ struct LLMBuilderConfig
     //! Total K-page budget for the independent SWA pool (0 = auto-size when reduced markers are present).
     int64_t numSwaPages{0};
     HardwareCompatibility hardwareCompatibility{HardwareCompatibility::kNONE};
+    //! Rank the runtime binds for LoRA inputs no adapter covers: 0 when every LoRA branch is a
+    //! LoraGroupPlugin node (skipped at rank 0), 1 for MatMul branches (rank-1 zero dummies).
+    //! Kept last so existing positional initializers remain source-compatible.
+    int32_t loraInactiveRank{1};
 
     //! Resolve and store the positive SWA page budget once SWA capability markers are known.
     //! A zero configured value selects the bounded builder default; runtime config does not use this auto mode.
@@ -245,6 +249,10 @@ struct LLMBuilderConfig
         json["spec_base"] = specBase;
         json["max_batch_size"] = maxBatchSize;
         json["max_lora_rank"] = maxLoraRank;
+        if (maxLoraRank > 0)
+        {
+            json["lora_inactive_rank"] = loraInactiveRank;
+        }
         json["max_kv_cache_capacity"] = maxKVCacheCapacity;
         json["max_kv_pool_pages"] = resolvedKVPoolPages();
         json["ragged_backend"] = raggedBackend;
@@ -303,6 +311,10 @@ struct LLMBuilderConfig
         if (json.contains("max_lora_rank"))
         {
             config.maxLoraRank = json["max_lora_rank"];
+        }
+        if (json.contains("lora_inactive_rank"))
+        {
+            config.loraInactiveRank = json["lora_inactive_rank"];
         }
         if (json.contains("max_kv_cache_capacity"))
         {

@@ -31,6 +31,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cuda_fp16.h>
 #include <limits>
@@ -356,8 +357,9 @@ private:
 
 } // namespace
 
-LoRAManager::LoRAManager(int32_t maxSupportedLoraRank) noexcept
+LoRAManager::LoRAManager(int32_t maxSupportedLoraRank, int32_t inactiveRank) noexcept
     : mMaxSupportedLoraRank(maxSupportedLoraRank)
+    , mInactiveRank(inactiveRank == 0 ? 0 : 1)
 {
 }
 
@@ -574,6 +576,25 @@ bool LoRAManager::hasWeightFor(std::string const& bindingName) const noexcept
 
 void LoRAManager::initializeEngineBindings(EngineExecutor const& runner)
 {
+    // Unused LoRA inputs are allocated at rank 1 and bound at the engine's recorded inactive
+    // rank: 0 for LoraGroupPlugin engines, which skip such targets, 1 for MatMul branches.
+    // EDGELLM_LORA_EMPTY_RANK=1 forces rank-1 dummies (A/B measurements); it can never lower
+    // an engine's recorded rank, because MatMul branches return garbage at rank 0.
+    int32_t emptyRank = mInactiveRank;
+    if (char const* const v = std::getenv("EDGELLM_LORA_EMPTY_RANK"); v != nullptr)
+    {
+        if (std::strcmp(v, "1") == 0)
+        {
+            emptyRank = 1;
+        }
+        else if (std::strcmp(v, "0") != 0 || mInactiveRank != 0)
+        {
+            LOG_WARNING("LoRAManager: ignoring EDGELLM_LORA_EMPTY_RANK=%s (this engine binds unused LoRA inputs "
+                        "at rank %d; only 1 may override it)",
+                v, mInactiveRank);
+        }
+    }
+    LOG_INFO("LoRAManager: unused LoRA inputs bound at rank %d", emptyRank);
     constexpr int32_t kEmptyLoraRank = 1;
 
     std::vector<std::string> names = collectLoraWeightsTensorNames(runner);
@@ -606,6 +627,20 @@ void LoRAManager::initializeEngineBindings(EngineExecutor const& runner)
         auto [it, inserted] = dummyTensors.emplace(
             name, rt::Tensor(shape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "loraDummy_" + name));
         CUDA_CHECK(cudaMemset(it->second.rawPointer(), 0, it->second.getMemoryCapacity()));
+        if (emptyRank == 0)
+        {
+            // Zero-volume binding on a valid allocation.
+            rt::Coords zeroRank = it->second.getShape();
+            if (name.find(binding_names::kLoraAPrefix) != std::string::npos)
+            {
+                zeroRank[zeroRank.getNumDims() - 1] = 0;
+            }
+            else
+            {
+                zeroRank[0] = 0;
+            }
+            check::check(it->second.reshape(zeroRank), "LoRA dummy reshape to rank 0 failed");
+        }
         maxShapes.emplace(name, maxShape);
     }
 

@@ -167,6 +167,7 @@ struct LLMEngineConfig
     int32_t pleHiddenSize{0};        //!< Hidden dimension of each PLE tensor (0 = disabled)
     int32_t padTokenId{0};           //!< PLE row gathered for media placeholder tokens
     int32_t maxSupportedLoraRank{0}; //!< Maximum LoRA rank (0 = no LoRA)
+    int32_t loraInactiveRank{1};     //!< Rank bound for LoRA inputs no adapter covers (0 or 1)
 
     //! Additional EOS token IDs parsed from config.json `eos_token_id` array.
     //! Models like Gemma4 have multiple EOS tokens (e.g. [1, 106] for <eos> and <turn|>).
