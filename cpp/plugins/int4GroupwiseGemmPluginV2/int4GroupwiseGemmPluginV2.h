@@ -54,6 +54,14 @@ public:
     Int4GroupwiseGemmPluginV2(std::string const& name, int32_t N, int32_t K, int32_t groupSize);
 
     /*!
+     * @brief Construct the dynamic-LoRA form (registered as Int4GroupwiseGemmLoraPlugin)
+     * @details Input 3 is t16 = fp16(x @ A) [.., 16] from LoraShrinkPlugin and input 4 is lora_B
+     * [rank, N] (FP16). The output is fp16(base + fp16(t16 @ B)) computed in the INT4 kernel's
+     * epilogue; a rank-0 binding runs the plain kernel. See docs/JP72-LORA-EPILOGUE-FUSION.md.
+     */
+    Int4GroupwiseGemmPluginV2(std::string const& name, int32_t N, int32_t K, int32_t groupSize, bool lora);
+
+    /*!
      * @brief Construct from field collection
      * @param name Layer name
      * @param fc Plugin field collection
@@ -188,12 +196,17 @@ public:
     char const* getTimingCacheID() noexcept override;
 
 private:
+    friend class Int4GroupwiseGemmLoraPluginCreator;
+
     std::string mLayerName;
     std::string mNamespace;
 
     int32_t mGemmN{};
     int32_t mGemmK{};
     int32_t mGroupSize{};
+
+    //! Dynamic-LoRA form: 5 inputs, LoRA expand-epilogue variants.
+    bool mLora{false};
 
     //! Selected tactic: >0 = cuteDSL variant id (table index + 1); 0 = default.
     int32_t mTactic{0};
@@ -221,6 +234,25 @@ private:
  *
  * Handles plugin registration and creation in TensorRT.
  */
+class Int4GroupwiseGemmLoraPluginCreator : public nvinfer1::IPluginCreatorV3One
+{
+public:
+    Int4GroupwiseGemmLoraPluginCreator();
+    ~Int4GroupwiseGemmLoraPluginCreator() override = default;
+    char const* getPluginName() const noexcept override;
+    char const* getPluginVersion() const noexcept override;
+    nvinfer1::PluginFieldCollection const* getFieldNames() noexcept override;
+    char const* getPluginNamespace() const noexcept override;
+    void setPluginNamespace(char const* pluginNamespace) noexcept;
+    nvinfer1::IPluginV3* createPlugin(char const* name, nvinfer1::PluginFieldCollection const* fc,
+        nvinfer1::TensorRTPhase /* phase */) noexcept override;
+
+private:
+    static nvinfer1::PluginFieldCollection mFieldCollection;
+    static std::vector<nvinfer1::PluginField> mPluginAttributes;
+    std::string mNamespace;
+};
+
 class Int4GroupwiseGemmPluginV2Creator : public nvinfer1::IPluginCreatorV3One
 {
 public:

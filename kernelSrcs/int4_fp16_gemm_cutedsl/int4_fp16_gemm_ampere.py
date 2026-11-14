@@ -80,12 +80,14 @@ from common import (
     ceil_div,
     export_compiled_kernel,
     make_lock_placeholder,
+    make_lora_placeholders,
     make_row_major_2d_placeholder,
     mark_lock_1d,
     mark_row_major_2d,
     parse_comma_separated_ints,
 )
 from int4_dequant import _dequant_int4_word
+from int4_lora import LORA_MAX_RANK, lora_add, lora_delta8_smem, lora_fill_smem
 
 
 class Int4Fp16GemmAmpere:
@@ -103,6 +105,7 @@ class Int4Fp16GemmAmpere:
         group_size: int = 128,
         split_k: int = 1,
         serial_split_k: bool = True,
+        lora: bool = False,
     ) -> None:
         self.ab_dtype = ab_dtype
         self.c_dtype = c_dtype
@@ -129,6 +132,11 @@ class Int4Fp16GemmAmpere:
         # B is staged as 32-bit fragment-order words (the repacked layout) and
         # dequantized with one lean ``_dequant_int4_word`` per N-group.
         self.b_smem_dtype = Uint32
+        # Dynamic-LoRA expand epilogue (int4_lora.py).
+        self.lora = bool(lora)
+        # The LoRA variant keeps the decode tiles' resident blocks per SM (bM = 16: 78
+        # registers at 3 stages, 88 at 4 on SM87, five blocks of 128 threads either way).
+        self.lora_min_blocks = 5 if (self.lora and cta_tiler_mnk[0] == 16) else 0
 
         atom_lay_m, atom_lay_n, atom_lay_k = self.atom_layout_mnk
         self.num_threads = atom_lay_m * atom_lay_n * atom_lay_k * 32
@@ -183,6 +191,11 @@ class Int4Fp16GemmAmpere:
         swizzle: Int32,
         stream: cuda.CUstream,
     ) -> None:
+        # The LoRA operands are unused placeholders (const_expr(self.lora) is False).
+        self._launch(mA, mQW, mScales, mC, mWorkspace, mLocks, swizzle, mA, mA, Int32(0), stream)
+
+    @cute.jit
+    def _launch(self, mA, mQW, mScales, mC, mWorkspace, mLocks, swizzle, mT, mLB, rank, stream):
         # ``mWorkspace`` is a placeholder (the serial reduction folds into mC in
         # place; the caller passes mC).  ``mLocks`` is the int32 per-output-tile
         # semaphore used by the serial path (a 1-element placeholder for
@@ -233,6 +246,16 @@ class Int4Fp16GemmAmpere:
             + cute.size_in_bytes(self.b_smem_dtype, sB_byte_layout)
             + cute.size_in_bytes(mScales.element_type, sScale_layout),
         )
+        if cutlass.const_expr(self.lora):
+            # Dedicated t16 rows [bM, 16] and B tile [16, bN] after the pipeline buffers.
+            smem_size = (
+                cute.size_in_bytes(mA.element_type, sA_layout)
+                + cute.size_in_bytes(self.b_smem_dtype, sB_byte_layout)
+                + cute.size_in_bytes(mScales.element_type, sScale_layout)
+                + self.bM * LORA_MAX_RANK * 2
+                + LORA_MAX_RANK * self.bN * 2
+                + 32
+            )
 
         atom_async_copy = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(
@@ -286,11 +309,15 @@ class Int4Fp16GemmAmpere:
             tiled_copy_C,
             tiled_mma,
             swizzle,
+            mT,
+            mLB,
+            rank,
         ).launch(
             grid=(cute.size(grid_dim[0]), cute.size(grid_dim[1]), self.split_k),
             block=[self.num_threads, 1, 1],
             smem=smem_size,
             stream=stream,
+            **({"min_blocks_per_mp": self.lora_min_blocks} if self.lora_min_blocks > 0 else {}),
         )
 
     @cute.kernel
@@ -311,6 +338,9 @@ class Int4Fp16GemmAmpere:
         tiled_copy_C: cute.TiledCopy,
         tiled_mma: cute.TiledMma,
         swizzle: Int32,
+        mT: cute.Tensor,
+        mLB: cute.Tensor,
+        rank: Int32,
     ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         block_m_idx, block_n_idx, split_k_idx = cute.arch.block_idx()
@@ -365,6 +395,13 @@ class Int4Fp16GemmAmpere:
         sC = cute.make_tensor(
             cute.recast_ptr(sA.iterator, dtype=self.c_dtype), sC_layout
         )
+        if cutlass.const_expr(self.lora):
+            sLT = smem.allocate_tensor(
+                Float16, cute.make_layout((self.bM, LORA_MAX_RANK), stride=(LORA_MAX_RANK, 1)), 16
+            )
+            sLB = smem.allocate_tensor(
+                Float16, cute.make_layout((LORA_MAX_RANK, self.bN), stride=(self.bN, 1)), 16
+            )
 
         thr_copy_A = tiled_copy_A.get_slice(tidx)
         thr_copy_C = tiled_copy_C.get_slice(tidx)
@@ -469,6 +506,15 @@ class Int4Fp16GemmAmpere:
             )
             k_tile_index = k_tile_index + 1
             cute.arch.cp_async_commit_group()
+
+        if cutlass.const_expr(self.lora):
+            # t16 and B are ready before the kernel starts: fetch the final writer's rows of t
+            # and its B tile while the prologue loads are in flight.
+            if split_k_idx == Int32(self.split_k - 1):
+                lora_fill_smem(
+                    tidx, self.num_threads, mT, mLB, sLT, sLB, block_m_idx * Int32(self.bM), self.bM,
+                    ((block_n_idx * Int32(self.bN), self.bN),), rank,
+                )
 
         thr_mma = tiled_mma.get_slice(tidx)
         tCsA = thr_mma.partition_A(sA)
@@ -669,6 +715,10 @@ class Int4Fp16GemmAmpere:
                     tCrC_epilogue.load().to(Float32) + prev.load().to(Float32)
                 ).to(self.c_dtype)
 
+            if cutlass.const_expr(self.lora):
+                if split_k_idx == last:
+                    self._lora_apply(tCrC_epilogue, tCcC, mC, sLT, sLB, block_m_idx, block_n_idx, rank)
+
             for rest_v in range(tCpC.shape[0]):
                 for n in range(tCpC.shape[2]):
                     if cute.elem_less(tCcC[(0, rest_v), 0, n][1], mC.shape[1]):
@@ -688,6 +738,9 @@ class Int4Fp16GemmAmpere:
                 cute.arch.atomic_exch(lock_ptr, next_lock, sem="release", scope="gpu")
             return
 
+        if cutlass.const_expr(self.lora):
+            self._lora_apply(tCrC_epilogue, tCcC, mC, sLT, sLB, block_m_idx, block_n_idx, rank)
+
         for rest_v in range(tCpC.shape[0]):
             for n in range(tCpC.shape[2]):
                 if cute.elem_less(tCcC[(0, rest_v), 0, n][1], mC.shape[1]):
@@ -697,6 +750,21 @@ class Int4Fp16GemmAmpere:
                         tCgC_epilogue[None, None, n],
                         pred=tCpC[None, None, n],
                     )
+
+    @cute.jit
+    def _lora_apply(self, tCrC_epilogue, tCcC, mC, sLT, sLB, block_m_idx, block_n_idx, rank):
+        """Add the LoRA delta to the final fp16 tile in the coalesced store layout, whose
+        mode-0 groups of 8 are consecutive columns of one row (the 128-bit copy atom)."""
+        d16 = cute.make_rmem_tensor(cute.make_layout(8), Float16)
+        for vi in cutlass.range_constexpr(cute.size(tCrC_epilogue) // 8):
+            lcrd = tCcC[vi * 8]
+            if cute.elem_less(lcrd, mC.shape):
+                lora_delta8_smem(
+                    sLT, lcrd[0] - block_m_idx * Int32(self.bM), sLB, lcrd[1] - block_n_idx * Int32(self.bN),
+                    rank, d16,
+                )
+                for e in cutlass.range_constexpr(8):
+                    tCrC_epilogue[vi * 8 + e] = lora_add(tCrC_epilogue[vi * 8 + e], d16[e])
 
     @cute.jit
     def _load_b_tile(
@@ -978,6 +1046,35 @@ class Int4Fp16GemmAmpere:
         return cute.make_tiled_copy_tv(atom_copy, thread_layout, value_layout)
 
 
+class Int4Fp16GemmLoraAmpere(Int4Fp16GemmAmpere):
+    """The W4A16 GEMM with the dynamic-LoRA expand epilogue (int4_lora.py).
+
+    ABI: (mA, mQW, mScales, mC, mWorkspace, mLocks, swizzle, mT, mLB, rank, stream).
+    mT [M, 16] fp16 is t16 = fp16(x @ A) from LoraShrinkPlugin (zero past the rank); mLB
+    [rank, N] fp16; 1 <= rank <= 16.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(lora=True, **kwargs)
+
+    @cute.jit
+    def __call__(
+        self,
+        mA: cute.Tensor,
+        mQW: cute.Tensor,
+        mScales: cute.Tensor,
+        mC: cute.Tensor,
+        mWorkspace: cute.Tensor,
+        mLocks: cute.Tensor,
+        swizzle: Int32,
+        mT: cute.Tensor,
+        mLB: cute.Tensor,
+        rank: Int32,
+        stream: cuda.CUstream,
+    ) -> None:
+        self._launch(mA, mQW, mScales, mC, mWorkspace, mLocks, swizzle, mT, mLB, rank, stream)
+
+
 def run(
     mnk: Tuple[int, int, int],
     cta_tiler_mnk: Tuple[int, int, int] = (16, 128, 64),
@@ -994,6 +1091,7 @@ def run(
     file_name: str = "int4_fp16_gemm_ampere",
     function_prefix: str = "int4_fp16_gemm_ampere",
     gpu_arch: str = "",
+    lora: bool = False,
 ):
     """Run or export the INT4 (W4A16) FP16 Ampere GEMM kernel.
 
@@ -1021,7 +1119,9 @@ def run(
     print(f"{_tag} Tile {cta_tiler_mnk}, MMA (16,8,16), atoms {atom_layout_mnk}, "
           f"stages={num_stages}, split_k={split_k} (serial), swizzle={swizzle}")
 
-    kernel = Int4Fp16GemmAmpere(
+    if lora and not export_only:
+        raise ValueError("--lora is export-only here; test_lora_epilogue.py checks it")
+    kernel = (Int4Fp16GemmLoraAmpere if lora else Int4Fp16GemmAmpere)(
         ab_dtype=cutlass.Float16,
         c_dtype=cutlass.Float16,
         acc_dtype=cutlass.Float32,
@@ -1051,10 +1151,16 @@ def run(
         )
         print(f"{_tag} Compiling kernel (gpu_arch={gpu_arch or 'default'})...")
         t0 = time.time()
-        compiled = cute.compile(
-            kernel, mA, mQW, mScales, mC, mC, mLocks, swizzle_i32, current_stream,
-            options=compile_opts,
-        )
+        if lora:
+            compiled = cute.compile(
+                kernel, mA, mQW, mScales, mC, mC, mLocks, swizzle_i32, *make_lora_placeholders(),
+                cutlass.Int32(1), current_stream, options=compile_opts,
+            )
+        else:
+            compiled = cute.compile(
+                kernel, mA, mQW, mScales, mC, mC, mLocks, swizzle_i32, current_stream,
+                options=compile_opts,
+            )
         print(f"{_tag} Compilation time: {time.time() - t0:.4f}s")
         export_compiled_kernel(
             compiled,
@@ -1169,6 +1275,8 @@ def _parse_args(argv=None):
     p.add_argument("--iterations", type=int, default=100)
     p.add_argument("--skip_ref_check", action="store_true")
     p.add_argument("--export_only", action="store_true")
+    p.add_argument("--lora", action="store_true",
+                   help="Export the dynamic-LoRA expand-epilogue variant (export-only).")
     p.add_argument("--output_dir", type=str, default="./int4_fp16_gemm_aot_artifacts")
     p.add_argument("--file_name", type=str, default="int4_fp16_gemm_ampere")
     p.add_argument("--function_prefix", type=str, default="int4_fp16_gemm_ampere")
@@ -1197,6 +1305,7 @@ def main():
         file_name=args.file_name,
         function_prefix=args.function_prefix,
         gpu_arch=args.gpu_arch,
+        lora=args.lora,
     )
 
 

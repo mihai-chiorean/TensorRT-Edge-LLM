@@ -2147,6 +2147,45 @@ for _gs in _INT4_FP16_GROUP_SIZES:
             )
         )
 
+# Dynamic-LoRA epilogue variants (int4_lora.py): one per GEMM config and per GEMV
+# M, same group, so a LoRA engine autotunes over the same tactic table.  ABI adds
+# (mT, mLB, rank) before the stream: the shrink output t [M, 16] and lora_B [rank, N].
+for _gs in _INT4_FP16_GROUP_SIZES:
+    for _bm, _stages, _sk in _INT4_FP16_GEMM_CONFIGS:
+        KERNEL_VARIANTS.append(
+            KernelVariant(
+                name=f"int4_fp16_gemm_lora_{_bm}x128x64_s{_stages}_sk{_sk}{_int4_group_suffix(_gs)}",
+                group="int4_fp16_gemm",
+                supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+                script="int4_fp16_gemm_cutedsl/int4_fp16_gemm_ampere.py",
+                script_args=[
+                    "--mnk", "256,512,1024",
+                    "--cta_tiler_mnk", f"{_bm},128,64",
+                    "--atom_layout_mnk", "1,4,1",
+                    "--num_stages", str(_stages),
+                    "--split_k", str(_sk),
+                    "--group_size", str(_gs),
+                    "--lora",
+                    "--export_only",
+                ],
+            )
+        )
+    for _m in range(1, _INT4_FP16_GEMV_MAX_M + 1):
+        KERNEL_VARIANTS.append(
+            KernelVariant(
+                name=f"int4_fp16_gemv_lora_m{_m}{_int4_group_suffix(_gs)}",
+                group="int4_fp16_gemm",
+                supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+                script="int4_fp16_gemm_cutedsl/int4_fp16_gemv_ampere.py",
+                script_args=[
+                    "--mnk", f"{_m},512,1024",
+                    "--group_size", str(_gs),
+                    "--lora",
+                    "--export_only",
+                ],
+            )
+        )
+
 # All known group names (set for O(1) membership check — no manual maintenance
 # needed).
 _ALL_GROUPS: set[str] = {v.group for v in KERNEL_VARIANTS}

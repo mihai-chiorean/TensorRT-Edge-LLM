@@ -19,6 +19,7 @@
 #include "common/cudaUtils.h"
 #include "cuteDslInt4Gemm.h"
 #include "cuteDslInt4Gemv.h"
+#include "cuteDslInt4Gemv.h"
 #include "int4GemvDispatchPolicy.h"
 
 #include <cassert>
@@ -39,6 +40,12 @@ namespace
 constexpr char const* kINT4_GEMM_V2_PLUGIN_VERSION{"1"};
 constexpr char const* kINT4_GEMM_V2_PLUGIN_NAME{"Int4GroupwiseGemmPluginV2"};
 constexpr char const* kMAX_LOCK_WORKSPACE_BYTES_FIELD{"max_lock_workspace_bytes"};
+constexpr char const* kINT4_GEMM_LORA_PLUGIN_NAME{"Int4GroupwiseGemmLoraPlugin"};
+constexpr char const* kINT4_GEMM_LORA_PLUGIN_VERSION{"1"};
+// Inputs of the LoRA form: 3 t16 [.., 16] from LoraShrinkPlugin, 4 lora_B [rank, N].
+constexpr int32_t kLORA_NB_INPUTS{5};
+constexpr int32_t kLORA_T{3};
+constexpr int32_t kLORA_B{4};
 // Worst-case lock sizing follows the current CuTe DSL kernel set: bM=16 is
 // the smallest M tile and bN=128 is fixed across variants.
 constexpr int32_t kWORST_CASE_LOCK_TILE_M{16};
@@ -111,13 +118,27 @@ inline int64_t computeMaxLockWorkspaceBytes(
 PluginFieldCollection Int4GroupwiseGemmPluginV2Creator::mFieldCollection{};
 std::vector<PluginField> Int4GroupwiseGemmPluginV2Creator::mPluginAttributes;
 
+PluginFieldCollection Int4GroupwiseGemmLoraPluginCreator::mFieldCollection{};
+std::vector<PluginField> Int4GroupwiseGemmLoraPluginCreator::mPluginAttributes;
+
 REGISTER_TENSORRT_PLUGIN(Int4GroupwiseGemmPluginV2Creator);
+REGISTER_TENSORRT_PLUGIN(Int4GroupwiseGemmLoraPluginCreator);
 
 Int4GroupwiseGemmPluginV2::Int4GroupwiseGemmPluginV2(std::string const& name, int32_t N, int32_t K, int32_t groupSize)
     : mLayerName(name)
     , mGemmN(N)
     , mGemmK(K)
     , mGroupSize(groupSize)
+{
+}
+
+Int4GroupwiseGemmPluginV2::Int4GroupwiseGemmPluginV2(
+    std::string const& name, int32_t N, int32_t K, int32_t groupSize, bool lora)
+    : mLayerName(name)
+    , mGemmN(N)
+    , mGemmK(K)
+    , mGroupSize(groupSize)
+    , mLora(lora)
 {
 }
 
@@ -175,7 +196,7 @@ IPluginV3* Int4GroupwiseGemmPluginV2::clone() noexcept
 {
     try
     {
-        auto* plugin = new Int4GroupwiseGemmPluginV2(mLayerName, mGemmN, mGemmK, mGroupSize);
+        auto* plugin = new Int4GroupwiseGemmPluginV2(mLayerName, mGemmN, mGemmK, mGroupSize, mLora);
         plugin->setPluginNamespace(mNamespace.c_str());
         plugin->mTactic = mTactic;
         plugin->mAutotuneM = mAutotuneM;
@@ -190,12 +211,12 @@ IPluginV3* Int4GroupwiseGemmPluginV2::clone() noexcept
 
 char const* Int4GroupwiseGemmPluginV2::getPluginName() const noexcept
 {
-    return kINT4_GEMM_V2_PLUGIN_NAME;
+    return mLora ? kINT4_GEMM_LORA_PLUGIN_NAME : kINT4_GEMM_V2_PLUGIN_NAME;
 }
 
 char const* Int4GroupwiseGemmPluginV2::getPluginVersion() const noexcept
 {
-    return kINT4_GEMM_V2_PLUGIN_VERSION;
+    return mLora ? kINT4_GEMM_LORA_PLUGIN_VERSION : kINT4_GEMM_V2_PLUGIN_VERSION;
 }
 
 char const* Int4GroupwiseGemmPluginV2::getPluginNamespace() const noexcept
@@ -234,7 +255,7 @@ int32_t Int4GroupwiseGemmPluginV2::getOutputShapes(DimsExprs const* inputs, [[ma
 {
     try
     {
-        assert(nbInputs == 3);
+        assert(nbInputs == (mLora ? kLORA_NB_INPUTS : 3));
         assert(nbOutputs == 1);
         if (inputs[0].nbDims != 2 && inputs[0].nbDims != 3)
         {
@@ -259,12 +280,30 @@ bool Int4GroupwiseGemmPluginV2::supportsFormatCombination(int32_t pos, DynamicPl
 {
     try
     {
-        assert(nbInputs == 3 && nbOutputs == 1);
+        assert(nbInputs == (mLora ? kLORA_NB_INPUTS : 3) && nbOutputs == 1);
         assert(pos < (nbInputs + nbOutputs));
         auto const& tensorDesc = inOut[pos].desc;
         bool status{true};
 
-        switch (pos)
+        if (mLora && pos >= kLORA_T && pos < kLORA_NB_INPUTS)
+        {
+            status &= tensorDesc.type == DataType::kHALF;
+            status &= tensorDesc.format == PluginFormat::kLINEAR;
+            if (pos == kLORA_T)
+            {
+                bool const supportedRank = tensorDesc.dims.nbDims == 2 || tensorDesc.dims.nbDims == 3;
+                status &= supportedRank && tensorDesc.dims.d[tensorDesc.dims.nbDims - 1] == kCuteDslInt4LoraMaxRank;
+            }
+            else
+            {
+                status &= tensorDesc.dims.nbDims == 2 && tensorDesc.dims.d[1] == mGemmN;
+            }
+            return status;
+        }
+        // The output follows the inputs.
+        int32_t const slot = (pos == nbInputs) ? 3 : pos;
+
+        switch (slot)
         {
         case 0:
         {
@@ -349,6 +388,34 @@ int32_t Int4GroupwiseGemmPluginV2::configurePlugin(DynamicPluginTensorDesc const
         mMaxLockWorkspaceBytes = maxLockWorkspaceBytes;
     }
 #endif
+    if (mLora)
+    {
+#ifndef CUTE_DSL_INT4_FP16_GEMM_LORA_ENABLED
+        LOG_ERROR("Int4GroupwiseGemmLoraPlugin %s: the CuTe DSL artifact has no LoRA variants",
+            mLayerName.c_str());
+        return -1;
+#else
+        if (nbInputs != kLORA_NB_INPUTS || in[0].max.nbDims < 2)
+        {
+            return -1;
+        }
+        // The LoRA variants serve rank <= kCuteDslInt4LoraMaxRank: refuse a larger profile at build.
+        int64_t const maxRank = in[kLORA_B].max.d[0];
+        if (maxRank > kCuteDslInt4LoraMaxRank)
+        {
+            LOG_ERROR("Int4GroupwiseGemmLoraPlugin %s: max LoRA rank %lld exceeds the fused kernels' %d",
+                mLayerName.c_str(), static_cast<long long>(maxRank), kCuteDslInt4LoraMaxRank);
+            return -1;
+        }
+        // The epilogue stages B in 16-byte pieces of 8 columns, so every row must start 16-byte
+        // aligned and a piece is either wholly inside N or wholly past it.
+        if (mGemmN % 8 != 0)
+        {
+            LOG_ERROR("Int4GroupwiseGemmLoraPlugin %s: N = %d is not a multiple of 8", mLayerName.c_str(), mGemmN);
+            return -1;
+        }
+#endif
+    }
     return 0;
 }
 
@@ -417,6 +484,26 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
             return -1;
         }
 
+        int32_t const loraRank = mLora ? static_cast<int32_t>(inputDesc[kLORA_B].dims.d[0]) : 0;
+#ifdef CUTE_DSL_INT4_FP16_GEMM_LORA_ENABLED
+        CuteDslInt4LoraArgs loraArgs{};
+        if (loraRank > 0)
+        {
+            if (loraRank > kCuteDslInt4LoraMaxRank || leadingVolume(inputDesc[kLORA_T].dims) != M)
+            {
+                return -1;
+            }
+            loraArgs = CuteDslInt4LoraArgs{inputs[kLORA_T], inputs[kLORA_B], loraRank};
+        }
+#else
+        if (loraRank > 0)
+        {
+            LOG_ERROR("Int4GroupwiseGemmLoraPlugin %s: the CuTe DSL artifact has no LoRA variants", mLayerName.c_str());
+            return -1;
+        }
+#endif
+        // Rank 0 (no adapter, or a module it does not cover) runs the plain kernels below, unchanged.
+
         // Decode regime: int4RouteToGemv picks the CUDA-core GEMV or the GEMM for
         // small M. The GEMV reads the SAME fragment weight buffer (input[1]), so there
         // is no extra weight and no repack -- one buffer serves prefill and decode. A
@@ -425,6 +512,13 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
         if (int4RouteToGemv(M, mGemmN, mGemmK, mGroupSize, m1LargeToGemmEnabled(), multiRowToGemmEnabled())
             && cuteDslInt4GemvSupported(M) && cuteDslInt4GemvLoadModules(mGroupSize))
         {
+#ifdef CUTE_DSL_INT4_FP16_GEMM_LORA_ENABLED
+            if (loraRank > 0)
+            {
+                return cuteDslInt4GemvLoraLaunch(
+                    M, inputs[0], inputs[1], inputs[2], outputs[0], loraArgs, mGemmN, mGemmK, mGroupSize, stream);
+            }
+#endif
             return cuteDslInt4GemvLaunch(
                 M, inputs[0], inputs[1], inputs[2], outputs[0], mGemmN, mGemmK, mGroupSize, stream);
         }
@@ -462,6 +556,14 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
         }
         // input[1] is the fragment-layout weight buffer (INT8 bytes of the uint32
         // words); pass it straight through as mQW -- no repack, no cache.
+#ifdef CUTE_DSL_INT4_FP16_GEMM_LORA_ENABLED
+        if (loraRank > 0)
+        {
+            return cuteDslInt4GemmLoraLaunch(v, inputs[0], inputs[1], inputs[2], outputs[0],
+                (v.splitK > 1) ? mLockWorkspace : nullptr, loraArgs, M, mGemmN, mGemmK, mGroupSize, /*swizzle=*/1,
+                stream);
+        }
+#endif
         return cuteDslInt4GemmLaunch(v, inputs[0], inputs[1], inputs[2], outputs[0],
             (v.splitK > 1) ? mLockWorkspace : nullptr, M, mGemmN, mGemmK, mGroupSize, /*swizzle=*/1, stream);
 #else
@@ -647,6 +749,63 @@ IPluginV3* Int4GroupwiseGemmPluginV2Creator::createPlugin(
     try
     {
         Int4GroupwiseGemmPluginV2* plugin = new Int4GroupwiseGemmPluginV2(std::string(name), fc);
+        plugin->setPluginNamespace(mNamespace.c_str());
+        return plugin;
+    }
+    catch (std::exception const& e)
+    {
+        return nullptr;
+    }
+}
+
+Int4GroupwiseGemmLoraPluginCreator::Int4GroupwiseGemmLoraPluginCreator()
+{
+    static std::mutex sMutex;
+    std::lock_guard<std::mutex> lock(sMutex);
+
+    mPluginAttributes.clear();
+    mPluginAttributes.emplace_back(PluginField("gemm_n", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("gemm_k", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("group_size", nullptr, PluginFieldType::kINT32, 1));
+
+    mFieldCollection.nbFields = mPluginAttributes.size();
+    mFieldCollection.fields = mPluginAttributes.data();
+}
+
+char const* Int4GroupwiseGemmLoraPluginCreator::getPluginName() const noexcept
+{
+    return kINT4_GEMM_LORA_PLUGIN_NAME;
+}
+
+char const* Int4GroupwiseGemmLoraPluginCreator::getPluginVersion() const noexcept
+{
+    return kINT4_GEMM_LORA_PLUGIN_VERSION;
+}
+
+nvinfer1::PluginFieldCollection const* Int4GroupwiseGemmLoraPluginCreator::getFieldNames() noexcept
+{
+    return &mFieldCollection;
+}
+
+void Int4GroupwiseGemmLoraPluginCreator::setPluginNamespace(char const* libNamespace) noexcept
+{
+    mNamespace = libNamespace;
+}
+
+char const* Int4GroupwiseGemmLoraPluginCreator::getPluginNamespace() const noexcept
+{
+    return mNamespace.c_str();
+}
+
+IPluginV3* Int4GroupwiseGemmLoraPluginCreator::createPlugin(
+    char const* name, PluginFieldCollection const* fc, TensorRTPhase /* phase */) noexcept
+{
+    try
+    {
+        Int4GroupwiseGemmPluginV2 parsed(std::string(name), fc);
+        auto* plugin = new Int4GroupwiseGemmPluginV2(
+            std::string(name), parsed.mGemmN, parsed.mGemmK, parsed.mGroupSize, /*lora=*/true);
+        plugin->mMaxLockWorkspaceBytes = parsed.mMaxLockWorkspaceBytes;
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }

@@ -68,6 +68,7 @@ from cutedsl_utils import aot_placeholders
 from common import (
     ceil_div,
     export_compiled_kernel,
+    make_lora_placeholders,
     make_row_major_2d_placeholder,
     mark_row_major_2d,
     parse_comma_separated_ints,
@@ -77,6 +78,7 @@ from common import (
 # consume the identical offline fragment weight buffer, so one dequant serves
 # both and keeps them bit-identical).
 from int4_dequant import _dequant_int4_word
+from int4_lora import LORA_MAX_RANK, lora_add, lora_delta1_smem, lora_fill_smem
 
 
 # fp16x2 fma / horizontal-sum device helpers for the CUDA-core accumulation.
@@ -149,7 +151,7 @@ class Int4Fp16GemvAmpere:
 
     def __init__(self, *, m: int, group_size: int = 128, warp_groups: int = 8,
                  prefetch: bool = True, unroll2: bool = False,
-                 u2_eager: bool = False, min_blocks: int = 0) -> None:
+                 u2_eager: bool = False, min_blocks: int = 0, lora: bool = False) -> None:
         if m <= 0:
             raise ValueError("m must be positive")
         if group_size % 16 != 0:
@@ -181,6 +183,17 @@ class Int4Fp16GemvAmpere:
         # the flag for functions carrying launch bounds, and the DSL always
         # emits .reqntid.  0 = off (ptxas picks).
         self.MINB = int(min_blocks)
+        # Dynamic-LoRA expand epilogue (int4_lora.py): M <= 8, one t16 row per M.
+        self.LORA = bool(lora)
+
+    def _smem_bytes(self) -> int:
+        red = self.W * 8 * self.M * 2 * 4
+        if not self.LORA:
+            return red
+        # Allocation order in kernel(): sRed, t16 rows [8, 16], B columns [16, 16] (16 B aligned).
+        def up16(x):
+            return (x + 15) // 16 * 16
+        return up16(red) + 8 * LORA_MAX_RANK * 2 + LORA_MAX_RANK * 16 * 2
 
     @cute.jit
     def __call__(
@@ -191,22 +204,26 @@ class Int4Fp16GemvAmpere:
         mOut: cute.Tensor,          # [M, N] fp16, written directly
         stream: cuda.CUstream,
     ) -> None:
+        # The LoRA operands are unused placeholders (const_expr(self.LORA) is False).
+        self._launch(mA, mQW, mScales, mOut, mA, mA, Int32(0), stream)
+
+    @cute.jit
+    def _launch(self, mA, mQW, mScales, mOut, mT, mLB, rank, stream):
         num_n_blocks = cute.ceil_div(mOut.shape[1], self.BN)
         # grid.x packs (N-block, column-group): bx = nb*4 + cg; grid.y = N-pair.
         if cutlass.const_expr(self.MINB > 0):
             # min_blocks_per_mp requires smem to be set; passing it explicitly
             # overrides the inferred size, so it must be the allocator's real
-            # footprint (sRed [W, 8, M, 2] Float32).
-            smem_bytes = self.W * 8 * self.M * 2 * 4
-            self.kernel(mA, mQW, mScales, mOut).launch(
+            # footprint (sRed [W, 8, M, 2] Float32, plus the LoRA buffers).
+            self.kernel(mA, mQW, mScales, mOut, mT, mLB, rank).launch(
                 grid=(cute.size(num_n_blocks) * 4, 2, 1),
                 block=[self.num_threads, 1, 1],
                 stream=stream,
                 min_blocks_per_mp=self.MINB,
-                smem=smem_bytes,
+                smem=self._smem_bytes(),
             )
         else:
-            self.kernel(mA, mQW, mScales, mOut).launch(
+            self.kernel(mA, mQW, mScales, mOut, mT, mLB, rank).launch(
                 grid=(cute.size(num_n_blocks) * 4, 2, 1),
                 block=[self.num_threads, 1, 1],
                 stream=stream,
@@ -219,6 +236,9 @@ class Int4Fp16GemvAmpere:
         mQW: cute.Tensor,
         mScales: cute.Tensor,
         mOut: cute.Tensor,
+        mT: cute.Tensor,
+        mLB: cute.Tensor,
+        rank: Int32,
     ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         bx, pblk, _ = cute.arch.block_idx()
@@ -248,6 +268,17 @@ class Int4Fp16GemvAmpere:
         # flush: per-half chain ~= K/64 (matches awq's; accuracy parity measured).
         psum = cute.make_rmem_tensor(cute.make_layout((M, 2)), Uint32)
         psum.fill(0)
+
+        # One allocator for the whole kernel so the LoRA buffers never alias sRed.
+        smem = utils.SmemAllocator()
+        sRed = smem.allocate_tensor(Float32, cute.make_layout((self.W, 8, M, 2)), 16)
+        if cutlass.const_expr(self.LORA):
+            sLT = smem.allocate_tensor(Float16, cute.make_layout((8, LORA_MAX_RANK), stride=(LORA_MAX_RANK, 1)), 16)
+            sLB = smem.allocate_tensor(Float16, cute.make_layout((LORA_MAX_RANK, 16), stride=(16, 1)), 16)
+            # This CTA's channels are two runs of 8: [lo, lo + 8) and [lo + 32, lo + 40).
+            lo = nb * Int32(self.BN) + Int32(8) * cg + Int32(64) * pblk
+            lora_fill_smem(tidx, self.num_threads, mT, mLB, sLT, sLB, Int32(0), 8,
+                           ((lo, 8), (lo + Int32(32), 8)), rank)
 
         mQW128 = cute.recast_tensor(mQW, cutlass.Int128)   # [rows, 32]
         wreg = cute.make_rmem_tensor(cute.make_layout(4), Uint32)
@@ -373,9 +404,6 @@ class Int4Fp16GemvAmpere:
 
         # Cross-warp reduce via smem [W, 8, M, 2]; warp 0's lanes 0..7 sum the W
         # partials for their column and write fp16.  One writer per channel.
-        sRed = utils.SmemAllocator().allocate_tensor(
-            Float32, cute.make_layout((self.W, 8, M, 2)), 16
-        )
         if r == Int32(0):
             for ch in cutlass.range_constexpr(2):
                 for m in cutlass.range_constexpr(M):
@@ -389,8 +417,38 @@ class Int4Fp16GemvAmpere:
                         acc = sRed[0, cp, m, ch]
                         for gg in cutlass.range_constexpr(1, self.W):
                             acc = acc + sRed[gg, cp, m, ch]
-                        mOut[m, cc] = acc.to(Float16)
+                        if cutlass.const_expr(self.LORA):
+                            mOut[m, cc] = lora_add(
+                                acc.to(Float16), lora_delta1_smem(sLT, m, sLB, cp + Int32(8 * ch), rank)
+                            )
+                        else:
+                            mOut[m, cc] = acc.to(Float16)
 
+
+
+class Int4Fp16GemvLoraAmpere(Int4Fp16GemvAmpere):
+    """The decode GEMV with the dynamic-LoRA expand epilogue (int4_lora.py).
+
+    ABI: (mA, mQW, mScales, mOut, mT, mLB, rank, stream). mT [M, 16] fp16 is t16 from
+    LoraShrinkPlugin (zero past the rank); mLB [rank, N] fp16; 1 <= rank <= 16; M <= 8.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(lora=True, **kwargs)
+
+    @cute.jit
+    def __call__(
+        self,
+        mA: cute.Tensor,
+        mQW: cute.Tensor,
+        mScales: cute.Tensor,
+        mOut: cute.Tensor,
+        mT: cute.Tensor,
+        mLB: cute.Tensor,
+        rank: Int32,
+        stream: cuda.CUstream,
+    ) -> None:
+        self._launch(mA, mQW, mScales, mOut, mT, mLB, rank, stream)
 
 # ---------------------------------------------------------------------------
 # Standalone test + AOT export harness (CuPy-only export path; the reference
@@ -440,6 +498,7 @@ def run(
     file_name: str = "int4_fp16_gemv_ampere",
     function_prefix: str = "int4_fp16_gemv_ampere",
     gpu_arch: str = "",
+    lora: bool = False,
 ):
     """Run or export the narrow-CTA W4A16 decode GEMV (M<=8)."""
     M, N, K = mnk
@@ -465,7 +524,9 @@ def run(
     print(f"{_tag} W={warp_groups}, prefetch={prefetch}, unroll2={unroll2}, "
           f"u2_eager={u2_eager}, min_blocks={min_blocks}")
 
-    kernel = Int4Fp16GemvAmpere(
+    if lora and not export_only:
+        raise ValueError("--lora is export-only here; test_lora_epilogue.py checks it")
+    kernel = (Int4Fp16GemvLoraAmpere if lora else Int4Fp16GemvAmpere)(
         m=M, group_size=group_size, warp_groups=warp_groups,
         prefetch=prefetch, unroll2=unroll2, u2_eager=u2_eager, min_blocks=min_blocks,
     )
@@ -486,10 +547,16 @@ def run(
         )
         print(f"{_tag} Compiling kernel (gpu_arch={gpu_arch or 'default'})...")
         t0 = time.time()
-        compiled = cute.compile(
-            kernel, mA, mQW, mScales, mOut, current_stream,
-            options=compile_opts,
-        )
+        if lora:
+            compiled = cute.compile(
+                kernel, mA, mQW, mScales, mOut, *make_lora_placeholders(),
+                cutlass.Int32(1), current_stream, options=compile_opts,
+            )
+        else:
+            compiled = cute.compile(
+                kernel, mA, mQW, mScales, mOut, current_stream,
+                options=compile_opts,
+            )
         print(f"{_tag} Compilation time: {time.time() - t0:.4f}s")
         export_compiled_kernel(
             compiled,
@@ -600,6 +667,8 @@ def _parse_args(argv=None):
     p.add_argument("--iterations", type=int, default=100)
     p.add_argument("--skip_ref_check", action="store_true")
     p.add_argument("--export_only", action="store_true")
+    p.add_argument("--lora", action="store_true",
+                   help="Export the dynamic-LoRA expand-epilogue variant (export-only).")
     p.add_argument("--output_dir", type=str, default="./int4_fp16_gemv_aot_artifacts")
     p.add_argument("--file_name", type=str, default="int4_fp16_gemv_ampere")
     p.add_argument("--function_prefix", type=str, default="int4_fp16_gemv_ampere")
@@ -628,6 +697,7 @@ def main():
         file_name=args.file_name,
         function_prefix=args.function_prefix,
         gpu_arch=args.gpu_arch,
+        lora=args.lora,
     )
 
 
