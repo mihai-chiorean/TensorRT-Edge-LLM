@@ -86,16 +86,28 @@ bool isPluginLayer(nvinfer1::ILayer* layer, char const* pluginName)
     return core != nullptr && std::string(core->getPluginName()) == pluginName;
 }
 
-//! True when the network has LoRA inputs and every layer that reads one is a LoraGroupPlugin,
-//! so every LoRA target is applied in place and skipped when bound at rank 0. A graph that
-//! mixes plugin and MatMul branches returns false.
-bool allLoraBranchesGrouped(nvinfer1::INetworkDefinition const& network)
+//! How the network's LoRA inputs are consumed.
+struct LoraBranchKinds
 {
+    //! Every layer that reads a LoRA input skips a rank-0 binding (LoraGroupPlugin, or the fused
+    //! INT4 LoRA path: LoraShrinkPlugin and the INT4 GEMM's expand epilogue). A graph with any
+    //! MatMul branch is false.
+    bool allSkipRankZero{false};
+    //! Some LoraGroupPlugin reads a LoRA input; its outputs alias its inputs.
+    bool anyGroupPlugin{false};
+};
+
+LoraBranchKinds classifyLoraBranches(nvinfer1::INetworkDefinition const& network)
+{
+    LoraBranchKinds kinds;
     bool sawLoraInput = false;
+    bool allSkip = true;
     for (int32_t i = 0; i < network.getNbLayers(); ++i)
     {
         auto* layer = network.getLayer(i);
         bool const grouped = isPluginLayer(layer, "LoraGroupPlugin");
+        bool const fused
+            = isPluginLayer(layer, "Int4GroupwiseGemmLoraPlugin") || isPluginLayer(layer, "LoraShrinkPlugin");
         for (int32_t j = 0; j < layer->getNbInputs(); ++j)
         {
             auto const* tensor = layer->getInput(j);
@@ -109,13 +121,12 @@ bool allLoraBranchesGrouped(nvinfer1::INetworkDefinition const& network)
                 continue;
             }
             sawLoraInput = true;
-            if (!grouped)
-            {
-                return false;
-            }
+            kinds.anyGroupPlugin = kinds.anyGroupPlugin || grouped;
+            allSkip = allSkip && (grouped || fused);
         }
     }
-    return sawLoraInput;
+    kinds.allSkipRankZero = sawLoraInput && allSkip;
+    return kinds;
 }
 
 bool usesAliasedPluginIO(Json const& config)
@@ -436,18 +447,24 @@ bool LLMBuilder::build()
     ELLM_CHECK(getInputRank(*network, binding_names::kInputsEmbeds) == 2,
         "LLMBuilder: inputs_embeds must be rank-2 [physical_tokens, hidden_size]. Re-export the model.");
 
-    // LoraGroupPlugin adds the LoRA residual in place (aliased plugin I/O).
-    bool const loraGroupPlugin = mBuilderConfig.maxLoraRank > 0 && allLoraBranchesGrouped(*network);
-    // Record it so the runtime binds LoRA inputs no adapter covers at rank 0 (the plugin
-    // launches nothing for them) instead of rank-1 zero dummies.
-    mBuilderConfig.loraInactiveRank = loraGroupPlugin ? 0 : 1;
-    if (loraGroupPlugin)
+    LoraBranchKinds const loraKinds
+        = mBuilderConfig.maxLoraRank > 0 ? classifyLoraBranches(*network) : LoraBranchKinds{};
+    // When every LoRA branch skips a rank-0 binding, record it so the runtime binds LoRA inputs
+    // no adapter covers at rank 0 instead of rank-1 zero dummies.
+    mBuilderConfig.loraInactiveRank = loraKinds.allSkipRankZero ? 0 : 1;
+    if (loraKinds.allSkipRankZero)
     {
-        LOG_INFO("LoRA branches are LoraGroupPlugin nodes: aliased plugin I/O enabled, inactive LoRA rank 0");
+        LOG_INFO("Every LoRA branch is a LoraGroupPlugin or a fused INT4 LoRA GEMM: inactive LoRA rank 0");
+    }
+    // LoraGroupPlugin adds the LoRA residual in place (aliased plugin I/O); the fused INT4 GEMM
+    // does not need it.
+    if (loraKinds.anyGroupPlugin)
+    {
+        LOG_INFO("LoraGroupPlugin nodes present: aliased plugin I/O enabled");
     }
 
     // Create builder config
-    auto config = createBuilderConfig(builder.get(), usesAliasedPluginIO(mModelConfig) || loraGroupPlugin);
+    auto config = createBuilderConfig(builder.get(), usesAliasedPluginIO(mModelConfig) || loraKinds.anyGroupPlugin);
     if (!config)
     {
         return false;

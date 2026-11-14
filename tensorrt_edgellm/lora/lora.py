@@ -840,9 +840,64 @@ def _emit_lora_group_plugins(graph: gs.Graph, members) -> int:
     return nodes
 
 
+_INT4_V2_OP = "Int4GroupwiseGemmPluginV2"
+_INT4_LORA_OP = "Int4GroupwiseGemmLoraPlugin"
+_LORA_SHRINK_OP = "LoraShrinkPlugin"
+_LORA_SHRINK_MAX_TARGETS = 4
+
+
+def _int4_v2_producer(output_tensor: gs.Tensor) -> Optional[gs.Node]:
+    """The ``Int4GroupwiseGemmPluginV2`` node producing ``output_tensor``, if any."""
+    producers = list(output_tensor.inputs)
+    if len(producers) == 1 and producers[0].op == _INT4_V2_OP:
+        return producers[0]
+    return None
+
+
+def _emit_fused_int4_lora(graph: gs.Graph, members) -> int:
+    """Fuse the LoRA branches of the INT4 V2 GEMMs in ``members``.
+
+    Branches that read the same (unsmoothed) activation share one ``LoraShrinkPlugin``
+    node, up to ``_LORA_SHRINK_MAX_TARGETS``, in insertion order; it outputs
+    ``t_i = fp16(x @ A_i)`` as ``[.., 16]``. Each GEMM becomes
+    ``Int4GroupwiseGemmLoraPlugin`` with inputs 3 and 4 set to ``t_i`` and ``lora_B_i``;
+    its epilogue adds ``fp16(t_i @ B_i)`` to its own output, so the output tensor and its
+    consumers are unchanged and the delta precedes every consumer by construction.
+    Returns the number of shrink nodes."""
+    groups = {}
+    for member in members:
+        # Resolve the activation now, not when the member was recorded: a selected FP16
+        # GEMM earlier in the insertion loop may have rewired this GEMM's input to its
+        # LoRA sum.
+        member["input"] = _unsmoothed_int4_activation(member["node"])
+        groups.setdefault(id(member["input"]), []).append(member)
+    nodes = 0
+    for group in groups.values():
+        for start in range(0, len(group), _LORA_SHRINK_MAX_TARGETS):
+            chunk = group[start:start + _LORA_SHRINK_MAX_TARGETS]
+            outs = [
+                gs.Variable(f"{m['name']}/lora_t", dtype=np.float16)
+                for m in chunk
+            ]
+            graph.nodes.append(
+                gs.Node(op=_LORA_SHRINK_OP,
+                        name=f"{chunk[0]['name']}/lora_shrink",
+                        domain="trt_edgellm",
+                        attrs={"num_targets": np.int32(len(chunk))},
+                        inputs=[chunk[0]["input"]] + [m["lora_a"] for m in chunk],
+                        outputs=outs))
+            nodes += 1
+            for member, t in zip(chunk, outs):
+                node = member["node"]
+                node.op = _INT4_LORA_OP
+                node.inputs.extend([t, member["lora_b"]])
+    return nodes
+
+
 def insert_lora_and_save(onnx_dir: str,
                          lora_targets: Optional[Sequence[str]] = None,
-                         lora_group_plugin: bool = False):
+                         lora_group_plugin: bool = False,
+                         lora_fused_int4: bool = False):
     """
     Insert LoRA patterns into ONNX models.
 
@@ -855,6 +910,11 @@ def insert_lora_and_save(onnx_dir: str,
         lora_group_plugin: Emit LoraGroupPlugin nodes (grouped by shared input, residual
             added in place) instead of MatMul -> MatMul -> Add branches. Needs the
             matching plugin library.
+        lora_fused_int4: Fuse the LoRA expand of every selected
+            ``Int4GroupwiseGemmPluginV2`` GEMM into the GEMM's epilogue
+            (``Int4GroupwiseGemmLoraPlugin``, rank <= 16), fed by one
+            ``LoraShrinkPlugin`` per shared activation. Other selected GEMMs keep
+            the branch chosen by ``lora_group_plugin``.
     """
     start_time = time.time()
     # Load ONNX model
@@ -892,6 +952,7 @@ def insert_lora_and_save(onnx_dir: str,
             "expected a supported MatMul, Gemm, or quantized GEMM node")
 
     group_members = []
+    fused_members = []
     # Insert LoRA patterns for each GEMM
     for gemm_info in gemm_infos:
         input_tensor = gemm_info.input
@@ -909,6 +970,17 @@ def insert_lora_and_save(onnx_dir: str,
                              dtype=np.float16,
                              shape=[f"{gemm_name_for_lora}.rank", n])
         graph.inputs.extend([lora_a, lora_b])
+
+        int4_node = _int4_v2_producer(output_tensor) if lora_fused_int4 else None
+        if int4_node is not None:
+            fused_members.append({
+                "name": gemm_name,
+                "input": input_tensor,
+                "node": int4_node,
+                "lora_a": lora_a,
+                "lora_b": lora_b
+            })
+            continue
 
         if lora_group_plugin:
             group_members.append({
@@ -960,6 +1032,11 @@ def insert_lora_and_save(onnx_dir: str,
         _check_lora_add_precedes_consumers(gemm_name, output_tensor,
                                            final_output, gemm_consumers)
 
+    if fused_members:
+        logger.info(
+            "Fused %d LoRA targets into Int4GroupwiseGemmLoraPlugin GEMMs fed by %d "
+            "LoraShrinkPlugin nodes", len(fused_members),
+            _emit_fused_int4_lora(graph, fused_members))
     if group_members:
         logger.info("Emitted %d LoraGroupPlugin nodes for %d LoRA targets",
                     _emit_lora_group_plugins(graph, group_members),
