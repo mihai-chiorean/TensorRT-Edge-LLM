@@ -62,7 +62,9 @@ class LoRAManager
 public:
     //! @brief Construct with the engine's maximum supported LoRA rank.
     //! @param maxSupportedLoraRank The engine's `max_lora_rank` build setting.
-    explicit LoRAManager(int32_t maxSupportedLoraRank) noexcept;
+    //! @param inactiveRank Rank bound for LoRA inputs no adapter covers: 0 for engines whose
+    //!        LoRA branches are LoraGroupPlugin nodes (recorded by the builder), else 1.
+    explicit LoRAManager(int32_t maxSupportedLoraRank, int32_t inactiveRank = 1) noexcept;
 
     //! Deleted copy to prevent accidental duplication of GPU resources.
     LoRAManager(LoRAManager const&) = delete;
@@ -201,6 +203,7 @@ private:
     //! The engine's `max_lora_rank` build setting; the rank ceiling every
     //! registered adapter is validated against.
     int32_t mMaxSupportedLoraRank{0};
+    int32_t mInactiveRank{1};
 
     //! Adapters whose unbound bindings have already been reported by
     //! `refreshTensorMap`, so each adapter is warned about at most once.

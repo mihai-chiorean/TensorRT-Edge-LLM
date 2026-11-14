@@ -218,6 +218,7 @@ struct LLMEngineConfig
     // --- Optional feature fields ---
     int32_t numDeepstackFeatures{0}; //!< Deepstack features (Qwen3-VL/Qwen3-Omni)
     int32_t maxSupportedLoraRank{0}; //!< Maximum LoRA rank (0 = no LoRA)
+    int32_t loraInactiveRank{1};     //!< Rank bound for LoRA inputs no adapter covers (0 or 1)
     PlePoolConfig plePool{};         //!< External immutable table for the pool/map ABI.
 
     // --- Gemma4 per-layer embeddings ---
