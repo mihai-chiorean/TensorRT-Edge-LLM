@@ -610,7 +610,8 @@ def test_ifb_refuses_adapter_requests_at_build_time(tmp_path, _fake_runtime):
     llm = LLM(model=str(bundle), cache_dir=str(tmp_path / "cache"))
     # Under IFB the runtime is a RequestEngine; mark the deployment so the
     # request-build refusal fires.
-    llm._engine = object()
+    llm._engine = SimpleNamespace(
+        status=lambda: SimpleNamespace(serving=True, unavailable_reason=None))
     client = TestClient(
         create_app(EngineClient(llm),
                    ApiConfig(served_model_name=SERVED_MODEL)))
