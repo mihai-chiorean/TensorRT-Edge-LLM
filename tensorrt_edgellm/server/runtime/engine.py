@@ -310,53 +310,74 @@ class CancellableIterator:
             iteration to finish. It must tolerate repeated calls.
 
     ``cancel()`` signals the producer without closing an executing generator.
-    ``close()`` signals cancellation once and closes the generator when it is
-    not executing in another thread. The caller must wait for active iteration
-    to finish, then close again, before releasing resources owned by that
-    generator.
+    ``close()`` signals cancellation once and ends the stream: later reads
+    raise ``StopIteration`` without entering the generator. The generator is
+    closed by ``close()`` when no read is executing, otherwise by the last
+    executing read as it returns, so resources owned by the generator are
+    released once that read has returned.
     """
 
     def __init__(self, iterator, cancel) -> None:
         self._iterator = iterator
         self._cancel = cancel
-        self._cancel_lock = threading.Lock()
+        self._lock = threading.Lock()
         self._cancelled = False
+        self._closing = False
+        self._closed = False
         self._active_reads = 0
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        with self._cancel_lock:
+        with self._lock:
+            if self._closing:
+                raise StopIteration
             self._active_reads += 1
         try:
             return next(self._iterator)
         finally:
-            with self._cancel_lock:
+            with self._lock:
                 self._active_reads -= 1
+                close_now = self._claim_close()
+            if close_now:
+                self._close_iterator()
 
     def cancel(self) -> None:
         """Request cancellation without closing an executing iterator."""
         self._cancel()
 
     def close(self) -> None:
-        with self._cancel_lock:
+        with self._lock:
             cancel = not self._cancelled
             self._cancelled = True
-            reading = self._active_reads > 0
+            self._closing = True
+            close_now = self._claim_close()
         if cancel:
             # Cancellation can invoke a user callback that closes this stream.
             self._cancel()
-        if reading:
-            # Closing a generator another thread is running can crash the
-            # interpreter. The cancel signal wakes that next(); the caller
-            # closes again once it returns.
-            return
+        if close_now:
+            self._close_iterator()
+
+    def _claim_close(self) -> bool:
+        """Under the lock: whether this caller closes the generator.
+
+        Closing a generator another thread is running can crash the
+        interpreter, so the close is claimed only with no read executing, and
+        ``_closing`` keeps a new read from starting before it happens.
+        """
+        if not self._closing or self._closed or self._active_reads:
+            return False
+        self._closed = True
+        return True
+
+    def _close_iterator(self) -> None:
         try:
             self._iterator.close()
         except (RuntimeError, ValueError):
-            # The generator is still unwinding; the caller closes again.
-            pass
+            # The generator is still unwinding; a later close() retries.
+            with self._lock:
+                self._closed = False
 
 
 def _pump_channels(rt, run, text_channel, audio_channel, sem=None):

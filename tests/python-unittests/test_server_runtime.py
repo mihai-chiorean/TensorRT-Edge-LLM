@@ -752,6 +752,56 @@ def test_disconnect_closes_the_stream_only_after_next_returns():
     assert closes_during_read and not any(closes_during_read)
 
 
+def test_close_ends_the_stream_and_the_last_read_closes_the_generator():
+    reading = threading.Event()
+    release = threading.Event()
+
+    class Source:
+
+        def __init__(self):
+            self.reads = 0
+            self.in_next = False
+            self.closes_during_read = []
+
+        def __next__(self):
+            self.reads += 1
+            if self.reads > 1:
+                return "late"
+            self.in_next = True
+            reading.set()
+            release.wait()
+            self.in_next = False
+            return "chunk"
+
+        def close(self):
+            self.closes_during_read.append(self.in_next)
+
+    source = Source()
+    stream = engine.CancellableIterator(source, lambda: None)
+    chunks = []
+    reader = threading.Thread(target=lambda: chunks.append(next(stream)))
+    reader.start()
+    assert reading.wait(1.0)
+
+    stream.close()
+    assert source.closes_during_read == []
+    with pytest.raises(StopIteration):
+        next(stream)
+    assert source.reads == 1
+
+    release.set()
+    reader.join(1.0)
+    assert not reader.is_alive()
+    assert chunks == ["chunk"]
+    assert source.closes_during_read == [False]
+
+    stream.close()
+    with pytest.raises(StopIteration):
+        next(stream)
+    assert source.reads == 1
+    assert source.closes_during_read == [False]
+
+
 def test_close_racing_a_native_wait_inside_next_does_not_crash(tmp_path):
     # A keyword C call releasing the GIL matches StreamChannel.wait_pop():
     # CPython 3.12 can SIGSEGV if another thread closes its running generator.
