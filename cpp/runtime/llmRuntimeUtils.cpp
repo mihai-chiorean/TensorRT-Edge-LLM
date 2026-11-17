@@ -1095,6 +1095,47 @@ rt::Tensor generateMultimodalIndices(
     return multimodalIndices;
 }
 
+MediaRowCounts generateSliceMultimodalIndices(std::vector<int32_t> const& promptTokenIds, int32_t sliceBegin,
+    int32_t const* sliceTokenIds, int32_t sliceLength, int32_t imageTokenId, int32_t audioTokenId,
+    MediaRowCounts rowBase, int32_t* indices)
+{
+    check::check(sliceBegin >= 0 && sliceBegin <= static_cast<int32_t>(promptTokenIds.size()),
+        "Prefill slice starts outside the prompt");
+    bool const hasImage = imageTokenId >= 0;
+    bool const hasAudio = audioTokenId >= 0;
+
+    MediaRowCounts row = rowBase;
+    for (int32_t position = 0; position < sliceBegin; ++position)
+    {
+        int32_t const tokenId = promptTokenIds[static_cast<size_t>(position)];
+        if (hasImage && tokenId == imageTokenId)
+        {
+            ++row.image;
+        }
+        else if (hasAudio && tokenId == audioTokenId)
+        {
+            ++row.audio;
+        }
+    }
+    for (int32_t column = 0; column < sliceLength; ++column)
+    {
+        int32_t const tokenId = sliceTokenIds[column];
+        if (hasImage && tokenId == imageTokenId)
+        {
+            indices[column] = row.image++;
+        }
+        else if (hasAudio && tokenId == audioTokenId)
+        {
+            indices[column] = row.audio++;
+        }
+        else
+        {
+            indices[column] = -1;
+        }
+    }
+    return row;
+}
+
 void mapMediaIndicesToReservationRows(std::vector<int32_t> const& requestLocalIndices, int32_t sliceBegin,
     int32_t sliceLength, int32_t slot, int32_t maxMediaRowsPerSlot, int64_t totalReservedRows, int32_t* globalIndices)
 {

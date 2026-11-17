@@ -125,6 +125,106 @@ TEST(GenerateVisionBlockIds, BlockIdsRestartPerBatch)
     EXPECT_EQ(v, (std::vector<int32_t>{0, -1, 1, -1, 0, 0}));
 }
 
+namespace
+{
+
+int32_t constexpr kSliceImage = 77;
+int32_t constexpr kSliceAudio = 99;
+
+struct SliceIndices
+{
+    std::vector<int32_t> indices;
+    rt::MediaRowCounts next;
+};
+
+SliceIndices sliceIndices(std::vector<int32_t> const& prompt, int32_t sliceBegin, std::vector<int32_t> const& slice,
+    rt::MediaRowCounts rowBase = {})
+{
+    SliceIndices result;
+    result.indices.assign(slice.size(), 12345);
+    result.next = rt::generateSliceMultimodalIndices(prompt, sliceBegin, slice.data(),
+        static_cast<int32_t>(slice.size()), kSliceImage, kSliceAudio, rowBase, result.indices.data());
+    return result;
+}
+
+} // namespace
+
+TEST(GenerateSliceMultimodalIndices, WholePromptNumbersFromZero)
+{
+    std::vector<int32_t> const prompt{1, kSliceImage, kSliceImage, 2, kSliceAudio, 3};
+    auto const result = sliceIndices(prompt, 0, prompt);
+    EXPECT_EQ(result.indices, (std::vector<int32_t>{-1, 0, 1, -1, 0, -1}));
+    EXPECT_EQ(result.next.image, 2);
+    EXPECT_EQ(result.next.audio, 1);
+}
+
+// A suffix after a reused prefix reads the rows that follow the prefix's media, not row zero.
+TEST(GenerateSliceMultimodalIndices, SuffixSkipsRowsOfThePrefix)
+{
+    std::vector<int32_t> const prompt{1, kSliceImage, kSliceImage, kSliceAudio, 2, kSliceImage, kSliceAudio, 3};
+    auto const result = sliceIndices(prompt, 4, {2, kSliceImage, kSliceAudio, 3});
+    EXPECT_EQ(result.indices, (std::vector<int32_t>{-1, 2, 1, -1}));
+    EXPECT_EQ(result.next.image, 3);
+    EXPECT_EQ(result.next.audio, 2);
+}
+
+TEST(GenerateSliceMultimodalIndices, LaterRequestStartsAfterEarlierRequestsWholePrompts)
+{
+    // Request 0 reuses its image; its suffix is text only. Request 1's image is still the second row.
+    std::vector<int32_t> const first{1, kSliceImage, 2, 3};
+    std::vector<int32_t> const second{4, kSliceImage, 5};
+    auto const row0 = sliceIndices(first, 2, {2, 3});
+    EXPECT_EQ(row0.indices, (std::vector<int32_t>{-1, -1}));
+    auto const row1 = sliceIndices(second, 0, second, row0.next);
+    EXPECT_EQ(row1.indices, (std::vector<int32_t>{-1, 1, -1}));
+    EXPECT_EQ(row1.next.image, 2);
+}
+
+TEST(GenerateSliceMultimodalIndices, SliceEndingBeforeThePromptEndStopsCounting)
+{
+    std::vector<int32_t> const prompt{1, kSliceImage, 2, kSliceImage, 3};
+    auto const result = sliceIndices(prompt, 0, {1, kSliceImage, 2});
+    EXPECT_EQ(result.indices, (std::vector<int32_t>{-1, 0, -1}));
+    EXPECT_EQ(result.next.image, 1);
+}
+
+// A draft prefill feeds the base prefill's tokens from the second on.
+TEST(GenerateSliceMultimodalIndices, DraftSliceStartsOnePastTheBaseSlice)
+{
+    std::vector<int32_t> const prompt{1, kSliceImage, kSliceImage, kSliceImage, 2};
+    auto const base = sliceIndices(prompt, 2, {kSliceImage, kSliceImage, 2});
+    EXPECT_EQ(base.indices, (std::vector<int32_t>{1, 2, -1}));
+    auto const draft = sliceIndices(prompt, 3, {kSliceImage, 2});
+    EXPECT_EQ(draft.indices, (std::vector<int32_t>{2, -1}));
+}
+
+// Visual-token pruning compacts a cold request's tokens and rows together, so the slice is counted as fed.
+TEST(GenerateSliceMultimodalIndices, CompactedSliceCountsItsOwnTokens)
+{
+    std::vector<int32_t> const prompt{1, kSliceImage, kSliceImage, kSliceImage, 2};
+    auto const result = sliceIndices(prompt, 1, {kSliceImage, 2, 0, 0});
+    EXPECT_EQ(result.indices, (std::vector<int32_t>{0, -1, -1, -1}));
+    EXPECT_EQ(result.next.image, 1);
+}
+
+TEST(GenerateSliceMultimodalIndices, UnusedPlaceholderIdsMatchNothing)
+{
+    std::vector<int32_t> const prompt{1, kSliceImage, kSliceAudio};
+    std::vector<int32_t> indices(prompt.size(), 12345);
+    auto const next = rt::generateSliceMultimodalIndices(prompt, 0, prompt.data(), 3, -1, -1, {}, indices.data());
+    EXPECT_EQ(indices, (std::vector<int32_t>{-1, -1, -1}));
+    EXPECT_EQ(next.image, 0);
+    EXPECT_EQ(next.audio, 0);
+}
+
+TEST(GenerateSliceMultimodalIndices, SliceMustStartInsideThePrompt)
+{
+    std::vector<int32_t> const prompt{1, kSliceImage, 2};
+    EXPECT_NO_THROW(sliceIndices(prompt, 3, {4}));
+    EXPECT_THROW(sliceIndices(prompt, 4, {4}), std::runtime_error);
+    EXPECT_THROW(sliceIndices(prompt, -1, {1}), std::runtime_error);
+}
+
 TEST(LLMRuntimeUtils, ClampMaxGenerateLengthForKVCapacitySingleBatch)
 {
     EXPECT_EQ(rt::clampMaxGenerateLengthForKVCapacity({100}, 80, 256, 0), 80);

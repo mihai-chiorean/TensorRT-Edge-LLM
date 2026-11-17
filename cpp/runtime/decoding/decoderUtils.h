@@ -165,6 +165,17 @@ void copyHiddenRowsStrided(Tensor& destination, int32_t destinationStride, Tenso
 
 ExecutionPhase contextPrefillPhase(std::vector<int32_t> const& pastLengths, int32_t activeBatchSize);
 
+//! @brief Stage the image rows a draft prefill reads.
+//!
+//! On-device numbering starts every pass at row zero, which is wrong past a reused prefix. A draft prefill feeds each
+//! sequence's base prefill tokens from the second on, so its slice starts one position after the base's.
+//!
+//! @param packedTokenIds [activeBatchSize, inputIdsLength] tokens the draft feeds, zero-padded
+//! @return The device indices, or nullopt for a request without image embeddings
+OptionalInputTensor stageDraftPrefillMediaIndices(DecodingRuntimeContext& runtime,
+    DecodingInferenceContext const& context, int32_t const* packedTokenIds, int32_t inputIdsLength,
+    cudaStream_t stream);
+
 //! @brief The last @p contextLength tokens a sequence has fed to the engine, oldest first.
 //!
 //! All of @p tokens but the last have been fed; the last is next round's root. A reused prefix is

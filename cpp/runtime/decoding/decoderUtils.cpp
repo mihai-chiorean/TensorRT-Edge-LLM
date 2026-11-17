@@ -148,6 +148,35 @@ ExecutionPhase contextPrefillPhase(std::vector<int32_t> const& pastLengths, int3
     return hasRestoredPrefix ? ExecutionPhase::kContextChunk : ExecutionPhase::kContextPrefill;
 }
 
+OptionalInputTensor stageDraftPrefillMediaIndices(DecodingRuntimeContext& runtime,
+    DecodingInferenceContext const& context, int32_t const* packedTokenIds, int32_t inputIdsLength, cudaStream_t stream)
+{
+    if (!context.visualEmbeddings.has_value())
+    {
+        return std::nullopt;
+    }
+    int32_t const activeBatchSize = context.activeBatchSize;
+    Tensor& indices = runtime.preprocess.multimodalIndices;
+    Tensor& hostIndices = runtime.preprocess.hostMultimodalIndices;
+    check::check(
+        indices.reshape({activeBatchSize, inputIdsLength}) && hostIndices.reshape({activeBatchSize, inputIdsLength}),
+        "Tensor reshape failed");
+    int32_t* const hostData = hostIndices.dataPointer<int32_t>();
+
+    MediaRowCounts rowBase;
+    for (int32_t i = 0; i < activeBatchSize; ++i)
+    {
+        int64_t const rowOffset = static_cast<int64_t>(i) * inputIdsLength;
+        rowBase = generateSliceMultimodalIndices(context.rawBatchedInputIds[static_cast<size_t>(i)],
+            context.prefillStartLengths[static_cast<size_t>(i)] + 1, packedTokenIds + rowOffset, inputIdsLength,
+            runtime.deployment.base.imageTokenId, runtime.deployment.base.audioTokenId, rowBase, hostData + rowOffset);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(indices.rawPointer(), hostData,
+        static_cast<size_t>(activeBatchSize) * inputIdsLength * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    runtime.base.pipelineIO.recordStepHostUploads(stream);
+    return OptionalInputTensor{indices};
+}
+
 void prepareSpecPrefillRaggedBindings(DecodingRuntimeContext& runtime, LLMEngineConfig const& cfg, int32_t kvCacheIndex,
     DecodingInferenceContext const& context, int32_t queryWidth, InferenceDims const& dims, cudaStream_t stream,
     int32_t heldBackTokens)

@@ -581,6 +581,35 @@ int32_t clampMaxGenerateLengthForKVCapacity(std::vector<int32_t> const& effectiv
 rt::Tensor generateMultimodalIndices(
     rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId, std::optional<int32_t> imageTokenId);
 
+//! Image and audio embedding rows, counted separately.
+struct MediaRowCounts
+{
+    int32_t image{0};
+    int32_t audio{0};
+};
+
+/*!
+ * @brief Media rows for the part of one request's prompt that a prefill pass feeds
+ *
+ * A pass's media embeddings hold the rows of every request in batch order, and each request's rows cover its whole
+ * prompt, whichever part of it the pass feeds. A slice's first image row is therefore the image rows of earlier
+ * requests plus the image placeholders of this prompt before the slice, and likewise for audio.
+ *
+ * @param promptTokenIds Whole prompt of the request
+ * @param sliceBegin Prompt position of the first slice token
+ * @param sliceTokenIds Tokens the pass feeds for this request, padding included
+ * @param sliceLength Entries of sliceTokenIds and indices
+ * @param imageTokenId Image placeholder ID, negative if unused
+ * @param audioTokenId Audio placeholder ID, negative if unused
+ * @param rowBase Media rows of earlier requests in the batch
+ * @param[out] indices sliceLength entries; positions without a media placeholder receive -1
+ * @return Media rows through the end of the slice: rowBase for the next request when the slice ends its prompt
+ * @throws std::runtime_error if sliceBegin is outside [0, promptTokenIds.size()]
+ */
+MediaRowCounts generateSliceMultimodalIndices(std::vector<int32_t> const& promptTokenIds, int32_t sliceBegin,
+    int32_t const* sliceTokenIds, int32_t sliceLength, int32_t imageTokenId, int32_t audioTokenId,
+    MediaRowCounts rowBase, int32_t* indices);
+
 /*!
  * @brief Map one prefill slice of request-local media rows to rows of a per-slot reservation buffer
  *

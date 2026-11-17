@@ -439,10 +439,12 @@ bool EagleDecoder::runDraftModelPrefill(DecodingInferenceContext& context, int32
     check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape({activeBatchSize, inputIdsLength, draftHiddenSize}),
         "Tensor reshape failed");
     // Unified embedding lookup (text, or vision by inserting image embeddings at the image
-    // placeholder positions). Reuses the shared EmbeddingPreprocessor, which generates the
-    // multimodal indices on-device and shares this decoder's embedding table.
-    mRuntime.preprocess.embeddingPreprocessor.embed(
-        mRuntime.preprocess.idsInput, context.visualEmbeddings, std::nullopt, mRuntime.base.pipelineIO, context.stream);
+    // placeholder positions). Reuses the shared EmbeddingPreprocessor, which shares this decoder's
+    // embedding table.
+    OptionalInputTensor const mediaIndices = decoder_utils::stageDraftPrefillMediaIndices(
+        mRuntime, context, hostPackedTokenIdsData, inputIdsLength, context.stream);
+    mRuntime.preprocess.embeddingPreprocessor.embed(mRuntime.preprocess.idsInput, context.visualEmbeddings,
+        std::nullopt, mRuntime.base.pipelineIO, context.stream, mediaIndices);
     int32_t* ctxLenData = mRuntime.base.pipelineIO.hostContextLengths.dataPointer<int32_t>();
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {

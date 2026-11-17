@@ -269,8 +269,8 @@ TEST(DecoderUtilsTests, SpecRaggedBindingsLeaveSkipSoftmaxTablesUntouched)
     std::filesystem::path checkpoint;
     DecodingRuntimeContext runtime{deployment, 2, checkpoint, checkpoint,
         {executor, tensorMap, *shared, *shared->cacheManagers.at(0), io, {}},
-        {stepPreparer, embeddingPreprocessor, embedding, unused, nullptr, nullptr, nullptr}, tokenizer, bias, guided,
-        {unused, unused, unused, unused, unused, unused, unused, unused, unused},
+        {stepPreparer, embeddingPreprocessor, embedding, unused, unused, unused, nullptr, nullptr, nullptr}, tokenizer,
+        bias, guided, {unused, unused, unused, unused, unused, unused, unused, unused, unused},
         {unused, unused, unused, unused, unused}};
 
     void const* const prefillAddress = io.skipSoftmaxPrefillScale.rawPointer();

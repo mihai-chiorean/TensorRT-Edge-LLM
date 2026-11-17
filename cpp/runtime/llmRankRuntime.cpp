@@ -811,8 +811,8 @@ void LLMRankRuntime::buildDecodingRuntimeContext()
         *mSharedResources->cacheManagers[0], *mPipelineIO, [this](InferenceDims const& dims, cudaStream_t stream) {
             return captureBaseGraphWithLoraFanout(dims, stream);
         }};
-    PreprocessResources preprocessResources{*mStepPreparer, *mEmbeddingPre, mEmbedding, mIdsInput, mDeepstack.get(),
-        mGemma4Ple.get(), mQwen4ExpNgram.get()};
+    PreprocessResources preprocessResources{*mStepPreparer, *mEmbeddingPre, mEmbedding, mIdsInput, mMultimodalIndices,
+        mHostMultimodalIndices, mDeepstack.get(), mGemma4Ple.get(), mQwen4ExpNgram.get()};
     SamplingBuffers sampling{mSamplingWorkspace, mSamplingIndices, mSamplingScores, mBaseVocabMappingTable,
         mHostDecoderTokenIds, mHostSelectedTokenIds, mHostOutputSpaceIds, mSamplingRows, mHostSamplingRows};
     LogprobsBuffers logprobs{
@@ -4981,90 +4981,19 @@ bool LLMRankRuntime::runBaseModelPrefill(DecodingInferenceContext& context,
         check::check(mHostMultimodalIndices.reshape({activeBatchSize, inputIdsLength}), "Tensor reshape failed");
         int32_t* hostIndices = mHostMultimodalIndices.dataPointer<int32_t>();
 
-        if (managedKVCacheRequest != nullptr && managedKVCacheRequest->hasContextReuse())
+        // A caller that splits the prefill passes no cache handle, yet a chunk can still start after a reused
+        // prefix or an earlier chunk. The batch's past length is where this call starts in the request.
+        bool const suffixOfPrompt = managedKVCacheRequest != nullptr && managedKVCacheRequest->hasContextReuse();
+        rt::MediaRowCounts rowBase;
+        for (int32_t i = 0; i < activeBatchSize; ++i)
         {
-            int32_t cumulativeImageTokens = 0;
-            int32_t cumulativeAudioTokens = 0;
-            for (int32_t i = 0; i < activeBatchSize; ++i)
-            {
-                auto const& fullSeq = context.rawBatchedInputIds[i];
-                int32_t const prefixLen = static_cast<int32_t>(fullSeq.size()) - context.effectivePrefillLengths[i];
-                int32_t prefixImageCount = 0;
-                int32_t prefixAudioCount = 0;
-                for (int32_t p = 0; p < prefixLen; ++p)
-                {
-                    if (fullSeq[p] == imageTokenId)
-                    {
-                        ++prefixImageCount;
-                    }
-                    else if (fullSeq[p] == audioTokenId)
-                    {
-                        ++prefixAudioCount;
-                    }
-                }
-                int32_t const rowImageBase = cumulativeImageTokens + prefixImageCount;
-                int32_t const rowAudioBase = cumulativeAudioTokens + prefixAudioCount;
-
-                // Generate indices for this row from the packed host token IDs.
-                int32_t rowImageIdx = rowImageBase;
-                int32_t rowAudioIdx = rowAudioBase;
-                int32_t const* rowTokens = packedTokenIds + static_cast<int64_t>(i) * inputIdsLength;
-                int32_t* rowIndices = hostIndices + static_cast<int64_t>(i) * inputIdsLength;
-                for (int32_t col = 0; col < inputIdsLength; ++col)
-                {
-                    int32_t const tok = rowTokens[col];
-                    if (imageTokenId >= 0 && tok == imageTokenId)
-                    {
-                        rowIndices[col] = rowImageIdx++;
-                    }
-                    else if (audioTokenId >= 0 && tok == audioTokenId)
-                    {
-                        rowIndices[col] = rowAudioIdx++;
-                    }
-                    else
-                    {
-                        rowIndices[col] = 0;
-                    }
-                }
-
-                for (size_t p = 0; p < fullSeq.size(); ++p)
-                {
-                    if (fullSeq[p] == imageTokenId)
-                    {
-                        ++cumulativeImageTokens;
-                    }
-                    else if (fullSeq[p] == audioTokenId)
-                    {
-                        ++cumulativeAudioTokens;
-                    }
-                }
-            }
-        }
-        else
-        {
-            int32_t imageIndex = 0;
-            int32_t audioIndex = 0;
-            for (int32_t i = 0; i < activeBatchSize; ++i)
-            {
-                int32_t const* rowTokens = packedTokenIds + static_cast<int64_t>(i) * inputIdsLength;
-                int32_t* rowIndices = hostIndices + static_cast<int64_t>(i) * inputIdsLength;
-                for (int32_t col = 0; col < inputIdsLength; ++col)
-                {
-                    int32_t const tok = rowTokens[col];
-                    if (imageTokenId >= 0 && tok == imageTokenId)
-                    {
-                        rowIndices[col] = imageIndex++;
-                    }
-                    else if (audioTokenId >= 0 && tok == audioTokenId)
-                    {
-                        rowIndices[col] = audioIndex++;
-                    }
-                    else
-                    {
-                        rowIndices[col] = 0;
-                    }
-                }
-            }
+            auto const& prompt = context.rawBatchedInputIds[i];
+            int32_t const sliceBegin = suffixOfPrompt
+                ? static_cast<int32_t>(prompt.size()) - context.effectivePrefillLengths[i]
+                : batch.pastLengths[static_cast<size_t>(i)];
+            rowBase = rt::generateSliceMultimodalIndices(prompt, sliceBegin,
+                packedTokenIds + static_cast<int64_t>(i) * inputIdsLength, inputIdsLength, imageTokenId, audioTokenId,
+                rowBase, hostIndices + static_cast<int64_t>(i) * inputIdsLength);
         }
 
         CUDA_CHECK(cudaMemcpyAsync(mMultimodalIndices.rawPointer(), hostIndices,

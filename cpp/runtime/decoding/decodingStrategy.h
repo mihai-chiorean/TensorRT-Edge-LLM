@@ -143,6 +143,8 @@ struct PreprocessResources
     EmbeddingPreprocessor& embeddingPreprocessor;
     EmbeddingData& embedding;
     Tensor& idsInput;
+    Tensor& multimodalIndices;     //!< GPU [batchSize, seqLen], shared with the base prefill
+    Tensor& hostMultimodalIndices; //!< Pinned staging for multimodalIndices
     DeepstackBinding* deepstack;
     Gemma4EmbeddingPreprocessor* gemma4Ple;
     Qwen4ExpNgramPreprocessor* qwen4ExpNgram;

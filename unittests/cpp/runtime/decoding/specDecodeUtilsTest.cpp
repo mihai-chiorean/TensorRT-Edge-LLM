@@ -70,8 +70,8 @@ TEST(SpecTargetCommitTest, PreservesChainPrefixAndCompactsTreeAcrossBatch)
     Tensor unused;
     std::filesystem::path checkpoint;
     DecodingRuntimeContext runtime{deployment, 2, checkpoint, checkpoint, {executor, tensorMap, shared, cache, io, {}},
-        {stepPreparer, embeddingPreprocessor, embedding, unused, nullptr, nullptr, nullptr}, tokenizer, bias, guided,
-        {unused, unused, unused, unused, unused, unused, unused, unused, unused},
+        {stepPreparer, embeddingPreprocessor, embedding, unused, unused, unused, nullptr, nullptr, nullptr}, tokenizer,
+        bias, guided, {unused, unused, unused, unused, unused, unused, unused, unused, unused},
         {unused, unused, unused, unused, unused}};
     DecodingInferenceContext context;
     context.activeBatchSize = 2;
