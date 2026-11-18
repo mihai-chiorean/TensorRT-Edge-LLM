@@ -768,15 +768,15 @@ DeviceLimits deviceLimits()
     DeviceLimits sLimits;
     {
         int count{0};
-        int optin{0};
+        int optInBytes{0};
         if (cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess
-            || cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess)
+            || cudaDeviceGetAttribute(&optInBytes, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess)
         {
             (void) cudaGetLastError();
             return sLimits;
         }
         sLimits.grid = std::min<int32_t>(count, kMaxBarrierGrid);
-        sLimits.smemBytes = std::min<size_t>(static_cast<size_t>(optin), kMaxDynSmem);
+        sLimits.smemBytes = std::min<size_t>(static_cast<size_t>(optInBytes), kMaxDynSmem);
     }
     sByDevice[dev] = sLimits;
     return sLimits;

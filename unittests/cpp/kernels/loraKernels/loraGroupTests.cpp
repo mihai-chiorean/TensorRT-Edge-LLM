@@ -486,9 +486,9 @@ TEST(LoraGroupPlan, GateUpStaysFusedOnEightSms)
 TEST(LoraGroupLauncher, MultiRoundExpandMatchesReference)
 {
     int dev = 0;
-    int optin = 0;
+    int optInBytes = 0;
     CUDA_OK(cudaGetDevice(&dev));
-    CUDA_OK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+    CUDA_OK(cudaDeviceGetAttribute(&optInBytes, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
     int32_t const M = 12;
     int32_t const K = 2560;
     std::vector<int32_t> const N{10240, 10240};
@@ -533,7 +533,7 @@ TEST(LoraGroupLauncher, MultiRoundExpandMatchesReference)
     CUDA_OK(cudaMalloc(&workspace, loraGroupWorkspaceBytes(M, 2, 16)));
     cudaStream_t stream{};
     CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    for (size_t const budget : {std::min<size_t>(static_cast<size_t>(optin), 160 * 1024), size_t{96 * 1024}})
+    for (size_t const budget : {std::min<size_t>(static_cast<size_t>(optInBytes), 160 * 1024), size_t{96 * 1024}})
     {
         LoraGroupPlan const plan = planLoraGroup(M, K, targets.data(), 2, 8, budget);
         ASSERT_TRUE(plan.fused) << "budget " << budget;
@@ -619,9 +619,9 @@ TEST(LoraGroupPlan, ShortPrefillIsOneLaunch)
 TEST(LoraGroupLauncher, ShortPrefillOnEightSmsMatchesReference)
 {
     int dev = 0;
-    int optin = 0;
+    int optInBytes = 0;
     CUDA_OK(cudaGetDevice(&dev));
-    CUDA_OK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+    CUDA_OK(cudaDeviceGetAttribute(&optInBytes, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
     struct Case
     {
         int32_t M;
@@ -674,9 +674,9 @@ TEST(LoraGroupLauncher, ShortPrefillOnEightSmsMatchesReference)
             LoraGroupPlan const plan = planLoraGroup(c.M, c.K, targets.data(), n, 8, budget);
             ASSERT_TRUE(plan.fused) << "M " << c.M << " budget " << budget;
             ASSERT_GT(plan.rowTiles, 1);
-            if (plan.smemBytes > static_cast<size_t>(optin))
+            if (plan.smemBytes > static_cast<size_t>(optInBytes))
             {
-                GTEST_SKIP() << "device opts in to " << optin << " B of shared memory per block, plan needs "
+                GTEST_SKIP() << "device opts in to " << optInBytes << " B of shared memory per block, plan needs "
                              << plan.smemBytes;
             }
             void* state = nullptr;

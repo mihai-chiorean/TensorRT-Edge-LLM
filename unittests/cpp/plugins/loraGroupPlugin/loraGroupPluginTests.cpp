@@ -146,12 +146,12 @@ void runEnqueue(int32_t inplace)
     std::array<PluginTensorDesc, 7> in{desc2d(M, N[0]), desc2d(M, N[1]), desc2d(M, K), desc2d(K, R[0]), desc2d(K, R[1]),
         desc2d(R[0], N[0]), desc2d(R[1], N[1])};
     std::array<PluginTensorDesc, 2> outDesc{desc2d(M, N[0]), desc2d(M, N[1])};
-    std::array<void*, 7> dIn{toDevice(base[0]), toDevice(base[1]), toDevice(x), toDevice(A[0]), toDevice(A[1]),
+    std::array<void*, 7> devIn{toDevice(base[0]), toDevice(base[1]), toDevice(x), toDevice(A[0]), toDevice(A[1]),
         toDevice(B[0]), toDevice(B[1])};
-    std::array<void*, 2> dOut{};
+    std::array<void*, 2> devOut{};
     for (int32_t i = 0; i < 2; ++i)
     {
-        dOut[i] = inplace ? dIn[i] : toDevice(std::vector<__half>(static_cast<size_t>(M) * N[i]));
+        devOut[i] = inplace ? devIn[i] : toDevice(std::vector<__half>(static_cast<size_t>(M) * N[i]));
     }
     ASSERT_EQ(rt->onShapeChange(in.data(), 7, outDesc.data(), 2), 0);
     void* workspace = nullptr;
@@ -159,13 +159,13 @@ void runEnqueue(int32_t inplace)
     cudaStream_t stream{};
     ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
-    ASSERT_EQ(rt->enqueue(in.data(), outDesc.data(), dIn.data(), dOut.data(), workspace, stream), 0);
+    ASSERT_EQ(rt->enqueue(in.data(), outDesc.data(), devIn.data(), devOut.data(), workspace, stream), 0);
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
     for (int32_t i = 0; i < 2; ++i)
     {
         std::vector<__half> got(static_cast<size_t>(M) * N[i]);
-        ASSERT_EQ(cudaMemcpy(got.data(), dOut[i], got.size() * sizeof(__half), cudaMemcpyDeviceToHost), cudaSuccess);
+        ASSERT_EQ(cudaMemcpy(got.data(), devOut[i], got.size() * sizeof(__half), cudaMemcpyDeviceToHost), cudaSuccess);
         for (int32_t m = 0; m < M; ++m)
         {
             std::vector<float> t(R[i]);
@@ -194,14 +194,14 @@ void runEnqueue(int32_t inplace)
             }
         }
     }
-    for (void* p : dIn)
+    for (void* p : devIn)
     {
         cudaFree(p);
     }
     if (!inplace)
     {
-        cudaFree(dOut[0]);
-        cudaFree(dOut[1]);
+        cudaFree(devOut[0]);
+        cudaFree(devOut[1]);
     }
     cudaFree(workspace);
     cudaStreamDestroy(stream);
