@@ -23,6 +23,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <tuple>
@@ -217,6 +218,28 @@ TEST(Gemma4ResizeTargetTest, MatchesPinnedGoldens)
         EXPECT_EQ(tW % kSideMult, 0);
         EXPECT_LE(tH * tW, kTargetPx);
     }
+}
+
+// visual_build bounds an above-checkpoint per-image budget by position_embedding_size / pooling_kernel_size.
+TEST(Gemma4ResizeTargetTest, LongestAxisIsAtMostTokensTimesPoolingKernelPatches)
+{
+    constexpr int64_t kPool = 3;
+    constexpr int64_t kPatch = 16;
+    constexpr int64_t kPositionEmbeddingSize = 10240;
+    constexpr int64_t kBoundedTokens = kPositionEmbeddingSize / kPool;
+    struct Dims
+    {
+        int64_t h, w;
+    };
+    Dims const inputs[] = {{10, 30720}, {30720, 10}, {1, 1000000}, {1000000, 1}, {48, 163824}, {896, 896}, {7, 9}};
+    for (auto const& in : inputs)
+    {
+        auto const [tH, tW] = iu::gemma4ResizeTarget(in.h, in.w, kBoundedTokens, kPool, kPatch);
+        EXPECT_LE(std::max(tH, tW) / kPatch, kPositionEmbeddingSize) << "input " << in.h << "x" << in.w;
+    }
+
+    auto const [tH, tW] = iu::gemma4ResizeTarget(10, 30720, 4096, kPool, kPatch);
+    EXPECT_GT(std::max(tH, tW) / kPatch, kPositionEmbeddingSize);
 }
 
 TEST(Gemma4ResizeTargetTest, ThrowsOnNonPositiveDims)

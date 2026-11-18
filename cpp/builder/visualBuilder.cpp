@@ -238,19 +238,36 @@ bool VisualBuilder::parseConfig()
             LOG_ERROR("Gemma4 default_output_length must be positive, got %ld", imageTokens);
             return false;
         }
-        mBuilderConfig.maxImageTokensPerImage
-            = std::min({mBuilderConfig.maxImageTokensPerImage, imageTokens, mBuilderConfig.maxImageTokens});
+        int64_t perImageCap = std::min(imageTokens, mBuilderConfig.maxImageTokens);
+        if (mBuilderConfig.allowImageTokensAboveCheckpoint)
+        {
+            auto const& visionConfig = mModelConfig[kVisionConfigKey];
+            int64_t const poolingKernelSize = visionConfig.value("pooling_kernel_size", 3);
+            int64_t const positionEmbeddingSize = visionConfig.value("position_embedding_size", 0);
+            if (poolingKernelSize < 1 || positionEmbeddingSize < poolingKernelSize)
+            {
+                LOG_ERROR(
+                    "Gemma4 --allow-image-tokens-above-checkpoint needs vision_config.position_embedding_size "
+                    "(%ld) of at least pooling_kernel_size (%ld)",
+                    positionEmbeddingSize, poolingKernelSize);
+                return false;
+            }
+            // An image one soft token high is tokens * pooling_kernel_size patches wide, and each patch column
+            // indexes the learned position table.
+            perImageCap = std::min(mBuilderConfig.maxImageTokens, positionEmbeddingSize / poolingKernelSize);
+        }
+        mBuilderConfig.maxImageTokensPerImage = std::min(mBuilderConfig.maxImageTokensPerImage, perImageCap);
         if (mBuilderConfig.minImageTokens > mBuilderConfig.maxImageTokensPerImage)
         {
             LOG_ERROR(
-                "Gemma4 --minImageTokens (%ld) exceeds the checkpoint-capped --maxImageTokensPerImage (%ld). "
+                "Gemma4 --minImageTokens (%ld) exceeds the capped --maxImageTokensPerImage (%ld). "
                 "Lower --minImageTokens to at most %ld to support single-image requests.",
                 mBuilderConfig.minImageTokens, mBuilderConfig.maxImageTokensPerImage,
                 mBuilderConfig.maxImageTokensPerImage);
             return false;
         }
-        LOG_INFO("Gemma4 visual profile: total max=%ld, checkpoint-capped max_per_image=%ld",
-            mBuilderConfig.maxImageTokens, mBuilderConfig.maxImageTokensPerImage);
+        LOG_INFO("Gemma4 visual profile: total max=%ld, max_per_image=%ld (checkpoint default %ld)",
+            mBuilderConfig.maxImageTokens, mBuilderConfig.maxImageTokensPerImage, imageTokens);
         break;
     }
 

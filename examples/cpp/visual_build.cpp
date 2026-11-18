@@ -51,7 +51,8 @@ enum VLMBuildOptionId : int
     MSS_PROFILE = 610,
     REMOTE_AUTO_TUNING_CONFIG = 611,
     SAFETY_PLUGIN_LIBRARY = 612,
-    HARDWARE_COMPATIBILITY = 613
+    HARDWARE_COMPATIBILITY = 613,
+    ALLOW_IMAGE_TOKENS_ABOVE_CHECKPOINT = 614
 };
 
 struct CommonViTBuildArgs
@@ -69,6 +70,7 @@ struct ViTBuildArgs : CommonViTBuildArgs
     int64_t minImageTokens{4};
     int64_t maxImageTokens{1024};
     builder::HardwareCompatibility hardwareCompatibility{builder::HardwareCompatibility::kNONE};
+    bool allowImageTokensAboveCheckpoint{false};
 };
 
 #ifdef ENABLE_SAFETY_RUNTIME
@@ -121,6 +123,9 @@ void printUsage(char const* programName)
     std::cerr << "  --hardware-compatibility  none: the engine targets the build GPU. same_compute_capability: the "
                  "engine runs on any GPU with the same compute capability (TensorRT >= 10.9). Default = none"
               << std::endl;
+    std::cerr << "  --allow-image-tokens-above-checkpoint  Gemma4 only: let --max-image-tokens-per-image exceed the "
+                 "checkpoint's default_output_length."
+              << std::endl;
 #ifdef ENABLE_SAFETY_RUNTIME
     std::cerr << "Safety Builder options:" << std::endl
               << "  --safety                    Build a visual engine with TensorRT kSAFETY capability." << std::endl
@@ -156,6 +161,7 @@ bool parseViTBuildArgs(CommonViTBuildArgs& commonArgs, ViTBuildArgs& args,
         {"profilingDetailed", no_argument, 0, VLMBuildOptionId::PROFILING_DETAILED},
         {"hardware-compatibility", required_argument, 0, VLMBuildOptionId::HARDWARE_COMPATIBILITY},
         {"hardwareCompatibility", required_argument, 0, VLMBuildOptionId::HARDWARE_COMPATIBILITY},
+        {"allow-image-tokens-above-checkpoint", no_argument, 0, VLMBuildOptionId::ALLOW_IMAGE_TOKENS_ABOVE_CHECKPOINT},
         {"safety", no_argument, 0, VLMBuildOptionId::SAFETY},
         {"mss-profile", required_argument, 0, VLMBuildOptionId::MSS_PROFILE},
         {"mssProfile", required_argument, 0, VLMBuildOptionId::MSS_PROFILE},
@@ -223,6 +229,7 @@ bool parseViTBuildArgs(CommonViTBuildArgs& commonArgs, ViTBuildArgs& args,
             args.hardwareCompatibility = *compatibility;
             break;
         }
+        case VLMBuildOptionId::ALLOW_IMAGE_TOKENS_ABOVE_CHECKPOINT: args.allowImageTokensAboveCheckpoint = true; break;
 #ifdef ENABLE_SAFETY_RUNTIME
         case VLMBuildOptionId::SAFETY: useSafety = true; break;
         case VLMBuildOptionId::MSS_PROFILE:
@@ -394,6 +401,7 @@ int main(int argc, char** argv)
     config.maxImageTokensPerImage = args.maxImageTokensPerImage;
     config.profilingDetailed = args.profilingDetailed;
     config.hardwareCompatibility = args.hardwareCompatibility;
+    config.allowImageTokensAboveCheckpoint = args.allowImageTokensAboveCheckpoint;
 
     // Create and run the builder
     builder::VisualBuilder visualBuilder(args.onnxDir, actualEngineDir, config);

@@ -43,8 +43,10 @@ struct VisualBuilderConfig
     int64_t minImageTokens{4};           //!< Minimum number of image tokens in a batch
     int64_t maxImageTokens{1024};        //!< Maximum number of image tokens in a batch
     int64_t maxImageTokensPerImage{512}; //!< Maximum number of image tokens per image
-    bool profilingDetailed{false};       //!< Enable detailed profiling verbosity for layer info extraction
-    bool useTrtNativeVitAttn{false};     //!< Use TRT IAttention
+    //! Gemma4: let maxImageTokensPerImage exceed the checkpoint's default_output_length.
+    bool allowImageTokensAboveCheckpoint{false};
+    bool profilingDetailed{false};   //!< Enable detailed profiling verbosity for layer info extraction
+    bool useTrtNativeVitAttn{false}; //!< Use TRT IAttention
     HardwareCompatibility hardwareCompatibility{HardwareCompatibility::kNONE};
 
     //! Convert configuration to JSON format for serialization.

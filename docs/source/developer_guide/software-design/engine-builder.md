@@ -419,6 +419,10 @@ to `llm_build` or `visual_build`:
 3. **Set Image Token Ranges for VLMs**: Configure appropriate token ranges for multimodal models
    - Use `--min-image-tokens` and `--max-image-tokens` to set the range
    - Set `--max-image-tokens-per-image` for batch processing limits
+   - Gemma 4: the per-image limit is capped at the checkpoint's `default_output_length` (280 in the E4B
+     checkpoint). Pass `--allow-image-tokens-above-checkpoint` to build a larger per-image profile, for example
+     `--max-image-tokens-per-image 560`; the limit is then `position_embedding_size / pooling_kernel_size`
+     (3413 for E4B), so that a one-token-high image stays inside the position table
 
 4. **Enable Debug Logging**: Use `--debug` for debugging build issues
 
