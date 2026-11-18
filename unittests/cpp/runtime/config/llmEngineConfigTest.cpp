@@ -3342,11 +3342,15 @@ TEST_F(LLMEngineConfigTest, LiLiCorrRejectsOutputGeometryOtherThanConfig)
 TEST(HostMappedEmbeddingPolicyTest, NeedsADecoderThatEmbedsHostIds)
 {
     EXPECT_TRUE(supportsHostMappedEmbeddingTables(SpecDecodeMode::kNONE, /*isDiffusionBackbone=*/false));
-    for (SpecDecodeMode const mode : {SpecDecodeMode::kEAGLE, SpecDecodeMode::kMTP, SpecDecodeMode::kGemma4MTP,
-             SpecDecodeMode::kDFlash, SpecDecodeMode::kJetSpec, SpecDecodeMode::kDSpark, SpecDecodeMode::kDomino})
+    EXPECT_TRUE(supportsHostMappedEmbeddingTables(SpecDecodeMode::kMTP, /*isDiffusionBackbone=*/false));
+    EXPECT_TRUE(supportsHostMappedEmbeddingTables(SpecDecodeMode::kGemma4MTP, /*isDiffusionBackbone=*/false));
+    for (SpecDecodeMode const mode : {SpecDecodeMode::kEAGLE, SpecDecodeMode::kDFlash, SpecDecodeMode::kJetSpec,
+             SpecDecodeMode::kDSpark, SpecDecodeMode::kDomino})
     {
         EXPECT_FALSE(supportsHostMappedEmbeddingTables(mode, /*isDiffusionBackbone=*/false))
             << specDecodeModeName(mode);
     }
     EXPECT_FALSE(supportsHostMappedEmbeddingTables(SpecDecodeMode::kNONE, /*isDiffusionBackbone=*/true));
+    EXPECT_FALSE(supportsHostMappedEmbeddingTables(SpecDecodeMode::kMTP, /*isDiffusionBackbone=*/true));
+    EXPECT_FALSE(supportsHostMappedEmbeddingTables(SpecDecodeMode::kGemma4MTP, /*isDiffusionBackbone=*/true));
 }

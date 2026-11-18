@@ -396,7 +396,11 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, DeploymentOpti
     // 9. Preprocessors.
     // -----------------------------------------------------------------------
     mStepPreparer = std::make_unique<StepPreparer>(mDeployment.base);
-    mEmbeddingPre = std::make_unique<EmbeddingPreprocessor>(mEmbedding, mDeployment.base);
+    // A speculative draft embeds its own rows through this preprocessor, so host-mapped staging covers both engines.
+    int32_t const hostStagingRows = mDeployment.draft.has_value()
+        ? std::max(mDeployment.base.maxPhysicalTokens, mDeployment.draft->maxPhysicalTokens)
+        : mDeployment.base.maxPhysicalTokens;
+    mEmbeddingPre = std::make_unique<EmbeddingPreprocessor>(mEmbedding, mDeployment.base, hostStagingRows);
     if (!mDeployment.base.isDiffusionBackbone && mDeployment.base.numDeepstackFeatures > 0)
     {
         mDeepstack = std::make_unique<DeepstackBinding>(mPipelineIO->deepstackEmbeds, mSharedResources->zeroBuffer);

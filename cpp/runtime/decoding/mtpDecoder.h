@@ -118,6 +118,8 @@ private:
     Tensor mHostAcceptLengths;
     Tensor mHostSeatStaging; //!< [B, 2] INT32 pinned; seatRow() only
     Tensor mHostAcceptedTokenIds;
+    //! INT32 host copy of the draft proposal and accept ids; allocated only for a host-mapped token table.
+    Tensor mHostLookupTokenIds;
     //! Target hidden states of each row's last accepted span, [maxBatch * maxAcceptDepth, baseOutputHiddenDim]; a
     //! seated prefill overwrites the pipeline's baseHiddenStates between decode steps.
     Tensor mAcceptedHiddenStates;

@@ -110,7 +110,9 @@ private:
     Tensor mHostAcceptLengths;                //!< [B] INT32 host staging.
     Tensor mHostSeatStaging;                  //!< [B, 2] INT32 pinned; seatRow() only.
     Tensor mHostAcceptedTokenIds;             //!< [B, max(P + 1, W)] INT32 host staging.
-    Tensor mArgmaxScratch;                    //!< [B * max(P + 1, J)] INT32 chain target token IDs.
+    //! [B] INT32 host copy of each draft step's sampled ids; allocated only for a host-mapped token table.
+    Tensor mHostDraftStepTokenIds;
+    Tensor mArgmaxScratch; //!< [B * max(P + 1, J)] INT32 chain target token IDs.
     //! Target hidden states of each row's last accepted span, [maxBatch * max(P + 1, W), baseOutputHiddenDim]; a
     //! seated prefill overwrites the pipeline's baseHiddenStates between decode steps.
     Tensor mAcceptedHiddenStates;

@@ -212,3 +212,14 @@ TEST_F(Gemma4MtpAssemblyTest, Seating)
 {
     expectSeating();
 }
+
+// Given a Gemma4 MTP deployment whose token table is host-mapped
+// When a prompt decodes, its seed, assistant-step and verify lookups gathering rows on the host
+// Then it decodes exactly as with the device-resident table
+//
+// No Markov proposal is accepted in this mode (one verify round per generated token), so the acceptance
+// precondition is waived; every round still embeds the seed and the verify rows from the host-mapped table.
+TEST_F(Gemma4MtpAssemblyTest, HostMappedTokenTableDecodesAlike)
+{
+    expectHostMappedTokenTableDecodesAlike(/*requireAcceptedDrafts=*/false);
+}

@@ -75,10 +75,12 @@ char const* specDecodeModeName(SpecDecodeMode mode) noexcept;
 bool isCachedBlockDraftMode(SpecDecodeMode mode) noexcept;
 
 //! A host-mapped token table gathers rows on the CPU, so a decoder may use it only if every token id it embeds
-//! reaches the host first. Vanilla decoding has them there already.
+//! reaches the host first. Vanilla decoding has them there already; the MTP and Gemma 4 MTP decoders copy their
+//! device-sampled draft and verify ids back before each lookup.
 constexpr bool supportsHostMappedEmbeddingTables(SpecDecodeMode mode, bool isDiffusionBackbone) noexcept
 {
-    return !isDiffusionBackbone && mode == SpecDecodeMode::kNONE;
+    return !isDiffusionBackbone
+        && (mode == SpecDecodeMode::kNONE || mode == SpecDecodeMode::kMTP || mode == SpecDecodeMode::kGemma4MTP);
 }
 
 enum class RaggedBackendKind : int32_t

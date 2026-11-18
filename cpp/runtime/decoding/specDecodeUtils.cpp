@@ -225,9 +225,13 @@ void prepareTargetVerifyInputs(SpecVerifyInputs const& inputs, DecodingRuntimeCo
                 && inputs.depths->rawPointer() == depths->rawPointer(),
             "Selected ancestry must borrow existing PipelineIO storage");
     }
-    kernel::embeddingLookup(inputs.tokenIds, runtime.preprocess.embedding.table,
-        runtime.preprocess.embedding.scalesAsOptional(), runtime.preprocess.embedding.descriptor, io.inputsEmbeds,
-        context.stream);
+    // A host-mapped token table is looked up by specPleStaging.embed below, from the one host copy of the ids.
+    if (!runtime.preprocess.embeddingPreprocessor.needsHostTokenIds())
+    {
+        kernel::embeddingLookup(inputs.tokenIds, runtime.preprocess.embedding.table,
+            runtime.preprocess.embedding.scalesAsOptional(), runtime.preprocess.embedding.descriptor, io.inputsEmbeds,
+            context.stream);
+    }
     if (runtime.preprocess.deepstack != nullptr)
     {
         runtime.preprocess.deepstack->useZeroTarget(runtime.base.tensorMap);

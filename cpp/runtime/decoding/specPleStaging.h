@@ -29,8 +29,9 @@ namespace trt_edgellm::rt
 struct DecodingRuntimeContext;
 struct DecodingInferenceContext;
 
-//! Host staging for the PLE preprocessors that read speculative verify rows on the host
-//! (Gemma4 host-token lookups, the Qwen4-Exp n-gram injection).
+//! Host staging for the preprocessors that read speculative verify rows on the host
+//! (a host-mapped token table, Gemma4 host-token lookups, the Qwen4-Exp n-gram injection).
+//! One device-to-host copy of the verify ids serves all of them.
 class SpecPleStaging
 {
 public:
@@ -39,8 +40,9 @@ public:
     //! Call once the base engine and its PipelineIO exist.
     SpecPleStaging(DecodingRuntimeContext const& runtime, int32_t maxVerifyTokens, SpecVerifyLayout layout);
 
-    //! Feed the verify rows to the PLE preprocessors; call after the ragged bindings, which fill
-    //! the query lengths that mask padding.
+    //! Feed the verify rows to the PLE preprocessors, and to the token-embedding lookup when the token table is
+    //! host-mapped (prepareTargetVerifyInputs leaves that lookup to this call); call after the ragged bindings,
+    //! which fill the query lengths that mask padding.
     void embed(DecodingRuntimeContext& runtime, DecodingInferenceContext const& context, Tensor const& tokenIds,
         int32_t requestCount, int32_t tokensPerRequest, cudaStream_t stream);
 

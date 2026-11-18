@@ -28,7 +28,8 @@ SpecPleStaging::SpecPleStaging(DecodingRuntimeContext const& runtime, int32_t ma
     int32_t const maxBatch = runtime.maxRuntimeBatchSize;
     auto const* const gemma = runtime.preprocess.gemma4Ple;
     auto const* const ngram = runtime.preprocess.qwen4ExpNgram;
-    if (ngram != nullptr || (gemma != nullptr && gemma->needsHostTokens()))
+    bool const hostTokenTable = runtime.preprocess.embeddingPreprocessor.needsHostTokenIds();
+    if (hostTokenTable || ngram != nullptr || (gemma != nullptr && gemma->needsHostTokens()))
     {
         mHostTokenIds = Tensor({maxBatch, maxVerifyTokens}, DeviceType::kCPU, trt_edgellm::DataType::kINT32,
             "SpecPleStaging::hostTokenIds");
@@ -50,7 +51,8 @@ void SpecPleStaging::embed(DecodingRuntimeContext& runtime, DecodingInferenceCon
     auto* const gemma = runtime.preprocess.gemma4Ple;
     auto* const ngram = runtime.preprocess.qwen4ExpNgram;
     Tensor& deviceQueryLengths = runtime.base.pipelineIO.queryLengths;
-    bool const needsHost = ngram != nullptr || (gemma != nullptr && gemma->needsHostTokens());
+    bool const hostTokenTable = runtime.preprocess.embeddingPreprocessor.needsHostTokenIds();
+    bool const needsHost = hostTokenTable || ngram != nullptr || (gemma != nullptr && gemma->needsHostTokens());
     if (!needsHost)
     {
         if (gemma != nullptr)
@@ -59,7 +61,8 @@ void SpecPleStaging::embed(DecodingRuntimeContext& runtime, DecodingInferenceCon
         }
         return;
     }
-    // Graph-capture contexts carry no request tokens; the capture shapes the PLE bindings itself.
+    // Graph-capture contexts carry no request tokens; the capture shapes the PLE bindings itself, and the engine
+    // graph does not depend on the embedding values.
     if (context.tokenIds.size() < static_cast<size_t>(requestCount))
     {
         return;
@@ -85,6 +88,12 @@ void SpecPleStaging::embed(DecodingRuntimeContext& runtime, DecodingInferenceCon
     CUDA_CHECK(cudaStreamSynchronize(stream));
     int32_t const* lengths = mHostQueryLengths.dataPointer<int32_t>();
     mQueryLengths.assign(lengths, lengths + batch);
+
+    if (hostTokenTable)
+    {
+        runtime.preprocess.embeddingPreprocessor.embed(tokenIds, mHostTokenIds.dataPointer<int32_t>(), std::nullopt,
+            std::nullopt, runtime.base.pipelineIO, stream);
+    }
 
     if (gemma != nullptr)
     {

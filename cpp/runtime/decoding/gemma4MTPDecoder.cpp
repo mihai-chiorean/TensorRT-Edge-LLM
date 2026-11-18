@@ -164,6 +164,11 @@ Gemma4MTPDecoder::Gemma4MTPDecoder(DecodingRuntimeContext& runtime, std::unique_
         {maxRuntimeBatchSize, 2}, DeviceType::kCPU, trt_edgellm::DataType::kINT32, "Gemma4MTP::hostSeatStaging");
     mHostAcceptedTokenIds = Tensor({maxRuntimeBatchSize, acceptCapacity}, DeviceType::kCPU,
         trt_edgellm::DataType::kINT32, "Gemma4MTP::hostAcceptedTokenIds");
+    if (mRuntime.preprocess.embeddingPreprocessor.needsHostTokenIds())
+    {
+        mHostDraftStepTokenIds = Tensor(
+            {maxRuntimeBatchSize}, DeviceType::kCPU, trt_edgellm::DataType::kINT32, "Gemma4MTP::hostDraftStepTokenIds");
+    }
     mArgmaxScratch = Tensor(
         {maxRuntimeBatchSize * verifyCapacity}, DeviceType::kGPU, trt_edgellm::DataType::kINT32, "Gemma4MTP::argmax");
     mAcceptedHiddenStates
@@ -496,9 +501,8 @@ bool Gemma4MTPDecoder::prepareSeed(DecodingInferenceContext& context)
     CUDA_CHECK(cudaMemcpyAsync(mRuntime.preprocess.idsInput.rawPointer(), hostSeedTokens,
         activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
 
-    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
-        mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.preprocess.embedding.descriptor,
-        mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
+    decoder_utils::embedTokenIds(
+        mRuntime, mRuntime.preprocess.idsInput, hostSeedTokens, mHostDraftStepTokenIds, context.stream);
 
     // The first round of a request seeds from the target's prefill hidden states; every later one (and a seated
     // row's first) from the accepted span the decoder carried from the last verification.
@@ -652,9 +656,9 @@ bool Gemma4MTPDecoder::runAssistantDraftChain(DecodingInferenceContext& context)
 
         if (step + 1 < draftSteps)
         {
-            kernel::embeddingLookup(mRuntime.sampling.indices, mRuntime.preprocess.embedding.table,
-                mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.preprocess.embedding.descriptor,
-                mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
+            // A host-mapped token table copies the sampled ids to the host here, one stream sync per step.
+            decoder_utils::embedTokenIds(
+                mRuntime, mRuntime.sampling.indices, nullptr, mHostDraftStepTokenIds, context.stream);
             CUDA_CHECK(cudaMemcpyAsync(mRuntime.base.pipelineIO.draftHiddenStatesIn.rawPointer(),
                 mRuntime.base.pipelineIO.draftHiddenStatesOut.rawPointer(),
                 activeBatchSize * baseHiddenSize

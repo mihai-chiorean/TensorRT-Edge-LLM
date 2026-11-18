@@ -107,6 +107,31 @@ std::vector<int32_t> const kJoinerPrompt{42, 43, 44};
 
 } // namespace
 
+// Given a deployment whose token table is host-mapped from a sidecar
+// When it is assembled and, where the decoder supports it, decodes
+// Then MTP decodes exactly as with the device-resident table, and EAGLE, whose drafter embeds device-sampled ids it
+//      never copies to the host, is refused at load
+TEST_P(SpecSessionTest, HostMappedTokenTable)
+{
+    if (GetParam() == TwoEngineMode::kMtp)
+    {
+        expectHostMappedTokenTableDecodesAlike();
+        return;
+    }
+    auto artifacts = makeArtifacts(makeMarkovBase(), makeMarkovEngine(/*draft=*/true));
+    hostMapTokenTable(artifacts, mModelDir / "hostMappedTokenTable", mStream);
+    std::string reason;
+    try
+    {
+        rt::LLMInferenceRuntime runtime = makeRuntime(std::move(artifacts));
+    }
+    catch (std::exception const& error)
+    {
+        reason = error.what();
+    }
+    EXPECT_THAT(reason, ::testing::HasSubstr("--host-embedding-tables does not support eagle3"));
+}
+
 // Given two prompts whose drafts are accepted over varying lengths
 // When the second is seated while the first is mid-generation
 // Then each decodes exactly as it does alone (see expectJoinerMatchesSolo)

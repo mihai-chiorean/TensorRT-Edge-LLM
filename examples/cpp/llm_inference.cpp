@@ -156,8 +156,9 @@ void printUsage(char const* programName)
         << std::endl;
     std::cerr << "                            and upload each step's rows; token table only, PLE uses --ple-residency."
               << std::endl;
-    std::cerr << "                            Vanilla decoding, single device; excludes --offload-embedding."
+    std::cerr << "                            Vanilla, MTP or Gemma 4 MTP decoding, single device; excludes"
               << std::endl;
+    std::cerr << "                            --offload-embedding." << std::endl;
     std::cerr << "  --ple-cache-slots          Cached PLE slots including zero; chosen at runtime initialization"
               << std::endl;
     std::cerr << "                            Distinct valid rows across each execution batch must fit in slots - 1."

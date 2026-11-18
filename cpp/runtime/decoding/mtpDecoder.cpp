@@ -133,6 +133,11 @@ MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, std::filesystem::path co
         {maxRuntimeBatchSize, 2}, DeviceType::kCPU, trt_edgellm::DataType::kINT32, "SpecDecode::hostSeatStaging");
     mHostAcceptedTokenIds = Tensor({maxRuntimeBatchSize, effectiveMaxAcceptDepth}, DeviceType::kCPU,
         trt_edgellm::DataType::kINT32, "SpecDecode::hostAcceptedIds");
+    if (mRuntime.preprocess.embeddingPreprocessor.needsHostTokenIds())
+    {
+        mHostLookupTokenIds = Tensor({mRuntime.deployment.draft->maxPhysicalTokens}, DeviceType::kCPU,
+            trt_edgellm::DataType::kINT32, "SpecDecode::hostLookupTokenIds");
+    }
     mAcceptedHiddenStates
         = Tensor({maxRuntimeBatchSize * effectiveMaxAcceptDepth, mRuntime.deployment.specConfig->baseOutputHiddenDim},
             DeviceType::kGPU, trt_edgellm::DataType::kHALF, "SpecDecode::acceptedHidden");
@@ -611,9 +616,8 @@ bool MTPDecoder::constructDraftProposal(DecodingInferenceContext& context)
         check::check(
             mRuntime.base.pipelineIO.inputsEmbeds.reshape({activeBatchSize, paddedDraftProposalSize, draftHiddenSize}),
             "Tensor reshape failed");
-        kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
-            mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.preprocess.embedding.descriptor,
-            mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
+        decoder_utils::embedTokenIds(
+            mRuntime, mRuntime.preprocess.idsInput, nullptr, mHostLookupTokenIds, context.stream);
 
         {
             Tensor const& draftKVCacheLengths = mDraftCacheManager.getKVCacheLengths();
@@ -1000,9 +1004,7 @@ bool MTPDecoder::runDraftModelAcceptToken(DecodingInferenceContext& context)
 
     check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape({activeBatchSize, inputIdsLength, draftHiddenSize}),
         "Tensor reshape failed");
-    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
-        mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.preprocess.embedding.descriptor,
-        mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
+    decoder_utils::embedTokenIds(mRuntime, mRuntime.preprocess.idsInput, nullptr, mHostLookupTokenIds, context.stream);
 
     {
         int32_t const acceptedTokenNum = static_cast<int32_t>(inputIdsLength);

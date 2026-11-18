@@ -59,6 +59,17 @@ void appendSampledTokens(DecodingInferenceContext& context, int32_t const* sampl
 //! bound region is a contiguous prefix of the allocation, so shape.volume() is sufficient.
 void zeroActiveRegion(Tensor& tensor, cudaStream_t stream);
 
+//! @brief Copy the first `count` device token ids into the pinned `hostIds` and wait for the copy to land.
+//! For row lookups that gather on the host from ids sampled on the device. Returns `hostIds`' data.
+int32_t const* copyTokenIdsToHost(Tensor const& deviceIds, int64_t count, Tensor& hostIds, cudaStream_t stream);
+
+//! @brief Token-embedding lookup of `tokenIds` into the base pipeline's inputsEmbeds.
+//!
+//! A host-mapped table needs the ids in host memory: `hostIds` when the caller has them, else the ids are copied
+//! from the device into `hostIdsScratch` first, which waits for the stream. A device-resident table uses neither.
+void embedTokenIds(DecodingRuntimeContext& runtime, Tensor const& tokenIds, int32_t const* hostIds,
+    Tensor& hostIdsScratch, cudaStream_t stream);
+
 //! @brief The forced nodes of a grafting round's verify tree, for telling forced accepted positions from predictions.
 struct ForcedPathInfo
 {

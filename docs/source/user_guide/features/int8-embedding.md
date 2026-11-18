@@ -98,10 +98,15 @@ The flag affects only the token table; Gemma 4 per-layer embeddings keep the
 storage selected by `--ple-residency`. It reads FP16, INT8 and packed INT4
 sidecars (not FP8 or NVFP4), excludes `--offload-embedding`, and needs the
 sidecar file: an engine whose token table comes from the checkpoint is refused.
-The staging keeps a pinned and a device copy of the engine's maximum number of
-physical tokens. It supports single-device vanilla decoding; speculative and
-diffusion decoders are refused at load, and `llm_inference` refuses it with
-Qwen3-Omni audio output.
+The staging keeps a pinned and a device copy of the larger of the base and draft
+engines' maximum number of physical tokens. It supports single-device vanilla,
+MTP and Gemma 4 MTP decoding. The MTP decoders sample draft tokens on the
+device, so with a host-mapped table they copy those ids to the host before each
+draft lookup (once per Gemma 4 assistant step that feeds the next one, once per
+MTP proposal round and draft accept pass) and once for the verify tokens, a copy
+that cached PLE shares when it is enabled; each copy waits for the stream.
+EAGLE, DFlash, DSpark, JetSpec, Domino and diffusion decoders are refused at
+load, and `llm_inference` refuses the flag with Qwen3-Omni audio output.
 
 ## Limitations
 

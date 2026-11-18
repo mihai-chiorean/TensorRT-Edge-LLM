@@ -49,6 +49,32 @@ void zeroActiveRegion(Tensor& tensor, cudaStream_t stream)
     CUDA_CHECK(cudaMemsetAsync(tensor.rawPointer(), 0, bytes, stream));
 }
 
+int32_t const* copyTokenIdsToHost(Tensor const& deviceIds, int64_t count, Tensor& hostIds, cudaStream_t stream)
+{
+    ELLM_CHECK(deviceIds.getDeviceType() == DeviceType::kGPU && hostIds.getDeviceType() == DeviceType::kCPU
+            && deviceIds.getDataType() == trt_edgellm::DataType::kINT32
+            && hostIds.getDataType() == trt_edgellm::DataType::kINT32,
+        "copyTokenIdsToHost copies INT32 ids from a device tensor into a pinned host tensor");
+    ELLM_CHECK(count > 0 && count <= deviceIds.getShape().volume()
+            && count * static_cast<int64_t>(sizeof(int32_t)) <= hostIds.getMemoryCapacity(),
+        "copyTokenIdsToHost count " + std::to_string(count) + " exceeds its source or destination");
+    CUDA_CHECK(cudaMemcpyAsync(hostIds.rawPointer(), deviceIds.rawPointer(),
+        static_cast<size_t>(count) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return hostIds.dataPointer<int32_t>();
+}
+
+void embedTokenIds(DecodingRuntimeContext& runtime, Tensor const& tokenIds, int32_t const* hostIds,
+    Tensor& hostIdsScratch, cudaStream_t stream)
+{
+    EmbeddingPreprocessor& preprocessor = runtime.preprocess.embeddingPreprocessor;
+    if (preprocessor.needsHostTokenIds() && hostIds == nullptr)
+    {
+        hostIds = copyTokenIdsToHost(tokenIds, tokenIds.getShape().volume(), hostIdsScratch, stream);
+    }
+    preprocessor.embed(tokenIds, hostIds, std::nullopt, std::nullopt, runtime.base.pipelineIO, stream);
+}
+
 void prepareSpecRaggedBindings(DecodingRuntimeContext& runtime, LLMEngineConfig const& cfg, int32_t kvCacheIndex,
     Tensor const& attentionPositions, Tensor const& committedPastLengths, Tensor const* validCounts,
     Tensor const& selectedTokenIndices, int32_t selectedRows, std::vector<ResidentRef> const* residentRefs,

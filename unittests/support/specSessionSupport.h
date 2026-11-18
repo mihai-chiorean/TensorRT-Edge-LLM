@@ -336,6 +336,36 @@ protected:
         return response;
     }
 
+    //! The substitute engines derive their tokens from the embeddings they are fed, so a host-mapped token table
+    //! that gathered a wrong row for any prefill, draft, verify or accept pass would change the output.
+    //!
+    //! Given the same deployment with its token table on the device and host-mapped from a sidecar
+    //! When a prompt whose drafts are accepted over varying lengths decodes on each
+    //! Then both produce the substitute model's continuation through the same rounds
+    //!
+    //! @p requireAcceptedDrafts is false for a mode in which the substitute's proposals are never accepted.
+    void expectHostMappedTokenTableDecodesAlike(bool requireAcceptedDrafts = true)
+    {
+        auto const request = makeTokenizedRequest({5, 9, 17, 33, 21}, kSessionGenerateLength);
+        rt::LLMGenerationResponse const device = decodeBlocking(request);
+        ASSERT_EQ(device.outputIds.size(), 1U);
+        ASSERT_EQ(device.specVerifyCounts.size(), 1U);
+        if (requireAcceptedDrafts)
+        {
+            ASSERT_LT(device.specVerifyCounts.front(), kSessionGenerateLength - 1)
+                << "no round accepted a draft, so the draft lookups went unchecked";
+        }
+
+        auto artifacts = makeArtifacts(makeMarkovBase(), makeMarkovEngine(/*draft=*/true));
+        hostMapTokenTable(artifacts, mModelDir / "hostMappedTokenTable", mStream);
+        rt::LLMInferenceRuntime runtime = makeRuntime(std::move(artifacts));
+        rt::LLMGenerationResponse mapped;
+        ASSERT_TRUE(runtime.handleRequest(request, mapped, mStream));
+        EXPECT_EQ(mapped.outputIds, device.outputIds);
+        EXPECT_EQ(mapped.specVerifyCounts, device.specVerifyCounts);
+        EXPECT_EQ(mapped.outputIds.front(), markovContinuation({5, 9, 17, 33, 21}, kSessionGenerateLength));
+    }
+
     //! A sequence seated into a running batch decodes exactly as it does alone.
     //!
     //! Given two prompts and their solo decodes on the blocking path
