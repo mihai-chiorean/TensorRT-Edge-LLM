@@ -1039,6 +1039,66 @@ EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cud
     return result;
 }
 
+EmbeddingData mapEmbeddingTable(std::filesystem::path const& embeddingPath)
+{
+    std::string const source = embeddingPath.string();
+    ELLM_CHECK(std::filesystem::exists(embeddingPath), format::fmtstr("Embedding file not found: %s", source.c_str()));
+    {
+        file_io::MmapReader reader(embeddingPath);
+        safetensors::FileMetadata const fileMetadata
+            = safetensors::parseMetadata(reader.getData(), reader.getSize(), source);
+        ELLM_CHECK(fileMetadata.metadata.find(kEmbeddingDescriptorMetadataKey) == fileMetadata.metadata.end(),
+            format::fmtstr("Host-mapped embedding tables do not support NVFP4 tables: %s", source.c_str()));
+        // Checked before mapping: an FP8 table carries shared scales, which HostRowTable reports as a shape error.
+        for (auto const& entry : fileMetadata.tensors)
+        {
+            ELLM_CHECK(entry.name != kEmbeddingTensorName || entry.dataType == trt_edgellm::DataType::kHALF
+                    || entry.dataType == trt_edgellm::DataType::kINT8
+                    || entry.dataType == trt_edgellm::DataType::kUINT8,
+                format::fmtstr("Host-mapped embedding tables must be FP16, INT8, or packed INT4, got dtype %d: %s",
+                    static_cast<int>(entry.dataType), source.c_str()));
+        }
+    }
+
+    auto hostTable
+        = std::make_unique<rt::HostRowTable>(embeddingPath, kEmbeddingTensorName, kFp8EmbeddingScaleTensorName);
+    auto const dtype = hostTable->dataType();
+    int64_t const vocabSize = hostTable->rows();
+    int64_t const storedWidth = hostTable->shape()[1];
+    Coords const& scaleShape = hostTable->scaleShape();
+    if (dtype == trt_edgellm::DataType::kINT8)
+    {
+        ELLM_CHECK(hostTable->hasScales() && hostTable->scaleDataType() == trt_edgellm::DataType::kFLOAT
+                && scaleShape.getNumDims() == 1,
+            format::fmtstr("INT8 embedding requires a 1D FP32 'embedding_scale' tensor: %s", source.c_str()));
+        LOG_INFO("Mapped INT8 embedding: [%ld, %ld], scales: [%ld]", vocabSize, storedWidth, vocabSize);
+    }
+    else if (dtype == trt_edgellm::DataType::kUINT8)
+    {
+        int64_t const columns = 2 * storedWidth;
+        ELLM_CHECK(hostTable->hasScales() && hostTable->scaleDataType() == trt_edgellm::DataType::kHALF
+                && scaleShape.getNumDims() == 2,
+            format::fmtstr("INT4 embedding requires a 2D FP16 'embedding_scale' tensor: %s", source.c_str()));
+        ELLM_CHECK(columns % kInt4EmbeddingGroupSize == 0 && scaleShape[1] == columns / kInt4EmbeddingGroupSize,
+            format::fmtstr("INT4 embedding_scale must be [%ld, %ld], got [%ld, %ld]", vocabSize,
+                columns / kInt4EmbeddingGroupSize, scaleShape[0], scaleShape[1]));
+        LOG_INFO("Mapped INT4 embedding: [%ld, %ld] packed as [%ld, %ld]", vocabSize, columns, vocabSize, storedWidth);
+    }
+    else
+    {
+        ELLM_CHECK(dtype == trt_edgellm::DataType::kHALF,
+            format::fmtstr("Host-mapped embedding tables must be FP16, INT8, or packed INT4, got dtype %d: %s",
+                static_cast<int>(dtype), source.c_str()));
+        ELLM_CHECK(!hostTable->hasScales(),
+            format::fmtstr("FP16 embedding must not have an 'embedding_scale' tensor: %s", source.c_str()));
+        LOG_INFO("Mapped FP16 embedding: [%ld, %ld]", vocabSize, storedWidth);
+    }
+
+    EmbeddingData result;
+    result.hostTable = std::move(hostTable);
+    return result;
+}
+
 int32_t clampMaxGenerateLengthForKVCapacity(std::vector<int32_t> const& effectivePrefillLengths,
     int32_t requestedMaxGenerateLength, int32_t kvCacheCapacity, int32_t kvCacheReserveLength)
 {

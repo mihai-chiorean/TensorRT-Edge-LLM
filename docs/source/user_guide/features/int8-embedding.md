@@ -82,6 +82,27 @@ store their token table on that grid, so this rule reproduces it up to FP16
 rounding of the scale. The sidecar format and the runtime decode are the same
 for both rules.
 
+## Host-Mapped Token Table
+
+By default the runtime copies `embedding.safetensors` into device memory at
+load, and `--offload-embedding` copies it into pinned host memory instead. On a
+board whose CPU and GPU share one memory pool, both copies stay resident for the
+life of the process. `--host-embedding-tables` (alias `--hostEmbeddingTables`;
+`EmbeddingTableResidency::kHostMapped` in `DeploymentOptions`) keeps the file
+mapped read-only instead. Each step gathers the rows of its token ids on the CPU
+into a pinned staging buffer, copies only those rows to the device, and runs the
+same dequantization on them, so the embeddings are bit-identical to the
+device-resident table. The mapped pages are file-backed and reclaimable.
+
+The flag affects only the token table; Gemma 4 per-layer embeddings keep the
+storage selected by `--ple-residency`. It reads FP16, INT8 and packed INT4
+sidecars (not FP8 or NVFP4), excludes `--offload-embedding`, and needs the
+sidecar file: an engine whose token table comes from the checkpoint is refused.
+The staging keeps a pinned and a device copy of the engine's maximum number of
+physical tokens. It supports single-device vanilla decoding; speculative and
+diffusion decoders are refused at load, and `llm_inference` refuses it with
+Qwen3-Omni audio output.
+
 ## Limitations
 
 - The experimental direct checkpoint builder has no INT8 embedding option; it

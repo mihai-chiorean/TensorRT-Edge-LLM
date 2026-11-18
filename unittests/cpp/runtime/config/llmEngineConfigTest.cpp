@@ -3336,3 +3336,17 @@ TEST_F(LLMEngineConfigTest, LiLiCorrRejectsOutputGeometryOtherThanConfig)
                     Dims{3, {-1, 7, 8}}, Dims{4, {-1, 7, 8, 8}}, DataType::kFLOAT),
         HasSubstr(binding_names::kSpecProposalSupportIds));
 }
+
+// A host-mapped token table gathers rows on the CPU, so only decoders that bring every embedded id to the host may
+// use it.
+TEST(HostMappedEmbeddingPolicyTest, NeedsADecoderThatEmbedsHostIds)
+{
+    EXPECT_TRUE(supportsHostMappedEmbeddingTables(SpecDecodeMode::kNONE, /*isDiffusionBackbone=*/false));
+    for (SpecDecodeMode const mode : {SpecDecodeMode::kEAGLE, SpecDecodeMode::kMTP, SpecDecodeMode::kGemma4MTP,
+             SpecDecodeMode::kDFlash, SpecDecodeMode::kJetSpec, SpecDecodeMode::kDSpark, SpecDecodeMode::kDomino})
+    {
+        EXPECT_FALSE(supportsHostMappedEmbeddingTables(mode, /*isDiffusionBackbone=*/false))
+            << specDecodeModeName(mode);
+    }
+    EXPECT_FALSE(supportsHostMappedEmbeddingTables(SpecDecodeMode::kNONE, /*isDiffusionBackbone=*/true));
+}

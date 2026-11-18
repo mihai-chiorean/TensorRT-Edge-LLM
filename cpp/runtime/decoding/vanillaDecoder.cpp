@@ -114,9 +114,9 @@ bool VanillaDecoder::runDecodeForward(DecodingInferenceContext& context)
     check::check(
         mRuntime.base.pipelineIO.inputsEmbeds.reshape({activeBatchSize, 1, mRuntime.deployment.base.hiddenSize}),
         "Tensor reshape failed");
-    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
-        mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.preprocess.embedding.descriptor,
-        mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
+    mRuntime.preprocess.embeddingPreprocessor.embed(mRuntime.preprocess.idsInput,
+        batch.hostTokenIds.dataPointer<int32_t>(), std::nullopt, std::nullopt, mRuntime.base.pipelineIO,
+        context.stream);
     prepareRaggedExecutionBindings(mRuntime.base.pipelineIO, mRuntime.base.sharedResources, mRuntime.deployment.base,
         batch, /*kvCacheIndex=*/0, context.stream);
     if (mRuntime.preprocess.gemma4Ple)
@@ -231,8 +231,8 @@ bool VanillaDecoder::runChunkForward(DecodingInferenceContext& context)
     io.recordStepHostUploads(context.stream);
 
     check::check(io.inputsEmbeds.reshape({activeBatchSize, queryWidth, base.hiddenSize}), "Tensor reshape failed");
-    mRuntime.preprocess.embeddingPreprocessor.embed(
-        mRuntime.preprocess.idsInput, std::nullopt, std::nullopt, io, context.stream);
+    mRuntime.preprocess.embeddingPreprocessor.embed(mRuntime.preprocess.idsInput,
+        batch.hostTokenIds.dataPointer<int32_t>(), std::nullopt, std::nullopt, io, context.stream);
     if (mRuntime.preprocess.deepstack)
     {
         // The shared zero target covers one row per sequence; a chunk binds queryWidth rows per sequence.

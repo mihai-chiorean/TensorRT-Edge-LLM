@@ -50,6 +50,7 @@ enum RuntimeOptionId : int
     PLE_CACHE_SLOTS = 943,
     PLE_FILE = 944,
     OFFLOAD_EMBEDDING = 949,
+    HOST_EMBEDDING_TABLES = 950,
     VISUAL_PRUNE = 935,
     VISUAL_PRUNE_ALGO = 939,
     DART_REDUCTION_RATIO = 936,
@@ -97,6 +98,7 @@ struct RuntimeArgs
     rt::ContextCacheConfig contextCacheConfig;
     rt::PleRuntimeConfig pleConfig{};
     bool offloadEmbedding{false};
+    bool hostEmbeddingTables{false};
     rt::VisualPrunerConfig visualPrunerConfig;
 };
 

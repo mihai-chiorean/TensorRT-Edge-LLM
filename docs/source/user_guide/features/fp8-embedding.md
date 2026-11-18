@@ -128,6 +128,9 @@ For host-backed token storage, pass `--offloadEmbedding` to `llm_inference`.
 The table remains compressed in CUDA-pinned host memory and the same CUDA
 lookup kernel reads it through unified virtual addressing. PLE additionally
 supports file-backed caching through `--pleResidency cached --pleCacheSlots 4096`.
+`--host-embedding-tables` maps an FP16, INT8 or packed INT4 token sidecar instead
+of loading it and uploads each step's rows; it does not read FP8 tables (see
+[INT8 Embedding Sidecar](int8-embedding.md#host-mapped-token-table)).
 
 ---
 

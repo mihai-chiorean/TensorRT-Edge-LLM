@@ -238,10 +238,12 @@ __global__ void assembleDeepstackEmbeddingKernel(int32_t const* inputIds, half c
 //! \brief Template-based embedding lookup kernel (text + optional image/audio)
 //! Text tokens use the template loader (FP16 or FP8), image/audio tokens use FP16 embeds
 //! \tparam TLoader Embedding loader type (Fp16EmbeddingLoader or Fp8EmbeddingLoader)
+//! With stagedRows the loader's table holds one pre-gathered row per position and is indexed by position.
 template <typename TLoader>
 __global__ void embeddingLookupKernelImpl(int32_t const* inputIds, TLoader loader, int32_t const* multimodalIndices,
     int32_t imageTokenId, half const* imageEmbeds, int64_t imageTokenLen, int32_t audioTokenId, half const* audioEmbeds,
-    int64_t audioTokenLen, half* output, int64_t batchSize, int64_t seqLen, int32_t vocabSize, int64_t hiddenSize)
+    int64_t audioTokenLen, half* output, int64_t batchSize, int64_t seqLen, int32_t vocabSize, int64_t hiddenSize,
+    bool stagedRows)
 {
     // Each warp handles one hidden state (one token's embedding)
     constexpr uint32_t vecSize = TLoader::vecSize;
@@ -263,6 +265,7 @@ __global__ void embeddingLookupKernelImpl(int32_t const* inputIds, TLoader loade
 
     // Get token ID
     int32_t const tokenId = inputIds[linearIdx];
+    int32_t const tableRow = stagedRows ? static_cast<int32_t>(linearIdx) : tokenId;
 
     // Determine token type
     bool isImageToken = (imageEmbeds != nullptr && tokenId == imageTokenId);
@@ -298,7 +301,7 @@ __global__ void embeddingLookupKernelImpl(int32_t const* inputIds, TLoader loade
         if (isValidTextToken)
         {
             // Use template loader for text tokens (supports FP16 or FP8)
-            loader.load(tokenId, hiddenSize, offset, embeddingVec);
+            loader.load(tableRow, hiddenSize, offset, embeddingVec);
         }
         else if (isValidImageToken)
         {
@@ -333,7 +336,7 @@ template <typename TLoader>
 void launchEmbeddingLookupKernel(int32_t const* inputIds, TLoader const& loader, int32_t const* multimodalIndices,
     int32_t imageTokenId, half const* imageEmbeds, int64_t imageTokenLen, int32_t audioTokenId, half const* audioEmbeds,
     int64_t audioTokenLen, half* output, int64_t batchSize, int64_t seqLen, int32_t vocabSize, int64_t hiddenSize,
-    cudaStream_t stream)
+    bool stagedRows, cudaStream_t stream)
 {
     constexpr uint32_t vecSize = TLoader::vecSize;
     uint32_t const totalTokens = batchSize * seqLen;
@@ -348,7 +351,7 @@ void launchEmbeddingLookupKernel(int32_t const* inputIds, TLoader const& loader,
 
     embeddingLookupKernelImpl<<<gridSize, threadsPerBlock, 0, stream>>>(inputIds, loader, multimodalIndices,
         imageTokenId, imageEmbeds, imageTokenLen, audioTokenId, audioEmbeds, audioTokenLen, output, batchSize, seqLen,
-        vocabSize, hiddenSize);
+        vocabSize, hiddenSize, stagedRows);
 }
 
 } // namespace
@@ -629,7 +632,8 @@ void assembleDeepstackEmbedding(rt::Tensor const& inputIds, rt::Tensor const& de
 static void embeddingLookupImpl(rt::Tensor const& inputIds, rt::Tensor const& embeddingTable,
     rt::OptionalInputTensor scales, rt::Tensor& output, cudaStream_t stream, rt::OptionalInputTensor multimodalIndices,
     std::optional<int32_t> imageTokenId, rt::OptionalInputTensor imageEmbeds, std::optional<int32_t> audioTokenId,
-    rt::OptionalInputTensor audioEmbeds, EmbeddingTableDescriptor const* descriptor)
+    rt::OptionalInputTensor audioEmbeds, EmbeddingTableDescriptor const* descriptor,
+    std::optional<int32_t> stagedVocabSize)
 {
     // Validate input shapes
     auto const inputShape = inputIds.getShape();
@@ -657,7 +661,15 @@ static void embeddingLookupImpl(rt::Tensor const& inputIds, rt::Tensor const& em
     }
 
     auto const& logicalShape = descriptor == nullptr ? embeddingShape : descriptor->logicalShape;
-    int32_t const vocabSize = static_cast<int32_t>(logicalShape[0]);
+    int64_t const tableRows = embeddingShape[0];
+    bool const stagedRows = stagedVocabSize.has_value();
+    if (stagedRows)
+    {
+        check::check(descriptor == nullptr, "Staged embedding rows do not support descriptor-based tables");
+        check::check(*stagedVocabSize > 0, "stagedVocabSize must be positive");
+        check::check(tableRows == batchSize * seqLen, "Staged embedding rows must hold one row per position");
+    }
+    int32_t const vocabSize = stagedRows ? *stagedVocabSize : static_cast<int32_t>(logicalShape[0]);
     // Without a descriptor an unsigned byte table is the packed INT4 format, two columns per byte.
     bool const isInt4Embedding = descriptor == nullptr && embeddingTable.getDataType() == trt_edgellm::DataType::kUINT8;
     int64_t const hiddenSize = isInt4Embedding ? 2 * logicalShape[1] : logicalShape[1];
@@ -789,7 +801,7 @@ static void embeddingLookupImpl(rt::Tensor const& inputIds, rt::Tensor const& em
             descriptor->multiplierGlobalScale * descriptor->modelOutputScale};
         launchEmbeddingLookupKernel(inputIdsPtr, loader, multimodalIndicesPtr, imageTokenIdValue, imageEmbedsPtr,
             imageTokenLen, audioTokenIdValue, audioEmbedsPtr, audioTokenLen, outputPtr, batchSize, seqLen, vocabSize,
-            hiddenSize, stream);
+            hiddenSize, stagedRows, stream);
 #else
         check::check(
             false, "NVFP4 embedding lookup is unavailable: build does not support FP8 block scales (SUPPORTS_FP8=0)");
@@ -805,7 +817,7 @@ static void embeddingLookupImpl(rt::Tensor const& inputIds, rt::Tensor const& em
         check::check(hiddenSize % kInt4GroupSize == 0,
             format::fmtstr("INT4 hiddenSize must be a multiple of %d", static_cast<int>(kInt4GroupSize)));
         check::check(scaleShape.getNumDims() == 2, "INT4 scales must be 2D tensor [vocabSize, hiddenSize / 32]");
-        check::check(scaleShape[0] == vocabSize, "INT4 scale rows must match embeddingTable rows");
+        check::check(scaleShape[0] == tableRows, "INT4 scale rows must match embeddingTable rows");
         check::check(scaleShape[1] == hiddenSize / kInt4GroupSize, "INT4 scale columns must equal hiddenSize / 32");
         check::check(scalesTensor.getDataType() == trt_edgellm::DataType::kHALF, "INT4 scales must be FP16");
 
@@ -813,7 +825,7 @@ static void embeddingLookupImpl(rt::Tensor const& inputIds, rt::Tensor const& em
             embeddingTable.dataPointer<uint8_t>(), scalesTensor.dataPointer<half>(), hiddenSize / kInt4GroupSize};
         launchEmbeddingLookupKernel(inputIdsPtr, loader, multimodalIndicesPtr, imageTokenIdValue, imageEmbedsPtr,
             imageTokenLen, audioTokenIdValue, audioEmbedsPtr, audioTokenLen, outputPtr, batchSize, seqLen, vocabSize,
-            hiddenSize, stream);
+            hiddenSize, stagedRows, stream);
     }
     else if (format == EmbeddingTableFormat::kINT8)
     {
@@ -824,16 +836,17 @@ static void embeddingLookupImpl(rt::Tensor const& inputIds, rt::Tensor const& em
         auto const scaleShape = scalesTensor.getShape();
 
         check::check(scaleShape.getNumDims() == 1, "INT8 scales must be 1D tensor [vocabSize]");
-        check::check(scaleShape[0] == vocabSize, "INT8 scale rows must match embeddingTable vocab size");
+        check::check(scaleShape[0] == tableRows, "INT8 scale rows must match embeddingTable rows");
         check::check(scalesTensor.getDataType() == trt_edgellm::DataType::kFLOAT, "INT8 scales must be FP32");
 
         Int8EmbeddingLoader loader{embeddingTable.dataPointer<int8_t>(), scalesTensor.dataPointer<float>()};
         launchEmbeddingLookupKernel(inputIdsPtr, loader, multimodalIndicesPtr, imageTokenIdValue, imageEmbedsPtr,
             imageTokenLen, audioTokenIdValue, audioEmbedsPtr, audioTokenLen, outputPtr, batchSize, seqLen, vocabSize,
-            hiddenSize, stream);
+            hiddenSize, stagedRows, stream);
     }
     else if (format == EmbeddingTableFormat::kFP8)
     {
+        check::check(!stagedRows, "Staged embedding rows support FP16, INT8, and packed INT4 tables only");
 #if SUPPORTS_FP8
         constexpr uint32_t vecSize = DVec<__nv_fp8_e4m3>::vec_size;
         check::check(embeddingTable.getDataType() == trt_edgellm::DataType::kFP8,
@@ -863,7 +876,7 @@ static void embeddingLookupImpl(rt::Tensor const& inputIds, rt::Tensor const& em
         Fp8EmbeddingLoader loader{tablePtr, scalePtr, blockSize, nGroups, rowBlockSize};
         launchEmbeddingLookupKernel(inputIdsPtr, loader, multimodalIndicesPtr, imageTokenIdValue, imageEmbedsPtr,
             imageTokenLen, audioTokenIdValue, audioEmbedsPtr, audioTokenLen, outputPtr, batchSize, seqLen, vocabSize,
-            hiddenSize, stream);
+            hiddenSize, stagedRows, stream);
 #else
         check::check(
             false, "FP8 multimodal embedding lookup is unavailable: build does not support FP8 (SUPPORTS_FP8=0)");
@@ -880,17 +893,17 @@ static void embeddingLookupImpl(rt::Tensor const& inputIds, rt::Tensor const& em
         Fp16EmbeddingLoader loader{embeddingTablePtr};
         launchEmbeddingLookupKernel(inputIdsPtr, loader, multimodalIndicesPtr, imageTokenIdValue, imageEmbedsPtr,
             imageTokenLen, audioTokenIdValue, audioEmbedsPtr, audioTokenLen, outputPtr, batchSize, seqLen, vocabSize,
-            hiddenSize, stream);
+            hiddenSize, stagedRows, stream);
     }
 }
 
 void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTable, rt::OptionalInputTensor scales,
     rt::Tensor& output, cudaStream_t stream, rt::OptionalInputTensor multimodalIndices,
     std::optional<int32_t> imageTokenId, rt::OptionalInputTensor imageEmbeds, std::optional<int32_t> audioTokenId,
-    rt::OptionalInputTensor audioEmbeds)
+    rt::OptionalInputTensor audioEmbeds, std::optional<int32_t> stagedVocabSize)
 {
     embeddingLookupImpl(inputIds, embeddingTable, scales, output, stream, multimodalIndices, imageTokenId, imageEmbeds,
-        audioTokenId, audioEmbeds, nullptr);
+        audioTokenId, audioEmbeds, nullptr, stagedVocabSize);
 }
 
 void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTable, rt::OptionalInputTensor scales,
@@ -901,7 +914,7 @@ void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTabl
     if (descriptor.format == EmbeddingTableFormat::kNVFP4)
     {
         embeddingLookupImpl(inputIds, embeddingTable, scales, output, stream, multimodalIndices, imageTokenId,
-            imageEmbeds, audioTokenId, audioEmbeds, &descriptor);
+            imageEmbeds, audioTokenId, audioEmbeds, &descriptor, std::nullopt);
     }
     else
     {

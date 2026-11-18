@@ -20,6 +20,7 @@
 #include "common/tensor.h"
 #include "multimodal/common/multimodalRunner.h"
 #include "runtime/config/deploymentConfig.h"
+#include "runtime/config/deploymentOptions.h"
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/state/externalWeightManager.h"
@@ -36,8 +37,6 @@ namespace trt_edgellm
 {
 namespace rt
 {
-
-struct DeploymentOptions;
 
 //! Validate the fixed recurrent verification ABI independently of the selected layout.
 void validateRecurrentVerifyMetadataBindings(DeploymentConfig const& deployment, EngineExecutor const& baseExecutor);
@@ -76,12 +75,21 @@ struct ModelArtifacts
     //!
     //! `draftCheckpointDir` must be empty for native MTP, whose draft weights are part of `checkpointDir`; the
     //! returned artifacts record it as equal to `checkpointDir` in that case.
+    //! `embeddingTableResidency` kHostMapped maps embedding.safetensors instead of loading it, and excludes
+    //! `offloadEmbedding`.
     static ModelArtifacts loadFromEngineDir(std::filesystem::path const& engineDir,
         std::optional<SpecDecodeDraftingConfig> const& draftingConfig, std::filesystem::path const& checkpointDir,
         std::filesystem::path const& draftCheckpointDir, bool contextReuseEnabled, cudaStream_t stream,
         std::optional<std::filesystem::path> const& runtimeCachePath = std::nullopt, bool offloadEmbedding = false,
-        std::function<void()> const& checkCancelled = {});
+        std::function<void()> const& checkCancelled = {},
+        EmbeddingTableResidency embeddingTableResidency = EmbeddingTableResidency::kDevice);
 };
+
+//! Token-embedding table of an engine directory: the checkpoint-backed table `weights` holds, else
+//! `engineDir`/embedding.safetensors loaded (`offloadEmbedding` selects pinned host memory) or, for kHostMapped,
+//! mapped. kHostMapped requires the sidecar and excludes `offloadEmbedding`.
+EmbeddingData loadTokenEmbedding(ExternalWeightManager& weights, std::filesystem::path const& engineDir,
+    cudaStream_t stream, bool offloadEmbedding, EmbeddingTableResidency embeddingTableResidency);
 
 } // namespace rt
 } // namespace trt_edgellm

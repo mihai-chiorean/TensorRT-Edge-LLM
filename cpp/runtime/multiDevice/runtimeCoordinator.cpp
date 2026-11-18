@@ -134,6 +134,8 @@ void RuntimeCoordinator::validateParallelPlan()
         "Tensor-parallel speculative decoding is not supported.");
     ELLM_CHECK(mWorldSize == 1 || !mConfig.deployment.contextCacheConfig.enabled,
         "Tensor-parallel context reuse is not supported in the current multi-device runtime.");
+    ELLM_CHECK(mWorldSize == 1 || mConfig.deployment.embeddingTableResidency == EmbeddingTableResidency::kDevice,
+        "--host-embedding-tables is not supported with tensor parallelism.");
     if (mWorldSize > 1)
     {
         for (ParallelBackendHandles const& backendHandles : mConfig.resources.backendHandles)

@@ -136,6 +136,8 @@ std::vector<option> runtimeOptions()
         {"pleResidency", required_argument, 0, RuntimeOptionId::PLE_RESIDENCY},
         {"offload-embedding", no_argument, 0, RuntimeOptionId::OFFLOAD_EMBEDDING},
         {"offloadEmbedding", no_argument, 0, RuntimeOptionId::OFFLOAD_EMBEDDING},
+        {"host-embedding-tables", no_argument, 0, RuntimeOptionId::HOST_EMBEDDING_TABLES},
+        {"hostEmbeddingTables", no_argument, 0, RuntimeOptionId::HOST_EMBEDDING_TABLES},
         {"ple-cache-slots", required_argument, 0, RuntimeOptionId::PLE_CACHE_SLOTS},
         {"pleCacheSlots", required_argument, 0, RuntimeOptionId::PLE_CACHE_SLOTS},
         {"checkpoint-dir", required_argument, 0, RuntimeOptionId::CHECKPOINT_DIR},
@@ -203,6 +205,7 @@ std::optional<bool> parseRuntimeOption(int id, char const* value, RuntimeArgs& a
     case RuntimeOptionId::MULTIMODAL_ENGINE_DIR: args.multimodalEngineDir = value; break;
     case RuntimeOptionId::PLE_FILE: args.pleConfig.filePath = value; break;
     case RuntimeOptionId::OFFLOAD_EMBEDDING: args.offloadEmbedding = true; break;
+    case RuntimeOptionId::HOST_EMBEDDING_TABLES: args.hostEmbeddingTables = true; break;
     case RuntimeOptionId::PLE_RESIDENCY:
     {
         std::string const policy(value);
@@ -461,6 +464,11 @@ rt::DeploymentOptions makeDeploymentOptions(
     {
         throw std::invalid_argument("--draft-checkpoint-dir requires --spec-decode");
     }
+    if (args.hostEmbeddingTables && args.offloadEmbedding)
+    {
+        throw std::invalid_argument(
+            "--host-embedding-tables and --offload-embedding are mutually exclusive; pass only one of them");
+    }
     rt::DeploymentOptions options{};
     options.engineDir = args.engineDir;
     options.multimodalEngineDir = args.multimodalEngineDir;
@@ -468,6 +476,8 @@ rt::DeploymentOptions makeDeploymentOptions(
     options.contextCacheConfig = args.contextCacheConfig;
     options.pleConfig = args.pleConfig;
     options.offloadEmbedding = args.offloadEmbedding;
+    options.embeddingTableResidency
+        = args.hostEmbeddingTables ? rt::EmbeddingTableResidency::kHostMapped : rt::EmbeddingTableResidency::kDevice;
     options.checkpointDir = args.checkpointDir;
     options.draftCheckpointDir = args.draftCheckpointDir;
     if (!args.rtxRuntimeCachePath.empty())

@@ -24,6 +24,7 @@
 
 #include <cstdint>
 #include <cuda_runtime.h>
+#include <memory>
 
 namespace trt_edgellm
 {
@@ -42,8 +43,10 @@ class EmbeddingPreprocessor
 public:
     //! Construct with the embedding table data and engine configuration.
     //!
-    //! Both references must outlive the preprocessor.
-    EmbeddingPreprocessor(EmbeddingData const& embedding, LLMEngineConfig const& config);
+    //! Both references must outlive the preprocessor. For a host-mapped table, `hostStagingRows` sizes the pinned
+    //! and device row staging allocated here (0 uses config.maxPhysicalTokens); a speculative draft that shares
+    //! this preprocessor can embed more rows per call than the base engine accepts.
+    EmbeddingPreprocessor(EmbeddingData const& embedding, LLMEngineConfig const& config, int32_t hostStagingRows = 0);
 
     //! Embed token IDs into dense vectors, optionally inserting multimodal embeddings.
     //!
@@ -55,6 +58,8 @@ public:
     //! caller and uploaded). Otherwise a fallback single-threaded GPU kernel generates them.
     //!
     //! @param tokenIds              GPU tensor of token IDs [batchSize, seqLen].
+    //! @param hostTokenIds          The same ids in host memory, or nullptr when the caller has none. Required, and
+    //!                              read before this call returns, when the embedding table is host-mapped.
     //! @param visionEmbeds          Optional vision (image) embeddings.
     //! @param audioEmbeds           Optional audio embeddings.
     //! @param io                    Pipeline I/O – `inputsEmbeds` is written.
@@ -65,9 +70,16 @@ public:
     //!                              Only used when precomputedIndices is nullptr.
     //! @param audioBaseOffsets      Device pointer to per-batch audio index offsets, or nullptr.
     //!                              Only used when precomputedIndices is nullptr.
-    void embed(Tensor const& tokenIds, OptionalInputTensor visionEmbeds, OptionalInputTensor audioEmbeds,
-        PipelineIO& io, cudaStream_t stream, OptionalInputTensor precomputedIndices = std::nullopt,
-        int32_t const* imageBaseOffsets = nullptr, int32_t const* audioBaseOffsets = nullptr);
+    void embed(Tensor const& tokenIds, int32_t const* hostTokenIds, OptionalInputTensor visionEmbeds,
+        OptionalInputTensor audioEmbeds, PipelineIO& io, cudaStream_t stream,
+        OptionalInputTensor precomputedIndices = std::nullopt, int32_t const* imageBaseOffsets = nullptr,
+        int32_t const* audioBaseOffsets = nullptr);
+
+    //! True when embed() gathers rows from a host-mapped table and therefore needs host token ids.
+    bool needsHostTokenIds() const noexcept
+    {
+        return mStaging != nullptr;
+    }
 
     //! Assemble deepstack features at image placeholder positions.
     //!
@@ -109,6 +121,9 @@ private:
 
     //! Fallback indices tensor allocated when no pre-computed indices are provided (decode paths).
     Tensor mOwnedIndices;
+
+    //! Per-call row staging for a host-mapped embedding table; null when the table is device or pinned-host resident.
+    std::unique_ptr<RowStaging> mStaging;
 };
 
 } // namespace rt

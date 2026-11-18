@@ -557,6 +557,24 @@ inline void finishArtifacts(rt::ModelArtifacts& artifacts, std::filesystem::path
     }
 }
 
+//! Replace `artifacts`' device token table with the same table mapped from an embedding.safetensors written under
+//! `dir`, as --host-embedding-tables loads it.
+inline void hostMapTokenTable(rt::ModelArtifacts& artifacts, std::filesystem::path const& dir, cudaStream_t stream)
+{
+    rt::Tensor const& device = artifacts.embedding.table;
+    std::vector<rt::Tensor> tensors;
+    rt::Tensor& host = tensors.emplace_back(device.getShape(), rt::DeviceType::kCPU, device.getDataType(), "embedding");
+    CUDA_CHECK(cudaMemcpyAsync(host.rawPointer(), device.rawPointer(), static_cast<size_t>(host.getMemoryCapacity()),
+        cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::filesystem::create_directories(dir);
+    if (!rt::safetensors::saveSafetensors(dir / "embedding.safetensors", tensors, stream))
+    {
+        throw std::runtime_error("test embedding sidecar failed to save");
+    }
+    artifacts.embedding = rt::mapEmbeddingTable(dir / "embedding.safetensors");
+}
+
 //! Assemble the artifacts a single-engine text deployment needs around a caller-supplied engine.
 inline rt::ModelArtifacts makeVanillaArtifacts(
     std::filesystem::path const& modelDir, std::unique_ptr<rt::EngineExecutor> executor, cudaStream_t stream)

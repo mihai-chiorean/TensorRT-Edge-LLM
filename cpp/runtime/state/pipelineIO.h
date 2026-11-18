@@ -22,6 +22,7 @@
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/exec/raggedBatchBuilder.h"
 #include "runtime/exec/tensorMap.h"
+#include "runtime/state/asyncHostStagingFence.h"
 #include "runtime/state/sharedResources.h"
 
 #include <NvInferRuntime.h>
@@ -34,26 +35,6 @@ namespace trt_edgellm
 {
 namespace rt
 {
-
-class AsyncHostStagingFence
-{
-public:
-    AsyncHostStagingFence() = default;
-    AsyncHostStagingFence(AsyncHostStagingFence const&) = delete;
-    AsyncHostStagingFence& operator=(AsyncHostStagingFence const&) = delete;
-    AsyncHostStagingFence(AsyncHostStagingFence&& other) noexcept;
-    AsyncHostStagingFence& operator=(AsyncHostStagingFence&& other) noexcept;
-    ~AsyncHostStagingFence();
-
-    void wait();
-    void record(cudaStream_t stream);
-
-private:
-    void release() noexcept;
-
-    cudaEvent_t mEvent{nullptr};
-    bool mPending{false};
-};
 
 //! Persistent copies of the prefill-time input embeddings and engine
 //! hidden_states output, used by streaming consumers that run concurrently

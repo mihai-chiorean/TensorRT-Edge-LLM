@@ -21,6 +21,7 @@
 #include "common/tensor.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
 #include "runtime/audioUtils.h"
+#include "runtime/embedding/hostRowTable.h"
 #include "runtime/imageUtils.h"
 #include "runtime/state/contextCache/contextCacheConfig.h"
 
@@ -528,6 +529,13 @@ struct EmbeddingData
     rt::Tensor table;              //!< Physical embedding table.
     rt::Tensor tableScalingFactor; //!< FP32 scales for FP8 and INT8, FP8 E4M3 block scales for NVFP4.
     kernel::EmbeddingTableDescriptor descriptor;
+    //! Set instead of `table` when the table stays mapped from its file (EmbeddingTableResidency::kHostMapped).
+    std::unique_ptr<rt::HostRowTable> hostTable;
+
+    bool isHostMapped() const noexcept
+    {
+        return hostTable != nullptr;
+    }
 
     //! \brief Returns scales as OptionalInputTensor (std::nullopt for FP16, a reference otherwise)
     rt::OptionalInputTensor scalesAsOptional() const
@@ -551,6 +559,17 @@ struct EmbeddingData
  *  \throws std::runtime_error if file not found, tensors missing, or invalid dtypes
  */
 EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cudaStream_t stream, bool offload = false);
+
+/*! \brief Map an embedding sidecar read-only in host memory without copying the table anywhere
+ *
+ *  Accepts the FP16, INT8 and packed INT4 sidecar formats with the same tensor contract as loadEmbeddingTable.
+ *  The returned EmbeddingData has `hostTable` set and empty device tensors; lookups gather each step's rows on
+ *  the host (EmbeddingPreprocessor).
+ *
+ *  \param embeddingPath Path to embedding.safetensors file
+ *  \throws std::runtime_error if the file is missing, a tensor is missing, or the format is FP8 or NVFP4
+ */
+EmbeddingData mapEmbeddingTable(std::filesystem::path const& embeddingPath);
 
 /*!
  * @brief Clamp max generation length against KV-cache capacity across the full active batch

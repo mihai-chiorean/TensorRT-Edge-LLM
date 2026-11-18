@@ -151,6 +151,13 @@ void printUsage(char const* programName)
     std::cerr << "  --ple-residency           PLE storage policy: resident (default) or cached" << std::endl;
     std::cerr << "  --offload-embedding       Keep embedding artifact in pinned host memory (same CUDA lookup kernel)"
               << std::endl;
+    std::cerr
+        << "  --host-embedding-tables   Keep the token table mapped from embedding.safetensors (reclaimable pages)"
+        << std::endl;
+    std::cerr << "                            and upload each step's rows; token table only, PLE uses --ple-residency."
+              << std::endl;
+    std::cerr << "                            Vanilla decoding, single device; excludes --offload-embedding."
+              << std::endl;
     std::cerr << "  --ple-cache-slots          Cached PLE slots including zero; chosen at runtime initialization"
               << std::endl;
     std::cerr << "                            Distinct valid rows across each execution batch must fit in slots - 1."
@@ -489,6 +496,14 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             return false;
         }
         LOG_INFO("Thinker-Talker streaming enabled (single CUDA stream)");
+    }
+
+    if (args.hostEmbeddingTables && args.enableAudioOutput)
+    {
+        LOG_ERROR(
+            "--host-embedding-tables does not support Qwen3-Omni audio output: the Talker reads the Thinker token "
+            "table as a dense tensor");
+        return false;
     }
 
     if (args.debug)

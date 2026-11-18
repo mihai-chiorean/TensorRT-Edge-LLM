@@ -78,13 +78,18 @@ struct EmbeddingTableDescriptor
 //! \param[in] imageEmbeds Image embeddings [totalImageTokens, hiddenSize] (FP16), or std::nullopt
 //! \param[in] audioTokenId Token ID marking audio positions, or std::nullopt if no audio input
 //! \param[in] audioEmbeds Audio embeddings [totalAudioTokens, hiddenSize] (FP16), or std::nullopt
+//! \param[in] stagedVocabSize When set, embeddingTable and scales hold one row per position instead of one per
+//!                            vocabulary entry: row i is the table row of position i, gathered beforehand (for
+//!                            example on the host). Token ids are still range-checked against this vocabulary size.
+//!                            FP16, INT8, and packed INT4 tables only.
 //! \note imageTokenId and audioTokenId must differ when both are provided.
 //! \note Element offsets are 64-bit: imageEmbeds, audioEmbeds and output may hold more than 2^32 elements.
 //! \throws std::runtime_error if tensor shapes or data types are invalid, or FP8 is not supported
 void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTable, rt::OptionalInputTensor scales,
     rt::Tensor& output, cudaStream_t stream, rt::OptionalInputTensor multimodalIndices = std::nullopt,
     std::optional<int32_t> imageTokenId = std::nullopt, rt::OptionalInputTensor imageEmbeds = std::nullopt,
-    std::optional<int32_t> audioTokenId = std::nullopt, rt::OptionalInputTensor audioEmbeds = std::nullopt);
+    std::optional<int32_t> audioTokenId = std::nullopt, rt::OptionalInputTensor audioEmbeds = std::nullopt,
+    std::optional<int32_t> stagedVocabSize = std::nullopt);
 
 //! \brief Embedding lookup using an explicit physical table descriptor.
 void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTable, rt::OptionalInputTensor scales,

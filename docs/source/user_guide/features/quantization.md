@@ -270,7 +270,9 @@ FP32 scale. `llm_inference --offloadEmbedding` keeps the token artifact in
 CUDA-pinned host memory; `--pleResidency cached --pleCacheSlots 4096` keeps
 PLE file-backed with a bounded GPU row cache. PLE uses the existing gather
 plugin followed by standard dequantization. Offloading does not change these
-operations or the engine contract.
+operations or the engine contract. `--host-embedding-tables` keeps an FP16,
+INT8 or packed INT4 token sidecar file-mapped and uploads each step's rows; it
+does not read FP8 tables.
 The scalar scale is independent of row placement, so moving compressed rows
 between storage and the cache does not change dequantization.
 

@@ -19,6 +19,7 @@
 
 #include "action/actionKvBatch.h"
 #include "action/alpamayo1ActionRunner.h"
+#include "common/checkMacros.h"
 #include "common/tensor.h"
 #include "multimodal/common/multimodalRunner.h"
 #include "profiling/metrics.h"
@@ -579,6 +580,8 @@ public:
     //! Get the embedding table (for Talker streaming pipeline)
     rt::Tensor const& getEmbeddingTable() const
     {
+        ELLM_CHECK(!mEmbedding.isHostMapped(),
+            "The token-embedding table is host-mapped (--host-embedding-tables) and has no dense tensor to share.");
         return mEmbedding.table;
     }
 

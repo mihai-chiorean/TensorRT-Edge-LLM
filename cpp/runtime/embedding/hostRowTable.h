@@ -1,0 +1,163 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "common/mmapReader.h"
+#include "common/tensor.h"
+#include "runtime/state/asyncHostStagingFence.h"
+
+#include <cstdint>
+#include <cuda_runtime.h>
+#include <filesystem>
+#include <string>
+#include <string_view>
+
+namespace trt_edgellm
+{
+namespace rt
+{
+
+//! A 2D table read in place from a read-only mapping of its safetensors file, with an optional scale tensor that
+//! has one row per table row. Rows are gathered on the CPU, so the table's pages stay file-backed and reclaimable
+//! instead of occupying device or pinned memory.
+class HostRowTable
+{
+public:
+    //! Maps `filePath` and resolves `tableName` and, when present in the file, `scaleName`.
+    //! The mapping is advised as random access: rows are gathered by token id, so read-around on a page fault
+    //! would only pull unused neighbours into memory.
+    HostRowTable(std::filesystem::path const& filePath, std::string_view tableName, std::string_view scaleName);
+
+    HostRowTable(HostRowTable const&) = delete;
+    HostRowTable& operator=(HostRowTable const&) = delete;
+
+    trt_edgellm::DataType dataType() const noexcept
+    {
+        return mDataType;
+    }
+
+    //! [rows, columns] as stored; a packed INT4 table stores two columns per byte.
+    Coords const& shape() const noexcept
+    {
+        return mShape;
+    }
+
+    int64_t rows() const noexcept
+    {
+        return mShape[0];
+    }
+
+    int64_t rowBytes() const noexcept
+    {
+        return mRowBytes;
+    }
+
+    bool hasScales() const noexcept
+    {
+        return mScales != nullptr;
+    }
+
+    //! Shape of the scale tensor as stored: [rows] or [rows, scalesPerRow]. Empty without scales.
+    Coords const& scaleShape() const noexcept
+    {
+        return mScaleShape;
+    }
+
+    //! FP32 or FP16; meaningful only with scales.
+    trt_edgellm::DataType scaleDataType() const noexcept
+    {
+        return mScaleDataType;
+    }
+
+    //! Scales per table row; 0 without scales.
+    int64_t scalesPerRow() const noexcept
+    {
+        return mScalesPerRow;
+    }
+
+    //! Bytes of scales per table row; 0 without scales.
+    int64_t scaleRowBytes() const noexcept
+    {
+        return mScaleRowBytes;
+    }
+
+    //! Copies table row ids[i] into row i of `rows` and its scales into `scales` (when the table has scales and
+    //! `scales` is non-null; scaleRowBytes() per row). Ids outside [0, rows()) produce zero rows and zero scales.
+    void gather(int32_t const* ids, int64_t count, void* rows, void* scales) const;
+
+private:
+    file_io::MmapReader mFile;
+    std::string mSource;
+    trt_edgellm::DataType mDataType{};
+    Coords mShape;
+    int64_t mRowBytes{0};
+    uint8_t const* mTable{nullptr};
+    uint8_t const* mScales{nullptr}; //!< Scale payload addressed as bytes; the file need not align it.
+    trt_edgellm::DataType mScaleDataType{trt_edgellm::DataType::kFLOAT};
+    Coords mScaleShape;
+    int64_t mScalesPerRow{0};
+    int64_t mScaleRowBytes{0};
+};
+
+//! Pinned and device staging for rows gathered from a HostRowTable, sized for `capacity` rows at construction.
+//!
+//! `upload` reuses the pinned buffers, so it first waits for the previous upload's copy to finish reading them,
+//! then gathers on the CPU and enqueues the host-to-device copies on the caller's stream. The device tensors it
+//! exposes are shaped to the uploaded row count and are read by the staged-rows mode of `kernel::embeddingLookup`,
+//! which must be enqueued on the same stream before the next `upload`.
+class RowStaging
+{
+public:
+    //! `table` must outlive the staging.
+    RowStaging(HostRowTable const& table, int64_t capacity, std::string const& name);
+
+    RowStaging(RowStaging const&) = delete;
+    RowStaging& operator=(RowStaging const&) = delete;
+
+    int64_t capacity() const noexcept
+    {
+        return mCapacity;
+    }
+
+    //! Gathers `count` rows for `ids` and copies them to the device on `stream`. `ids` is read before returning.
+    void upload(int32_t const* ids, int64_t count, cudaStream_t stream);
+
+    //! Device rows of the last upload, shaped [count, columns].
+    Tensor const& rows() const noexcept
+    {
+        return mDeviceRows;
+    }
+
+    //! Device scales of the last upload, shaped [count] or [count, scalesPerRow]; nullopt for a table without scales.
+    OptionalInputTensor scales() const noexcept
+    {
+        return mTable.hasScales() ? OptionalInputTensor{mDeviceScales} : std::nullopt;
+    }
+
+private:
+    HostRowTable const& mTable;
+    int64_t mCapacity{0};
+    Tensor mHostRows;
+    Tensor mDeviceRows;
+    Tensor mHostScales;
+    Tensor mDeviceScales;
+    AsyncHostStagingFence mFence;
+};
+
+} // namespace rt
+} // namespace trt_edgellm

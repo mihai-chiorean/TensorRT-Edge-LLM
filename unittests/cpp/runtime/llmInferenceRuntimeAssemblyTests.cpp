@@ -525,6 +525,33 @@ TEST_F(RuntimeAssemblyTest, EachSlotDecodesTheSameTokensAloneAsItDoesBesideAnoth
     EXPECT_EQ(batched.outputIds[1], longAlone) << "slot 1's answer moved when it was batched beside another request";
 }
 
+// Given the same deployment with its token table on the device and host-mapped from an embedding.safetensors
+// When a batch of two prompts of different lengths decodes on each, the substitute engine deriving every token from
+//      the embeddings it is fed
+// Then the host-mapped table gives each slot the tokens the device table gives it, through prefill and decode
+TEST_F(RuntimeAssemblyTest, HostMappedTokenTableDecodesLikeTheDeviceTable)
+{
+    constexpr int64_t kGenerateLength{4};
+    auto const request = makeGreedyBatch({makePrompt(3, /*variant=*/0), makePrompt(9, /*variant=*/1)}, kGenerateLength);
+
+    rt::LLMGenerationResponse device;
+    {
+        auto runtime = makeRuntime(makeVanillaArtifacts(mModelDir, makeFakeEngine(), mStream));
+        ASSERT_TRUE(runtime.handleRequest(request, device, mStream));
+    }
+    ASSERT_EQ(device.outputIds.size(), 2U);
+    ASSERT_NE(device.outputIds[0], device.outputIds[1])
+        << "the two prompts decode alike, so this fixture cannot tell a wrong row from a right one";
+
+    auto artifacts = makeVanillaArtifacts(mModelDir, makeFakeEngine(), mStream);
+    hostMapTokenTable(artifacts, mModelDir / "hostMappedTokenTable", mStream);
+    ASSERT_TRUE(artifacts.embedding.isHostMapped());
+    auto runtime = makeRuntime(std::move(artifacts));
+    rt::LLMGenerationResponse mapped;
+    ASSERT_TRUE(runtime.handleRequest(request, mapped, mStream));
+    EXPECT_EQ(mapped.outputIds, device.outputIds);
+}
+
 // Given a vanilla runtime whose logits are the same at every step
 // When a seeded sampling request generates, and an unseeded one generates twice
 // Then the seeded request replays the sampler's draws for its request-stable uniforms exactly, while the

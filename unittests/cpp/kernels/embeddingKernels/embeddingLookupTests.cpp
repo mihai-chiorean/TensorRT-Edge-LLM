@@ -450,6 +450,65 @@ TEST_F(EmbeddingLookupTest, Int8MultimodalLookupDequantizesRequestedRows)
     auto const expected = embeddingLookupMultimodalInt8Ref(inputIds, table, scales, multimodalIndices, kImageTokenId,
         imageEmbeds, kAudioTokenId, audioEmbeds, kBatchSize, kSeqLen, kVocabSize, kHiddenSize);
     EXPECT_TRUE(compareResults(expected, output, "INT8 Multimodal Embedding Lookup"));
+
+    // Staged rows: the table holds one pre-gathered row per position. Placeholder and out-of-range positions carry
+    // zero rows that the kernel never reads, and the output must be bit-identical to the resident lookup.
+    std::vector<int8_t> stagedRows(static_cast<size_t>(kSeqLen) * kHiddenSize, 0);
+    std::vector<float> stagedScales(kSeqLen, 0.0F);
+    for (int64_t pos = 0; pos < kSeqLen; ++pos)
+    {
+        int32_t const tokenId = inputIds[pos];
+        if (tokenId >= 0 && tokenId < kVocabSize && tokenId != kImageTokenId && tokenId != kAudioTokenId)
+        {
+            std::copy_n(table.begin() + static_cast<int64_t>(tokenId) * kHiddenSize, kHiddenSize,
+                stagedRows.begin() + pos * kHiddenSize);
+            stagedScales[pos] = scales[tokenId];
+        }
+    }
+    rt::Tensor stagedRowsDevice({kSeqLen, kHiddenSize}, rt::DeviceType::kGPU, trt_edgellm::DataType::kINT8);
+    rt::Tensor stagedScalesDevice({kSeqLen}, rt::DeviceType::kGPU, trt_edgellm::DataType::kFLOAT);
+    rt::Tensor stagedOutputDevice(
+        {kBatchSize, kSeqLen, kHiddenSize}, rt::DeviceType::kGPU, trt_edgellm::DataType::kHALF);
+    copyHostToDevice(stagedRowsDevice, stagedRows);
+    copyHostToDevice(stagedScalesDevice, stagedScales);
+    kernel::embeddingLookup(inputIdsDevice, stagedRowsDevice, rt::OptionalInputTensor{stagedScalesDevice},
+        stagedOutputDevice, stream, rt::OptionalInputTensor{indicesDevice}, kImageTokenId,
+        rt::OptionalInputTensor{imageDevice}, kAudioTokenId, rt::OptionalInputTensor{audioDevice}, kVocabSize);
+    auto const stagedOutput = copyDeviceToHost<half>(stagedOutputDevice);
+    ASSERT_EQ(stagedOutput.size(), output.size());
+    EXPECT_EQ(std::memcmp(stagedOutput.data(), output.data(), output.size() * sizeof(half)), 0);
+}
+
+TEST_F(EmbeddingLookupTest, StagedRowsRejectRowCountMismatch)
+{
+    rt::Tensor inputIds({1, 3}, rt::DeviceType::kGPU, trt_edgellm::DataType::kINT32);
+    rt::Tensor rows({2, 16}, rt::DeviceType::kGPU, trt_edgellm::DataType::kHALF);
+    rt::Tensor output({1, 3, 16}, rt::DeviceType::kGPU, trt_edgellm::DataType::kHALF);
+    EXPECT_THROW(kernel::embeddingLookup(inputIds, rows, std::nullopt, output, stream, std::nullopt, std::nullopt,
+                     std::nullopt, std::nullopt, std::nullopt, 100),
+        std::runtime_error);
+}
+
+// Staged rows carry one scale row per position; FP8 tables may share a scale across vocabulary blocks, so they are
+// refused rather than dequantized with the wrong scale.
+TEST_F(EmbeddingLookupTest, StagedRowsRejectFp8Tables)
+{
+    rt::Tensor inputIds({1, 2}, rt::DeviceType::kGPU, trt_edgellm::DataType::kINT32);
+    rt::Tensor rows({2, 128}, rt::DeviceType::kGPU, trt_edgellm::DataType::kFP8);
+    rt::Tensor scales({2, 1}, rt::DeviceType::kGPU, trt_edgellm::DataType::kFLOAT);
+    rt::Tensor output({1, 2, 128}, rt::DeviceType::kGPU, trt_edgellm::DataType::kHALF);
+    std::string message;
+    try
+    {
+        kernel::embeddingLookup(inputIds, rows, rt::OptionalInputTensor{scales}, output, stream, std::nullopt,
+            std::nullopt, std::nullopt, std::nullopt, std::nullopt, 100);
+    }
+    catch (std::runtime_error const& error)
+    {
+        message = error.what();
+    }
+    EXPECT_NE(message.find("Staged embedding rows support FP16, INT8, and packed INT4 tables only"), std::string::npos)
+        << message;
 }
 
 // The lookup kernel assigns one warp per token and eight elements per lane, so hiddenSize must be a multiple of 8
@@ -2175,6 +2234,35 @@ TEST_F(EmbeddingLookupTest, Int4PackedLookupMatchesReference)
                 << "pos " << pos << " col " << col;
         }
     }
+
+    // Staged rows: packed bytes and FP16 group scales gathered per position give the same output bits.
+    int64_t const positions = kBatchSize * kSeqLen;
+    int64_t const packedWidth = kHiddenSize / 2;
+    int64_t const groups = kHiddenSize / 32;
+    std::vector<uint8_t> stagedRows(static_cast<size_t>(positions * packedWidth), 0);
+    std::vector<half> stagedScales(static_cast<size_t>(positions * groups), __float2half(0.0F));
+    for (int64_t pos = 0; pos < positions; ++pos)
+    {
+        int32_t const tokenId = inputIds[pos];
+        if (tokenId >= 0 && tokenId < kVocabSize)
+        {
+            std::copy_n(
+                fixture.packed.begin() + tokenId * packedWidth, packedWidth, stagedRows.begin() + pos * packedWidth);
+            std::copy_n(fixture.scales.begin() + tokenId * groups, groups, stagedScales.begin() + pos * groups);
+        }
+    }
+    rt::Tensor stagedRowsDevice({positions, packedWidth}, rt::DeviceType::kGPU, trt_edgellm::DataType::kUINT8);
+    rt::Tensor stagedScalesDevice({positions, groups}, rt::DeviceType::kGPU, trt_edgellm::DataType::kHALF);
+    rt::Tensor stagedOutputDevice(
+        {kBatchSize, kSeqLen, kHiddenSize}, rt::DeviceType::kGPU, trt_edgellm::DataType::kHALF);
+    copyHostToDevice(stagedRowsDevice, stagedRows);
+    copyHostToDevice(stagedScalesDevice, stagedScales);
+    kernel::embeddingLookup(inputIdsDevice, stagedRowsDevice, rt::OptionalInputTensor{stagedScalesDevice},
+        stagedOutputDevice, stream, rt::OptionalInputTensor{indicesDevice}, kImageTokenId,
+        rt::OptionalInputTensor{imageDevice}, std::nullopt, std::nullopt, kVocabSize);
+    auto const stagedOutput = copyDeviceToHost<half>(stagedOutputDevice);
+    ASSERT_EQ(stagedOutput.size(), output.size());
+    EXPECT_EQ(std::memcmp(stagedOutput.data(), output.data(), output.size() * sizeof(half)), 0);
 }
 
 TEST_F(EmbeddingLookupTest, Int4LookupRejectsMalformedScales)

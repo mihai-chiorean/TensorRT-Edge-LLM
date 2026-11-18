@@ -421,8 +421,8 @@ bool MTPDecoder::runDraftModelPrefill(DecodingInferenceContext& context, int32_t
     // embedding table.
     OptionalInputTensor const mediaIndices = decoder_utils::stageDraftPrefillMediaIndices(
         mRuntime, context, hostPackedTokenIdsData, inputIdsLength, context.stream);
-    mRuntime.preprocess.embeddingPreprocessor.embed(mRuntime.preprocess.idsInput, context.visualEmbeddings,
-        std::nullopt, mRuntime.base.pipelineIO, context.stream, mediaIndices);
+    mRuntime.preprocess.embeddingPreprocessor.embed(mRuntime.preprocess.idsInput, hostPackedTokenIdsData,
+        context.visualEmbeddings, std::nullopt, mRuntime.base.pipelineIO, context.stream, mediaIndices);
 
     int32_t* ctxLenData = mRuntime.base.pipelineIO.hostContextLengths.dataPointer<int32_t>();
     for (int32_t i = 0; i < activeBatchSize; ++i)

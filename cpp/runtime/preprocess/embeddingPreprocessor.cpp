@@ -29,18 +29,32 @@ namespace trt_edgellm
 namespace rt
 {
 
-EmbeddingPreprocessor::EmbeddingPreprocessor(EmbeddingData const& embedding, LLMEngineConfig const& config)
+EmbeddingPreprocessor::EmbeddingPreprocessor(
+    EmbeddingData const& embedding, LLMEngineConfig const& config, int32_t hostStagingRows)
     : mEmbedding(embedding)
     , mConfig(config)
     , mOwnedIndices(Coords{config.maxPhysicalTokens}, DeviceType::kGPU, trt_edgellm::DataType::kINT32,
           "EmbeddingPreprocessor::ownedMultimodalIndices")
 {
+    if (mEmbedding.isHostMapped())
+    {
+        mStaging = std::make_unique<RowStaging>(*mEmbedding.hostTable,
+            hostStagingRows > 0 ? hostStagingRows : config.maxPhysicalTokens, "EmbeddingPreprocessor::staging");
+    }
 }
 
-void EmbeddingPreprocessor::embed(Tensor const& tokenIds, OptionalInputTensor visionEmbeds,
+void EmbeddingPreprocessor::embed(Tensor const& tokenIds, int32_t const* hostTokenIds, OptionalInputTensor visionEmbeds,
     OptionalInputTensor audioEmbeds, PipelineIO& io, cudaStream_t stream, OptionalInputTensor precomputedIndices,
     int32_t const* imageBaseOffsets, int32_t const* audioBaseOffsets)
 {
+    std::optional<int32_t> stagedVocabSize;
+    if (mStaging)
+    {
+        ELLM_CHECK(hostTokenIds != nullptr, "A host-mapped embedding table needs the token ids in host memory");
+        mStaging->upload(hostTokenIds, tokenIds.getShape().volume(), stream);
+        stagedVocabSize = static_cast<int32_t>(mEmbedding.hostTable->rows());
+    }
+
     if (visionEmbeds.has_value() || audioEmbeds.has_value())
     {
         std::optional<int32_t> audioTokenOpt
@@ -60,9 +74,23 @@ void EmbeddingPreprocessor::embed(Tensor const& tokenIds, OptionalInputTensor vi
             mIndicesPtr = &mOwnedIndices;
         }
 
-        kernel::embeddingLookup(tokenIds, mEmbedding.table, mEmbedding.scalesAsOptional(), mEmbedding.descriptor,
-            io.inputsEmbeds, stream, std::optional{std::ref(*mIndicesPtr)}, imageTokenOpt, visionEmbeds, audioTokenOpt,
-            audioEmbeds);
+        if (mStaging)
+        {
+            kernel::embeddingLookup(tokenIds, mStaging->rows(), mStaging->scales(), io.inputsEmbeds, stream,
+                std::optional{std::ref(*mIndicesPtr)}, imageTokenOpt, visionEmbeds, audioTokenOpt, audioEmbeds,
+                stagedVocabSize);
+        }
+        else
+        {
+            kernel::embeddingLookup(tokenIds, mEmbedding.table, mEmbedding.scalesAsOptional(), mEmbedding.descriptor,
+                io.inputsEmbeds, stream, std::optional{std::ref(*mIndicesPtr)}, imageTokenOpt, visionEmbeds,
+                audioTokenOpt, audioEmbeds);
+        }
+    }
+    else if (mStaging)
+    {
+        kernel::embeddingLookup(tokenIds, mStaging->rows(), mStaging->scales(), io.inputsEmbeds, stream, std::nullopt,
+            std::nullopt, std::nullopt, std::nullopt, std::nullopt, stagedVocabSize);
     }
     else
     {

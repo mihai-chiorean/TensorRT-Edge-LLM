@@ -47,7 +47,7 @@ LLMInferenceRuntime::LLMInferenceRuntime(DeploymentOptions options, cudaStream_t
 {
     auto artifacts = std::make_unique<ModelArtifacts>(ModelArtifacts::loadFromEngineDir(options.engineDir,
         options.draftingConfig, options.checkpointDir, options.draftCheckpointDir, options.contextCacheConfig.enabled,
-        stream, options.runtimeCachePath, options.offloadEmbedding));
+        stream, options.runtimeCachePath, options.offloadEmbedding, {}, options.embeddingTableResidency));
     initializeCoordinator(std::move(options), singleDeviceResources(stream), std::move(artifacts));
 }
 

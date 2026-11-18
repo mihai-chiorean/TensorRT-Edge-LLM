@@ -33,6 +33,13 @@ namespace trt_edgellm
 namespace rt
 {
 
+//! Where the token-embedding table lives at runtime.
+enum class EmbeddingTableResidency
+{
+    kDevice,     //!< Loaded into device memory, or into pinned host memory with DeploymentOptions::offloadEmbedding.
+    kHostMapped, //!< Stays mapped from embedding.safetensors; each step gathers its rows on the CPU and uploads them.
+};
+
 //! Caller-selected deployment policies and artifact locations, separate from resolved engine metadata.
 struct DeploymentOptions
 {
@@ -48,6 +55,9 @@ struct DeploymentOptions
     std::optional<std::filesystem::path> runtimeCachePath{}; //!< TRT-RTX runtime cache file path.
     RuntimeBenchmarkOptions benchmark{};
     bool offloadEmbedding{false}; //!< Keep embedding storage in CUDA-pinned host memory, using the same GPU lookup.
+    //! kHostMapped excludes offloadEmbedding and requires the embedding.safetensors sidecar; Gemma 4 PLE storage is
+    //! selected separately by pleConfig.
+    EmbeddingTableResidency embeddingTableResidency{EmbeddingTableResidency::kDevice};
 };
 
 } // namespace rt

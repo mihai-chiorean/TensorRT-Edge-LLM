@@ -100,10 +100,34 @@ void validateRecurrentVerifyMetadataBindings(DeploymentConfig const& deployment,
         "Recurrent verify engine spec_verify_layout must be INT32");
 }
 
+EmbeddingData loadTokenEmbedding(ExternalWeightManager& weights, std::filesystem::path const& engineDir,
+    cudaStream_t stream, bool offloadEmbedding, EmbeddingTableResidency embeddingTableResidency)
+{
+    bool const hostMapped = embeddingTableResidency == EmbeddingTableResidency::kHostMapped;
+    ELLM_CHECK(!(hostMapped && offloadEmbedding),
+        "--host-embedding-tables and --offload-embedding are mutually exclusive; pass only one of them.");
+    if (auto checkpointEmbedding = weights.takeEmbedding())
+    {
+        ELLM_CHECK(!hostMapped,
+            "--host-embedding-tables requires the embedding.safetensors sidecar; this engine reads its token "
+            "table from the checkpoint.");
+        EmbeddingData embedding;
+        embedding.table = std::move(*checkpointEmbedding);
+        return embedding;
+    }
+    std::filesystem::path const sidecar = engineDir / "embedding.safetensors";
+    return hostMapped ? mapEmbeddingTable(sidecar) : loadEmbeddingTable(sidecar, stream, offloadEmbedding);
+}
+
 void ModelArtifacts::validateDeploymentOptions(DeploymentOptions const& options) const
 {
+    ELLM_CHECK(!(options.offloadEmbedding && options.embeddingTableResidency == EmbeddingTableResidency::kHostMapped),
+        "--host-embedding-tables and --offload-embedding are mutually exclusive; pass only one of them.");
     ELLM_CHECK(!options.offloadEmbedding || embedding.table.getDeviceType() == DeviceType::kCPU,
         "--offloadEmbedding requires a host-backed embedding artifact; checkpoint-only embeddings are not offloaded.");
+    ELLM_CHECK(options.embeddingTableResidency != EmbeddingTableResidency::kHostMapped || embedding.isHostMapped(),
+        "Injected embeddingTableResidency kHostMapped conflicts with the device-resident table already loaded in "
+        "ModelArtifacts.");
     auto const normalizePath = [](std::filesystem::path const& path) {
         auto const normalized = std::filesystem::absolute(path).lexically_normal();
         return normalized.filename().empty() ? normalized.parent_path() : normalized;
@@ -142,7 +166,7 @@ ModelArtifacts ModelArtifacts::loadFromEngineDir(std::filesystem::path const& en
     std::optional<SpecDecodeDraftingConfig> const& draftingConfig, std::filesystem::path const& checkpointDir,
     std::filesystem::path const& draftCheckpointDir, bool contextReuseEnabled, cudaStream_t stream,
     std::optional<std::filesystem::path> const& runtimeCachePath, bool offloadEmbedding,
-    std::function<void()> const& checkCancelled)
+    std::function<void()> const& checkCancelled, EmbeddingTableResidency embeddingTableResidency)
 {
     ModelArtifacts artifacts;
     artifacts.checkpointDir = checkpointDir;
@@ -154,14 +178,8 @@ ModelArtifacts ModelArtifacts::loadFromEngineDir(std::filesystem::path const& en
     // Finish checkpoint reads and weight conversion before any engine can run.
     artifacts.weights.load(
         engineDir, baseConfigPath, stream, artifacts.checkpointDir, {}, std::nullopt, std::nullopt, checkCancelled);
-    if (auto embedding = artifacts.weights.takeEmbedding())
-    {
-        artifacts.embedding.table = std::move(*embedding);
-    }
-    else
-    {
-        artifacts.embedding = loadEmbeddingTable(engineDir / "embedding.safetensors", stream, offloadEmbedding);
-    }
+    artifacts.embedding
+        = loadTokenEmbedding(artifacts.weights, engineDir, stream, offloadEmbedding, embeddingTableResidency);
 
     std::optional<std::filesystem::path> const draftConfigPath = draftingConfig.has_value()
         ? std::optional<std::filesystem::path>{engineDir / "draft_config.json"}

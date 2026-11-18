@@ -74,6 +74,13 @@ enum class SwaKVCacheMode : int32_t
 char const* specDecodeModeName(SpecDecodeMode mode) noexcept;
 bool isCachedBlockDraftMode(SpecDecodeMode mode) noexcept;
 
+//! A host-mapped token table gathers rows on the CPU, so a decoder may use it only if every token id it embeds
+//! reaches the host first. Vanilla decoding has them there already.
+constexpr bool supportsHostMappedEmbeddingTables(SpecDecodeMode mode, bool isDiffusionBackbone) noexcept
+{
+    return !isDiffusionBackbone && mode == SpecDecodeMode::kNONE;
+}
+
 enum class RaggedBackendKind : int32_t
 {
     kNone,

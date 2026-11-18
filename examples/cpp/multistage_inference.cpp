@@ -399,6 +399,11 @@ bool parseArgs(Args& args, int argc, char* argv[])
         default: return false;
         }
     }
+    if (args.runtime.hostEmbeddingTables)
+    {
+        std::cerr << "--host-embedding-tables: llm.backbone stages keep their token table on the device\n";
+        return false;
+    }
     if (!args.runtime.engineDir.empty() || !args.runtime.multimodalEngineDir.empty())
     {
         std::cerr << "--engine-dir and --multimodal-engine-dir do not apply; the graph names every engine directory\n";

@@ -162,15 +162,8 @@ void LLMRankRuntime::initializeFromEngineDir(DeploymentOptions const& options, c
     std::optional<int32_t> const weightTpSize
         = tensorParallelSize > 1 ? std::optional<int32_t>{tensorParallelSize} : std::nullopt;
     artifacts.weights.load(engineRoot, baseConfigPath, stream, artifacts.checkpointDir, {}, weightTpRank, weightTpSize);
-    if (auto embedding = artifacts.weights.takeEmbedding())
-    {
-        artifacts.embedding.table = std::move(*embedding);
-    }
-    else
-    {
-        artifacts.embedding
-            = loadEmbeddingTable(engineRoot / "embedding.safetensors", stream, options.offloadEmbedding);
-    }
+    artifacts.embedding = loadTokenEmbedding(
+        artifacts.weights, engineRoot, stream, options.offloadEmbedding, options.embeddingTableResidency);
 
     // Parse engine configurations and attach user drafting. The bundle factory
     // performs cross-engine consistency and drafting-vs-capacity checks.
@@ -296,6 +289,16 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, DeploymentOpti
     mDeployment = std::move(artifacts.deployment);
     mBaseExecutor = std::move(artifacts.baseExecutor);
     mEmbedding = std::move(artifacts.embedding);
+    if (mEmbedding.isHostMapped())
+    {
+        SpecDecodeMode const mode = mDeployment.specDecodeMode();
+        ELLM_CHECK(supportsHostMappedEmbeddingTables(mode, mDeployment.base.isDiffusionBackbone),
+            std::string("--host-embedding-tables does not support ")
+                + (mDeployment.base.isDiffusionBackbone ? "diffusion decoding" : specDecodeModeName(mode))
+                + ": that decoder embeds token ids sampled on the device without bringing them to the host.");
+        ELLM_CHECK(
+            mapping.tensorParallelSize == 1, "--host-embedding-tables is not supported with tensor parallelism.");
+    }
     mCheckpointDir = std::move(artifacts.checkpointDir);
     mDraftCheckpointDir = std::move(artifacts.draftCheckpointDir);
     ExternalWeightManager preparedWeights = std::move(artifacts.weights);
@@ -2876,17 +2879,19 @@ LLMRankRuntime::CompactForwardStatus LLMRankRuntime::runCompactForward(
 
     check::check(mPipelineIO->inputsEmbeds.reshape({1, tokens, base.hiddenSize}), "Tensor reshape failed");
     bool const mediaStep = mCompactMedia != nullptr && uploadCompactMediaIndices(batch, context.stream);
+    int32_t const* const hostTokenIds = batch.hostTokenIds.dataPointer<int32_t>();
     if (mediaStep)
     {
         Tensor const& image = mCompactMedia->imageRows();
         Tensor const& audio = mCompactMedia->audioRows();
-        mEmbeddingPre->embed(mIdsInput, image.isEmpty() ? OptionalInputTensor{} : OptionalInputTensor{std::cref(image)},
+        mEmbeddingPre->embed(mIdsInput, hostTokenIds,
+            image.isEmpty() ? OptionalInputTensor{} : OptionalInputTensor{std::cref(image)},
             audio.isEmpty() ? OptionalInputTensor{} : OptionalInputTensor{std::cref(audio)}, *mPipelineIO,
             context.stream, OptionalInputTensor{std::cref(mMultimodalIndices)});
     }
     else
     {
-        mEmbeddingPre->embed(mIdsInput, std::nullopt, std::nullopt, *mPipelineIO, context.stream);
+        mEmbeddingPre->embed(mIdsInput, hostTokenIds, std::nullopt, std::nullopt, *mPipelineIO, context.stream);
     }
     if (mDeepstack != nullptr)
     {
@@ -5002,8 +5007,8 @@ bool LLMRankRuntime::runBaseModelPrefill(DecodingInferenceContext& context,
         mPipelineIO->recordStepHostUploads(context.stream);
         precomputedIndices = rt::OptionalInputTensor{mMultimodalIndices};
     }
-    mEmbeddingPre->embed(
-        mIdsInput, context.visualEmbeddings, context.audioEmbeddings, *mPipelineIO, context.stream, precomputedIndices);
+    mEmbeddingPre->embed(mIdsInput, batch.hostTokenIds.dataPointer<int32_t>(), context.visualEmbeddings,
+        context.audioEmbeddings, *mPipelineIO, context.stream, precomputedIndices);
 
     mEmbeddingPre->prepareDeepstack(mIdsInput, context.deepstackFeatures, *mPipelineIO, context.stream);
     if (mQwen4ExpNgram)
