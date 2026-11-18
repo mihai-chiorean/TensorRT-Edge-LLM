@@ -258,6 +258,11 @@ void checkLoadingSignals()
     }
 }
 
+EmbeddingTableResidency embeddingTableResidency(bool hostEmbeddingTables)
+{
+    return hostEmbeddingTables ? EmbeddingTableResidency::kHostMapped : EmbeddingTableResidency::kDevice;
+}
+
 //! Unified Python wrapper for LLMInferenceRuntime.
 //! Supports both vanilla decoding and the runtime's speculative decoders
 //! through constructor overloading — mirrors the C++ unified runtime.
@@ -267,10 +272,11 @@ public:
     //! Vanilla constructor (no speculative decoding).
     PyLLMRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, std::string const& checkpointDir,
-        ContextCacheConfig const& contextCacheConfig, PleRuntimeConfig const& pleConfig)
+        ContextCacheConfig const& contextCacheConfig, PleRuntimeConfig const& pleConfig, bool hostEmbeddingTables)
     {
         mPluginHandle = loadEdgellmPluginLib();
         DeploymentOptions options{};
+        options.embeddingTableResidency = embeddingTableResidency(hostEmbeddingTables);
         options.engineDir = engineDir;
         options.multimodalEngineDir = multimodalEngineDir;
         options.loraWeightsMap = loraWeightsMap;
@@ -279,7 +285,7 @@ public:
         options.checkpointDir = checkpointDir;
         auto artifacts = ModelArtifacts::loadFromEngineDir(options.engineDir, options.draftingConfig,
             options.checkpointDir, options.draftCheckpointDir, options.contextCacheConfig.enabled, mStream.get(),
-            options.runtimeCachePath, options.offloadEmbedding, checkLoadingSignals);
+            options.runtimeCachePath, options.offloadEmbedding, checkLoadingSignals, options.embeddingTableResidency);
         mRuntime = std::make_unique<LLMInferenceRuntime>(std::move(artifacts), std::move(options), mStream.get());
     }
 
@@ -288,7 +294,7 @@ public:
         std::unordered_map<std::string, std::string> const& loraWeightsMap, int32_t draftTopK,
         std::optional<int32_t> draftingStep, std::optional<int32_t> proposalTokens, std::optional<int32_t> verifyTokens,
         std::string const& checkpointDir, std::string const& draftCheckpointDir,
-        ContextCacheConfig const& contextCacheConfig, PleRuntimeConfig const& pleConfig)
+        ContextCacheConfig const& contextCacheConfig, PleRuntimeConfig const& pleConfig, bool hostEmbeddingTables)
     {
         mPluginHandle = loadEdgellmPluginLib();
         SpecDecodeDraftingConfig draftingConfig;
@@ -305,9 +311,10 @@ public:
         options.pleConfig = pleConfig;
         options.checkpointDir = checkpointDir;
         options.draftCheckpointDir = draftCheckpointDir;
+        options.embeddingTableResidency = embeddingTableResidency(hostEmbeddingTables);
         auto artifacts = ModelArtifacts::loadFromEngineDir(options.engineDir, options.draftingConfig,
             options.checkpointDir, options.draftCheckpointDir, options.contextCacheConfig.enabled, mStream.get(),
-            options.runtimeCachePath, options.offloadEmbedding, checkLoadingSignals);
+            options.runtimeCachePath, options.offloadEmbedding, checkLoadingSignals, options.embeddingTableResidency);
         mRuntime = std::make_unique<LLMInferenceRuntime>(std::move(artifacts), std::move(options), mStream.get());
     }
 
@@ -690,7 +697,7 @@ public:
         std::string const& schedulingPolicy, std::string const& preemption, int32_t priorityReservedSlots,
         int32_t maxPauseSteps, std::optional<int32_t> draftTopK, std::optional<int32_t> draftingStep,
         std::optional<int32_t> proposalTokens, std::optional<int32_t> verifyTokens,
-        std::string const& draftCheckpointDir)
+        std::string const& draftCheckpointDir, bool hostEmbeddingTables)
     {
         scheduler::EngineConfig config;
         config.maxBatchSize = maxBatchSize;
@@ -710,6 +717,7 @@ public:
         options.contextCacheConfig = contextCacheConfig;
         options.checkpointDir = checkpointDir;
         options.pleConfig = pleConfig;
+        options.embeddingTableResidency = embeddingTableResidency(hostEmbeddingTables);
         // A speculative deployment: the session seats each sequence's draft state as it admits it.
         if (draftTopK.has_value())
         {
@@ -723,7 +731,7 @@ public:
         }
         auto artifacts = ModelArtifacts::loadFromEngineDir(options.engineDir, options.draftingConfig,
             options.checkpointDir, options.draftCheckpointDir, options.contextCacheConfig.enabled, mStream.get(),
-            options.runtimeCachePath, options.offloadEmbedding, checkLoadingSignals);
+            options.runtimeCachePath, options.offloadEmbedding, checkLoadingSignals, options.embeddingTableResidency);
         auto runtime = std::make_unique<LLMInferenceRuntime>(std::move(artifacts), std::move(options), mStream.get());
         // Capture happens here because after the constructor hands the runtime over, nothing but
         // the actor may touch it, and the actor has no pre-first-request hook to capture from.
@@ -1495,19 +1503,20 @@ NB_MODULE(_edgellm_runtime, m)
     // ========================================================================
     py::class_<PyLLMRuntime>(m, "LLMRuntime", "Unified LLM inference runtime with optional speculative decoding.")
         .def(py::init<std::string const&, std::string const&, std::unordered_map<std::string, std::string> const&,
-                 std::string const&, ContextCacheConfig const&, PleRuntimeConfig const&>(),
+                 std::string const&, ContextCacheConfig const&, PleRuntimeConfig const&, bool>(),
             py::arg("engine_dir"), py::arg("multimodal_engine_dir") = "",
             py::arg("lora_weights_map") = std::unordered_map<std::string, std::string>{},
             py::arg("checkpoint_dir") = "", py::arg("context_cache_config") = ContextCacheConfig{},
-            py::arg("ple_config") = PleRuntimeConfig{}, "Construct for vanilla (non-speculative) decoding")
+            py::arg("ple_config") = PleRuntimeConfig{}, py::arg("host_embedding_tables") = false,
+            "Construct for vanilla (non-speculative) decoding")
         .def(py::init<std::string const&, std::string const&, std::unordered_map<std::string, std::string> const&,
                  int32_t, std::optional<int32_t>, std::optional<int32_t>, std::optional<int32_t>, std::string const&,
-                 std::string const&, ContextCacheConfig const&, PleRuntimeConfig const&>(),
+                 std::string const&, ContextCacheConfig const&, PleRuntimeConfig const&, bool>(),
             py::arg("engine_dir"), py::arg("multimodal_engine_dir"), py::arg("lora_weights_map"),
             py::arg("draft_top_k"), py::arg("draft_step"), py::arg("proposal_tokens"), py::arg("verify_tokens"),
             py::arg("checkpoint_dir") = "", py::arg("draft_checkpoint_dir") = "",
             py::arg("context_cache_config") = ContextCacheConfig{}, py::arg("ple_config") = PleRuntimeConfig{},
-            "Construct for speculative decoding")
+            py::arg("host_embedding_tables") = false, "Construct for speculative decoding")
         .def("handle_request", &PyLLMRuntime::handleRequest, py::arg("request"),
             py::call_guard<py::gil_scoped_release>(), "Process a generation request and return the response")
         .def_prop_ro("unavailable_reason", &PyLLMRuntime::unavailableReason)
@@ -1694,7 +1703,7 @@ NB_MODULE(_edgellm_runtime, m)
                  std::string const&, ContextCacheConfig const&, int32_t, int32_t, int32_t, bool,
                  PleRuntimeConfig const&, std::string const&, int32_t, int32_t, std::string const&, std::string const&,
                  int32_t, int32_t, std::optional<int32_t>, std::optional<int32_t>, std::optional<int32_t>,
-                 std::optional<int32_t>, std::string const&>(),
+                 std::optional<int32_t>, std::string const&, bool>(),
             py::arg("engine_dir"), py::arg("multimodal_engine_dir") = "",
             py::arg("lora_weights_map") = std::unordered_map<std::string, std::string>{},
             py::arg("checkpoint_dir") = "", py::arg("context_cache_config") = ContextCacheConfig{},
@@ -1705,7 +1714,7 @@ NB_MODULE(_edgellm_runtime, m)
             py::arg("preemption") = "none", py::arg("priority_reserved_slots") = 0, py::arg("max_pause_steps") = 0,
             py::arg("draft_top_k") = py::none(), py::arg("draft_step") = py::none(),
             py::arg("proposal_tokens") = py::none(), py::arg("verify_tokens") = py::none(),
-            py::arg("draft_checkpoint_dir") = "",
+            py::arg("draft_checkpoint_dir") = "", py::arg("host_embedding_tables") = false,
             "ifb_scheduling_mode: auto | mixed | prefillFirst | singleCohort; scheduling_policy: fcfs | priority; "
             "preemption: none | pause (pause requires scheduling_policy=priority and the mixed mode); "
             "max_num_tokens / max_chunk_tokens: mixed-step budgets, 0 for the engine-derived default; "

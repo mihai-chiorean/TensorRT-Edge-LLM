@@ -981,6 +981,33 @@ def _native_context_cache_config(rt, config: ContextCacheConfig):
     return native
 
 
+# Speculative methods whose decoders bring every embedded token id to the host
+# (supportsHostMappedEmbeddingTables in the native runtime).
+_HOST_EMBEDDING_SPEC_METHODS = ("mtp", "gemma4_mtp")
+
+
+def _check_host_embedding_tables(layout, engine_dir: str) -> None:
+    """Refuse --host-embedding-tables before the native load for deployments
+    the native runtime cannot serve with a host-mapped token table."""
+    if layout.has_speech:
+        raise ValueError(
+            "--host-embedding-tables does not support Qwen3-Omni models: the "
+            "Talker reads the Thinker token table as a dense GPU tensor")
+    if layout.engine_type == EngineType.SPEC_DECODE:
+        method = str(
+            _read_json(os.path.join(engine_dir, SPEC_BASE_CONFIG_FILE)).get(
+                "spec_decode_type", ""))
+        if method not in _HOST_EMBEDDING_SPEC_METHODS:
+            raise ValueError(
+                "--host-embedding-tables supports speculative decoding only "
+                f"for MTP and Gemma 4 MTP bundles, not {method!r}")
+    if not os.path.isfile(os.path.join(engine_dir, "embedding.safetensors")):
+        raise ValueError(
+            "--host-embedding-tables needs the embedding.safetensors sidecar "
+            "in the engine directory; this bundle reads its token table from "
+            "the checkpoint")
+
+
 def _native_ple_config(rt, config: PleRuntimeConfig):
     native = rt.PleRuntimeConfig()
     native.residency = (rt.PleResidency.CACHED if config.residency == "cached"
@@ -1266,6 +1293,7 @@ class LLM:
                                              Mapping[str, Any]]] = None,
         ple_config: Optional[Union[PleRuntimeConfig, Mapping[str,
                                                              Any]]] = None,
+        host_embedding_tables: bool = False,
         enable_in_flight_batching: bool = False,
         require_cuda_graphs: bool = False,
         ifb_scheduling_mode: str = "auto",
@@ -1310,6 +1338,7 @@ class LLM:
         self._context_cache_config = ContextCacheConfig.parse(
             context_cache_config)
         self._ple_config = PleRuntimeConfig.parse(ple_config)
+        self._host_embedding_tables = bool(host_embedding_tables)
         self._enable_in_flight_batching = enable_in_flight_batching
         self._require_cuda_graphs = require_cuda_graphs
         self._cuda_graphs_captured: Optional[bool] = None
@@ -1497,6 +1526,12 @@ class LLM:
             if reason:
                 raise _ifb_unsupported_error(reason)
         ple_config = _native_ple_config(self._rt, self._ple_config)
+        # Passed only when set, so a native module without the option still
+        # loads deployments that do not ask for it.
+        residency = {}
+        if getattr(self, "_host_embedding_tables", False):
+            _check_host_embedding_tables(self._layout, self._engine_dir)
+            residency["host_embedding_tables"] = True
         lora_weights_map = {
             adapter.name: adapter.path
             for adapter in getattr(self, "_lora_adapters", ())
@@ -1524,6 +1559,7 @@ class LLM:
                 draft_checkpoint_dir=self._draft_checkpoint_dir,
                 context_cache_config=context_cache_config,
                 ple_config=ple_config,
+                **residency,
             )
         elif self._use_ifb():
             # In-flight batching: the engine owns the runtime and the one
@@ -1554,6 +1590,7 @@ class LLM:
                     ple_config=ple_config,
                     **self._ifb_scheduling,
                     **drafting,
+                    **residency,
                 )
                 policy = self._engine.resolved_policy
                 logger.info(
@@ -1591,6 +1628,7 @@ class LLM:
                 self._checkpoint_dir,
                 context_cache_config,
                 ple_config=ple_config,
+                **residency,
             )
         if getattr(self, "_runtime", None) is not None:
             self._cuda_graphs_captured = bool(
@@ -3093,6 +3131,9 @@ def load_model(**kwargs):
         ple_config = PleRuntimeConfig.parse(kwargs.pop("ple_config", None))
         if ple_config != PleRuntimeConfig():
             raise ValueError("standalone TTS models do not use PLE")
+        if kwargs.pop("host_embedding_tables", False):
+            raise ValueError(
+                "standalone TTS models have no token-embedding sidecar")
         context_cache = ContextCacheConfig.parse(
             kwargs.pop("context_cache_config", None))
         if context_cache.enabled:

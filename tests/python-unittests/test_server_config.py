@@ -539,3 +539,12 @@ def test_prebuilt_tree_needs_no_draft_model(tmp_path):
     assert spec.method == "dflash"
     assert not spec.draft_model
     assert SpeculativeConfig.parse(spec, prebuilt=True) == spec
+
+
+def test_host_embedding_tables_flag_reaches_llm_kwargs():
+    default = parse_server_config(["model"]).model
+    assert not default.host_embedding_tables
+    assert default.llm_kwargs()["host_embedding_tables"] is False
+    config = parse_server_config(["model", "--host-embedding-tables"])
+    assert config.model.host_embedding_tables
+    assert config.model.llm_kwargs()["host_embedding_tables"] is True

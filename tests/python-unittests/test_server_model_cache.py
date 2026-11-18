@@ -977,3 +977,52 @@ def test_prebuilt_paired_bundle_takes_a_model_free_speculative_config(
                      })
     kwargs = llm._runtime.kwargs
     assert (kwargs["draft_top_k"], kwargs["draft_step"]) == (10, 3)
+
+
+def _prebuilt_text_tree_with_sidecar(root):
+    bundle = _prebuilt_text_tree(root)
+    (bundle / "llm" / "embedding.safetensors").touch()
+    return bundle
+
+
+@pytest.mark.parametrize("ifb", [False, True])
+def test_load_model_forwards_host_embedding_tables_for_a_sidecar_tree(
+        tmp_path, monkeypatch, ifb):
+    from tensorrt_edgellm.server.runtime.engine import load_model
+
+    bundle = _prebuilt_text_tree_with_sidecar(tmp_path / "engines")
+    monkeypatch.setattr(
+        "tensorrt_edgellm.server.runtime.engine._import_runtime",
+        lambda: _FakeBindings)
+    default = load_model(model=str(bundle),
+                         cache_dir=str(tmp_path / "cache"),
+                         enable_in_flight_batching=ifb)
+    mapped = load_model(model=str(bundle),
+                        cache_dir=str(tmp_path / "cache"),
+                        enable_in_flight_batching=ifb,
+                        host_embedding_tables=True)
+    default_native = default._engine if ifb else default._runtime
+    mapped_native = mapped._engine if ifb else mapped._runtime
+    assert "host_embedding_tables" not in default_native.kwargs
+    assert mapped_native.kwargs["host_embedding_tables"] is True
+
+
+def test_load_model_refuses_host_embedding_tables_without_a_sidecar(
+        tmp_path, monkeypatch):
+    from tensorrt_edgellm.server.runtime.engine import load_model
+
+    bundle = _prebuilt_text_tree(tmp_path / "engines")
+    monkeypatch.setattr(
+        "tensorrt_edgellm.server.runtime.engine._import_runtime",
+        lambda: _FakeBindings)
+    with pytest.raises(ValueError, match="embedding.safetensors sidecar"):
+        load_model(model=str(bundle),
+                   cache_dir=str(tmp_path / "cache"),
+                   host_embedding_tables=True)
+
+
+def test_load_model_forwards_host_embedding_tables_for_gemma4_mtp(
+        tmp_path, monkeypatch):
+    _, llm = _load_mtp(tmp_path, monkeypatch, host_embedding_tables=True)
+    assert llm.has_draft_model
+    assert llm._runtime.kwargs["host_embedding_tables"] is True

@@ -163,6 +163,15 @@ working buffers cannot fit the remaining budget, initialization fails. This
 limit excludes cache/request metadata, thread stacks, and the OS page cache;
 it is not a limit on total host memory usage.
 
+## Token-Embedding Storage
+
+`--host-embedding-tables` (`host_embedding_tables=True` for `LLM` and the native
+`LLMRuntime` and `RequestEngine`) keeps the token-embedding table mapped from the
+bundle's FP16, INT8 or packed INT4 `embedding.safetensors` and uploads each step's
+rows instead of loading the table into GPU memory; it does not affect PLE storage.
+It needs that sidecar, supports speculative decoding only for MTP and Gemma 4 MTP
+bundles, and is refused for Qwen3-Omni models.
+
 ## Speculative Decoding
 
 `--speculative-config` accepts `method`, `model`, `num_speculative_tokens`,

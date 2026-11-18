@@ -377,6 +377,7 @@ class ModelConfig:
     context_cache_config: ContextCacheConfig = field(
         default_factory=ContextCacheConfig)
     ple_config: PleRuntimeConfig = field(default_factory=PleRuntimeConfig)
+    host_embedding_tables: bool = False
     enable_in_flight_batching: bool = False
     require_cuda_graphs: bool = False
     ifb_scheduling_mode: str = "auto"
@@ -449,6 +450,8 @@ class ModelConfig:
             self.context_cache_config,
             "ple_config":
             self.ple_config,
+            "host_embedding_tables":
+            self.host_embedding_tables,
             "enable_in_flight_batching":
             self.enable_in_flight_batching,
             "require_cuda_graphs":
@@ -790,6 +793,16 @@ def create_argument_parser(
         "increase slots or reduce the execution chunk/batch if needed. "
         "Smaller I/O batches do not relax this requirement.")
     model.add_argument(
+        "--host-embedding-tables",
+        action="store_true",
+        help="Keep the token-embedding table mapped from the bundle's "
+        "embedding.safetensors (reclaimable pages) and upload each step's "
+        "rows, instead of loading it into GPU memory. Token table only; PLE "
+        "storage follows --ple-residency. Needs an FP16, INT8 or packed INT4 "
+        "sidecar; speculative decoding supports it for MTP and Gemma 4 MTP "
+        "only; not with Qwen3-Omni models.",
+    )
+    model.add_argument(
         "--ple-file",
         default="",
         help=
@@ -916,6 +929,7 @@ def parse_server_config(argv: Optional[Sequence[str]] = None,
         ple_config=PleRuntimeConfig(residency=args.ple_residency,
                                     cache_slots=args.ple_cache_slots,
                                     file_path=args.ple_file),
+        host_embedding_tables=args.host_embedding_tables,
         enable_in_flight_batching=args.enable_in_flight_batching,
         require_cuda_graphs=args.require_cuda_graphs,
         ifb_scheduling_mode=args.ifb_scheduling_mode,

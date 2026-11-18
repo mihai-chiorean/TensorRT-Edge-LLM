@@ -2355,3 +2355,118 @@ def test_reserved_slots_are_checked_against_the_batch_the_engine_is_built_with(
             priority_reserved_slots=reserved,
             **limits)
     assert len(built) == (0 if refused else 1)
+
+
+def _host_tables_llm(monkeypatch,
+                     engine_type,
+                     captured,
+                     engine_dir,
+                     has_speech=False):
+    from tensorrt_edgellm.server.runtime import engine as engine_module
+
+    class Runtime:
+
+        def __init__(self, *args, **kwargs):
+            captured["kwargs"] = kwargs
+
+        @staticmethod
+        def capture_decoding_cuda_graph():
+            return True
+
+    monkeypatch.setattr(
+        engine_module, "_import_runtime",
+        lambda: SimpleNamespace(ContextCacheConfig=lambda: SimpleNamespace(),
+                                LLMRuntime=Runtime,
+                                PleRuntimeConfig=SimpleNamespace,
+                                PleResidency=SimpleNamespace(
+                                    RESIDENT="resident", CACHED="cached")))
+    monkeypatch.setattr(engine_module, "_native_context_cache_config",
+                        lambda rt, config: config)
+    llm = LLM.__new__(LLM)
+    llm._layout = SimpleNamespace(engine_type=engine_type,
+                                  has_speech=has_speech)
+    llm._bundle_dir = llm._engine_dir = str(engine_dir)
+    llm._media_dir = ""
+    llm._model_dir = llm._draft_model_dir = ""
+    llm._checkpoint_dir = llm._draft_checkpoint_dir = ""
+    llm._draft_top_k = llm._draft_step = 1
+    llm._proposal_tokens = llm._verify_tokens = None
+    llm._context_cache_config = ContextCacheConfig()
+    llm._ple_config = PleRuntimeConfig()
+    llm._host_embedding_tables = True
+    return llm
+
+
+def _write_host_tables_spec_dir(engine_dir, method):
+    (engine_dir / "base_config.json").write_text(
+        json.dumps({"spec_decode_type": method}))
+    (engine_dir / "embedding.safetensors").write_bytes(b"")
+
+
+def test_runtime_load_forwards_host_embedding_tables(monkeypatch, tmp_path):
+    (tmp_path / "embedding.safetensors").write_bytes(b"")
+    captured = {}
+    llm = _host_tables_llm(monkeypatch, EngineType.LLM, captured, tmp_path)
+    llm._load_runtime()
+    assert captured["kwargs"]["host_embedding_tables"] is True
+
+
+def test_host_embedding_tables_require_the_embedding_sidecar(
+        monkeypatch, tmp_path):
+    captured = {}
+    llm = _host_tables_llm(monkeypatch, EngineType.LLM, captured, tmp_path)
+    with pytest.raises(ValueError, match="embedding.safetensors sidecar"):
+        llm._load_runtime()
+    assert "kwargs" not in captured
+
+
+def test_host_embedding_tables_rejected_for_omni(monkeypatch, tmp_path):
+    (tmp_path / "embedding.safetensors").write_bytes(b"")
+    captured = {}
+    llm = _host_tables_llm(monkeypatch,
+                           EngineType.LLM,
+                           captured,
+                           tmp_path,
+                           has_speech=True)
+    with pytest.raises(ValueError, match="Qwen3-Omni"):
+        llm._load_runtime()
+    assert "kwargs" not in captured
+
+
+@pytest.mark.parametrize("method", ["eagle3", "dflash", "dspark"])
+def test_host_embedding_tables_rejected_for_other_speculative_decoders(
+        monkeypatch, tmp_path, method):
+    _write_host_tables_spec_dir(tmp_path, method)
+    captured = {}
+    llm = _host_tables_llm(monkeypatch, EngineType.SPEC_DECODE, captured,
+                           tmp_path)
+    with pytest.raises(ValueError, match="only for MTP and Gemma 4 MTP"):
+        llm._load_runtime()
+    assert "kwargs" not in captured
+
+
+@pytest.mark.parametrize("method", ["mtp", "gemma4_mtp"])
+def test_host_embedding_tables_reach_the_mtp_runtime(monkeypatch, tmp_path,
+                                                     method):
+    _write_host_tables_spec_dir(tmp_path, method)
+    captured = {}
+    llm = _host_tables_llm(monkeypatch, EngineType.SPEC_DECODE, captured,
+                           tmp_path)
+    llm._load_runtime()
+    assert captured["kwargs"]["host_embedding_tables"] is True
+    assert captured["kwargs"]["draft_top_k"] == 1
+
+
+def test_standalone_tts_refuses_host_embedding_tables(tmp_path, monkeypatch):
+    from tensorrt_edgellm.server.runtime import engine as engine_module
+    from tensorrt_edgellm.server.runtime import engine_build
+
+    model_dir = tmp_path / "tts"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model_type": "qwen3_tts"}')
+    monkeypatch.setattr(engine_build, "resolve_model_dir",
+                        lambda model, cache_dir: str(model_dir))
+    monkeypatch.setattr(engine_module, "TTS", lambda **kwargs: None)
+    with pytest.raises(ValueError, match="no token-embedding sidecar"):
+        engine_module.load_model(model=str(model_dir),
+                                 host_embedding_tables=True)
