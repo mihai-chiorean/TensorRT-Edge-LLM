@@ -659,8 +659,7 @@ static void embeddingLookupImpl(rt::Tensor const& inputIds, rt::Tensor const& em
     auto const& logicalShape = descriptor == nullptr ? embeddingShape : descriptor->logicalShape;
     int32_t const vocabSize = static_cast<int32_t>(logicalShape[0]);
     // Without a descriptor an unsigned byte table is the packed INT4 format, two columns per byte.
-    bool const isInt4Embedding
-        = descriptor == nullptr && embeddingTable.getDataType() == trt_edgellm::DataType::kUINT8;
+    bool const isInt4Embedding = descriptor == nullptr && embeddingTable.getDataType() == trt_edgellm::DataType::kUINT8;
     int64_t const hiddenSize = isInt4Embedding ? 2 * logicalShape[1] : logicalShape[1];
     check::check(
         logicalShape[0] == embeddingShape[0], "embedding descriptor logical and packed vocab dimensions must match");
@@ -798,7 +797,8 @@ static void embeddingLookupImpl(rt::Tensor const& inputIds, rt::Tensor const& em
     }
     else if (format == EmbeddingTableFormat::kINT4)
     {
-        check::check(isInt4Embedding, "packed INT4 embedding tables are selected by UINT8 storage without a descriptor");
+        check::check(
+            isInt4Embedding, "packed INT4 embedding tables are selected by UINT8 storage without a descriptor");
         check::check(scales.has_value(), "scales must be provided for INT4 embedding table");
         auto const& scalesTensor = scales.value().get();
         auto const scaleShape = scalesTensor.getShape();

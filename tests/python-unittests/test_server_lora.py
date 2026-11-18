@@ -32,12 +32,11 @@ import pytest
 from safetensors.numpy import save_file as save_numpy_safetensors
 
 from tensorrt_edgellm import lora_package
-
 from tensorrt_edgellm.server.config import (ApiConfig, LoraAdapterConfig,
-                                        ModelConfig, ServerConfigError,
-                                        parse_server_config)
+                                            ModelConfig, ServerConfigError,
+                                            parse_server_config)
 from tensorrt_edgellm.server.runtime.engine import (LLM, SamplingParams,
-                                                finish_reason_name)
+                                                    finish_reason_name)
 
 # ---------------------------------------------------------------------------
 # Fake nanobind runtime: records the adapter each request carries
@@ -281,8 +280,9 @@ def _adapter(engine_dir: Path,
 @pytest.fixture
 def _fake_runtime(monkeypatch):
     """Swap the nanobind module for the recording fake in every HTTP-path test."""
-    monkeypatch.setattr("tensorrt_edgellm.server.runtime.engine._import_runtime",
-                        lambda: _FakeRuntimeModule)
+    monkeypatch.setattr(
+        "tensorrt_edgellm.server.runtime.engine._import_runtime",
+        lambda: _FakeRuntimeModule)
 
 
 def _build_llm(tmp_path: Path, *, max_lora_rank: int = 16) -> LLM:
@@ -843,7 +843,8 @@ def test_unverified_adapters_are_served_only_when_allowed(
     assert sorted(llm._runtime.args[2]) == ["good", "stale"]
 
 
-def test_checkpoint_backed_bundle_is_not_covered_by_the_base_identity(tmp_path):
+def test_checkpoint_backed_bundle_is_not_covered_by_the_base_identity(
+        tmp_path):
     from tensorrt_edgellm.server.runtime.engine import _resolve_lora_adapters
     engine_dir = _engine_tree(tmp_path, max_lora_rank=16) / "llm"
     _adapter(engine_dir, "tool", rank=8)
@@ -891,11 +892,13 @@ def test_full_verification_and_health_fields(tmp_path, _fake_runtime):
     }]
 
 
-def test_configured_adapter_outside_lora_weights_is_verified(tmp_path,
-                                                             _fake_runtime):
+def test_configured_adapter_outside_lora_weights_is_verified(
+        tmp_path, _fake_runtime):
     bundle = _engine_tree(tmp_path, max_lora_rank=16)
     digest = lora_package.read_base_identity(str(bundle / "llm"))["digest"]
-    weights = _adapter(tmp_path / "staging", "tool", rank=4,
+    weights = _adapter(tmp_path / "staging",
+                       "tool",
+                       rank=4,
                        base_identity=digest)
 
     llm = LLM(model=str(bundle),
@@ -903,8 +906,6 @@ def test_configured_adapter_outside_lora_weights_is_verified(tmp_path,
               lora_adapters=[LoraAdapterConfig("tool", str(weights))])
 
     assert [entry["verified"] for entry in llm.lora_adapter_info()] == [True]
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -1030,7 +1031,8 @@ def _tts_load(tmp_path, monkeypatch, require_cuda_graphs=False):
 
     from tensorrt_edgellm.server.runtime import engine as engine_module
     from tensorrt_edgellm.server.runtime import engine_build
-    from tensorrt_edgellm.server.runtime.engine_layout import runtime_config_path
+    from tensorrt_edgellm.server.runtime.engine_layout import \
+        runtime_config_path
 
     model_dir = tmp_path / "tts"
     model_dir.mkdir()
@@ -1049,14 +1051,15 @@ def _tts_load(tmp_path, monkeypatch, require_cuda_graphs=False):
 
     monkeypatch.setattr(engine_module, "TTS", BoundTTS)
     model = parse_server_config([str(model_dir)]).model
-    return engine_module.load_model(model=str(model_dir),
-                                    lora_verify=model.lora_verify,
-                                    allow_unverified_lora_adapters=model.
-                                    allow_unverified_lora_adapters,
-                                    require_cuda_graphs=require_cuda_graphs)
+    return engine_module.load_model(
+        model=str(model_dir),
+        lora_verify=model.lora_verify,
+        allow_unverified_lora_adapters=model.allow_unverified_lora_adapters,
+        require_cuda_graphs=require_cuda_graphs)
 
 
-def test_tts_dispatch_accepts_the_default_server_options(tmp_path, monkeypatch):
+def test_tts_dispatch_accepts_the_default_server_options(
+        tmp_path, monkeypatch):
     assert _tts_load(tmp_path, monkeypatch) is not None
 
 

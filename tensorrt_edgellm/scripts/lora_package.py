@@ -51,31 +51,37 @@ def _verify(args) -> None:
     print(f"base identity {base['digest'][:12]} ok")
     for adapter_dir in lora_package.adapter_dirs(args.engine_dir):
         manifest = lora_package.verify_adapter(
-            os.path.join(adapter_dir, lora_package.WEIGHTS_FILE), base, max_rank)
-        print(f"{os.path.basename(adapter_dir)} version {manifest['version']} ok")
+            os.path.join(adapter_dir, lora_package.WEIGHTS_FILE), base,
+            max_rank)
+        print(
+            f"{os.path.basename(adapter_dir)} version {manifest['version']} ok"
+        )
 
 
 def main(argv=None, *, prog="tensorrt-edgellm-lora-package") -> None:
     parser = argparse.ArgumentParser(
         prog=prog,
-        description="Bind processed LoRA adapters to a deployed engine directory")
+        description=
+        "Bind processed LoRA adapters to a deployed engine directory")
     sub = parser.add_subparsers(dest="command", required=True)
     base = sub.add_parser("base-identity",
                           help="write edgellm_base_identity.json")
     base.add_argument("--engine-dir", required=True)
     base.set_defaults(func=_base_identity)
-    adapter = sub.add_parser("adapter",
-                             help="write an adapter's edgellm_adapter_manifest.json")
+    adapter = sub.add_parser(
+        "adapter", help="write an adapter's edgellm_adapter_manifest.json")
     adapter.add_argument("--engine-dir", required=True)
     adapter.add_argument("--adapter-dir", required=True)
     adapter.add_argument("--version", required=True)
     adapter.set_defaults(func=_adapter)
     verify = sub.add_parser(
-        "verify", help="check the base identity and every adapter under lora_weights/")
+        "verify",
+        help="check the base identity and every adapter under lora_weights/")
     verify.add_argument("--engine-dir", required=True)
-    verify.add_argument("--full",
-                        action="store_true",
-                        help="rehash every base file instead of checking sizes")
+    verify.add_argument(
+        "--full",
+        action="store_true",
+        help="rehash every base file instead of checking sizes")
     verify.set_defaults(func=_verify)
 
     args = parser.parse_args(argv)

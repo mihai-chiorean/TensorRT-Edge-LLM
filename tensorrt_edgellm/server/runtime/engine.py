@@ -1099,15 +1099,15 @@ def _read_lora_provenance(adapter: LoraAdapter) -> LoraAdapter:
     )
 
 
-def _resolve_lora_adapters(engine_dir: str,
-                           configured: Optional[List[Any]] = None,
-                           *,
-                           verify_mode: str = "full",
-                           allow_unverified: bool = False,
-                           checkpoint_dir: str = "",
-                           stamp_path: Optional[str] = None,
-                           report: Optional[Dict[str, Any]] = None
-                           ) -> List[LoraAdapter]:
+def _resolve_lora_adapters(
+        engine_dir: str,
+        configured: Optional[List[Any]] = None,
+        *,
+        verify_mode: str = "full",
+        allow_unverified: bool = False,
+        checkpoint_dir: str = "",
+        stamp_path: Optional[str] = None,
+        report: Optional[Dict[str, Any]] = None) -> List[LoraAdapter]:
     """Merge configured and discovered adapters and validate the set.
 
     The engine's ``builder_config.max_lora_rank`` gates everything: adapters
@@ -1157,13 +1157,15 @@ def _resolve_lora_adapters(engine_dir: str,
     return [adapters[name] for name in sorted(adapters)]
 
 
-def _verify_lora_adapters(adapters: Dict[str, LoraAdapter], engine_dir: str,
-                          max_lora_rank: int, verify_mode: str,
-                          allow_unverified: bool,
-                          checkpoint_dir: str,
-                          stamp_path: Optional[str] = None,
-                          report: Optional[Dict[str, Any]] = None
-                          ) -> Dict[str, LoraAdapter]:
+def _verify_lora_adapters(
+        adapters: Dict[str, LoraAdapter],
+        engine_dir: str,
+        max_lora_rank: int,
+        verify_mode: str,
+        allow_unverified: bool,
+        checkpoint_dir: str,
+        stamp_path: Optional[str] = None,
+        report: Optional[Dict[str, Any]] = None) -> Dict[str, LoraAdapter]:
     """Bind every adapter to the deployed base through its manifest.
 
     A failure refuses startup unless ``allow_unverified``, which keeps the
@@ -1182,8 +1184,9 @@ def _verify_lora_adapters(adapters: Dict[str, LoraAdapter], engine_dir: str,
 
     if checkpoint_dir:
         for name in adapters:
-            refuse(name, "checkpoint-backed bundles are not covered by the "
-                   "base identity")
+            refuse(
+                name, "checkpoint-backed bundles are not covered by the "
+                "base identity")
         return adapters
     try:
         base = lora_package.read_base_identity(engine_dir,
@@ -1202,7 +1205,11 @@ def _verify_lora_adapters(adapters: Dict[str, LoraAdapter], engine_dir: str,
         "; sizes mode does not detect a same-size engine swap"
         if verify_mode == "sizes" else "")
     if report is not None:
-        report.update({"digest": base["digest"][:12], "verified": True, **check})
+        report.update({
+            "digest": base["digest"][:12],
+            "verified": True,
+            **check
+        })
     verified = {}
     for name, adapter in adapters.items():
         try:

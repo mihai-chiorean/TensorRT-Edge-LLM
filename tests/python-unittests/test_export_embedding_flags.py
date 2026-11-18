@@ -26,8 +26,8 @@ from safetensors.torch import save_file
 from tensorrt_edgellm import model as model_module
 from tensorrt_edgellm.checkpoint import checkpoint_utils
 from tensorrt_edgellm.models import linear as linear_module
-from tensorrt_edgellm.onnx import export as onnx_export
 from tensorrt_edgellm.onnx import cli as export_script
+from tensorrt_edgellm.onnx import export as onnx_export
 
 
 def _checkpoint(tmp_path, model_type):

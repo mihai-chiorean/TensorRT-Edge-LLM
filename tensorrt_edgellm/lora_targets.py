@@ -31,7 +31,9 @@ def parse_lora_targets(value: Optional[str]) -> Optional[Tuple[str, ...]]:
     """Parse a comma-separated target list; ``None``/``""`` mean every eligible GEMM."""
     if value is None or value == "":
         return None
-    targets = sorted({part.strip() for part in value.split(",") if part.strip()})
+    targets = sorted(
+        {part.strip()
+         for part in value.split(",") if part.strip()})
     if not targets:
         raise ValueError(f"--lora-targets {value!r} names no targets")
     for target in targets:
@@ -42,8 +44,7 @@ def parse_lora_targets(value: Optional[str]) -> Optional[Tuple[str, ...]]:
     return tuple(targets)
 
 
-def stem_matches_targets(stem: str,
-                         targets: Optional[Sequence[str]]) -> bool:
+def stem_matches_targets(stem: str, targets: Optional[Sequence[str]]) -> bool:
     """Whether ``stem`` is selected; every stem is selected when ``targets`` is None."""
     if targets is None:
         return True
@@ -55,6 +56,6 @@ def unmatched_targets(stems: Iterable[str],
                       targets: Sequence[str]) -> List[str]:
     """Targets that select none of ``stems``."""
     stems = list(stems)
-    return sorted(target for target in targets
-                  if not any(stem_matches_targets(stem, (target, ))
-                             for stem in stems))
+    return sorted(
+        target for target in targets
+        if not any(stem_matches_targets(stem, (target, )) for stem in stems))

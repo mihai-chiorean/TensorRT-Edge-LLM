@@ -95,8 +95,8 @@ bool isPluginLayer(nvinfer1::ILayer* layer, char const* pluginName)
         return false;
     }
     auto& plugin = static_cast<nvinfer1::IPluginV3Layer*>(layer)->getPlugin();
-    auto* core
-        = static_cast<nvinfer1::IPluginV3OneCore*>(plugin.getCapabilityInterface(nvinfer1::PluginCapabilityType::kCORE));
+    auto* core = static_cast<nvinfer1::IPluginV3OneCore*>(
+        plugin.getCapabilityInterface(nvinfer1::PluginCapabilityType::kCORE));
     return core != nullptr && std::string(core->getPluginName()) == pluginName;
 }
 

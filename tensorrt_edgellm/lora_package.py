@@ -29,9 +29,9 @@ import logging
 import os
 import re
 import struct
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
-import tempfile
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -61,7 +61,9 @@ def _sha256(path: str) -> str:
 def _write_json_atomic(path: str, value: dict) -> None:
     """Write through a uniquely named, exclusively created temporary file."""
     directory = os.path.dirname(os.path.abspath(path))
-    fd, tmp = tempfile.mkstemp(prefix=".edgellm-", suffix=".tmp", dir=directory)
+    fd, tmp = tempfile.mkstemp(prefix=".edgellm-",
+                               suffix=".tmp",
+                               dir=directory)
     try:
         with os.fdopen(fd, "w") as out:
             json.dump(value, out, indent=2, sort_keys=True)
@@ -180,8 +182,9 @@ def _load_stamps(stamp_path: Optional[str], digest: str) -> Dict[str, list]:
     if not stamp_path or not os.path.isfile(stamp_path):
         return {}
     if not _trusted_cache_file(stamp_path):
-        logger.warning("Ignoring base identity stamp cache %s: it is not a "
-                       "private file of this user", stamp_path)
+        logger.warning(
+            "Ignoring base identity stamp cache %s: it is not a "
+            "private file of this user", stamp_path)
         return {}
     try:
         with open(stamp_path) as stream:
@@ -218,7 +221,8 @@ def read_base_identity(engine_dir: str,
             f"base-identity --engine-dir {engine_dir}")
     with open(path) as stream:
         record = json.load(stream)
-    if not isinstance(record, dict) or record.get("schema") != BASE_IDENTITY_SCHEMA:
+    if not isinstance(record,
+                      dict) or record.get("schema") != BASE_IDENTITY_SCHEMA:
         raise ValueError(f"{path}: unsupported base identity schema")
     files = record.get("files")
     if not isinstance(files, list) or _digest(files) != record.get("digest"):
@@ -245,19 +249,25 @@ def read_base_identity(engine_dir: str,
     hashed = trusted = 0
     if verify == "full":
         cached = _load_stamps(stamp_path, record["digest"])
-        stamps = {rel: _file_stamp(os.path.join(engine_dir, rel)) for rel in paths}
+        stamps = {
+            rel: _file_stamp(os.path.join(engine_dir, rel))
+            for rel in paths
+        }
         pending = [rel for rel in paths if cached.get(rel) != stamps[rel]]
         trusted = len(paths) - len(pending)
-        with ThreadPoolExecutor(max_workers=max(1, min(4, len(pending)))) as pool:
+        with ThreadPoolExecutor(
+                max_workers=max(1, min(4, len(pending)))) as pool:
             results = dict(
-                zip(pending,
+                zip(
+                    pending,
                     pool.map(
                         lambda rel: _hash_and_stamp(
                             os.path.join(engine_dir, rel)), pending)))
         for rel in pending:
             digest, stamps[rel] = results[rel]
             if digest != recorded[rel]["sha256"]:
-                raise ValueError(f"base identity mismatch: {rel} sha256 differs")
+                raise ValueError(
+                    f"base identity mismatch: {rel} sha256 differs")
         for rel in paths:
             if rel not in results and _file_stamp(os.path.join(
                     engine_dir, rel)) != stamps[rel]:
@@ -280,8 +290,9 @@ def read_base_identity(engine_dir: str,
                 })
             except OSError as error:
                 # Verification succeeded; only the next start's shortcut is lost.
-                logger.warning("Could not record base identity stamps in %s: "
-                               "%s", stamp_path, error)
+                logger.warning(
+                    "Could not record base identity stamps in %s: "
+                    "%s", stamp_path, error)
     record["verification"] = {
         "mode": verify,
         "hashed_files": hashed,
@@ -294,7 +305,8 @@ def read_base_identity(engine_dir: str,
 _DTYPE_BYTES = {"F16": 2, "BF16": 2, "F32": 4, "I8": 1, "U8": 1}
 
 
-def read_safetensors_tensor_names(path: str) -> Dict[str, Tuple[str, List[int]]]:
+def read_safetensors_tensor_names(
+        path: str) -> Dict[str, Tuple[str, List[int]]]:
     """``{name: (dtype, shape)}`` from a safetensors header, without reading the
     payload; refuses headers whose byte ranges the file cannot hold."""
     file_size = os.path.getsize(path)
@@ -375,9 +387,11 @@ def _processing_record(adapter_dir: str) -> dict:
     record = config.get("edgellm_lora_processing") if isinstance(
         config, dict) else None
     if not isinstance(record, dict):
-        raise ValueError(f"{adapter_dir}/config.json has no "
-                         "edgellm_lora_processing record; reprocess the adapter")
-    if record.get("processing_schema_version") not in SUPPORTED_PROCESSING_SCHEMAS:
+        raise ValueError(
+            f"{adapter_dir}/config.json has no "
+            "edgellm_lora_processing record; reprocess the adapter")
+    if record.get(
+            "processing_schema_version") not in SUPPORTED_PROCESSING_SCHEMAS:
         raise ValueError(
             f"{adapter_dir}: processing_schema_version "
             f"{record.get('processing_schema_version')!r} is not supported "
@@ -406,20 +420,29 @@ def write_adapter_manifest(adapter_dir: str, engine_dir: str,
         raise ValueError(f"{adapter_dir}: factor ranks {sorted(ranks)} differ "
                          f"from the recorded rank {rank}")
     manifest = {
-        "schema": ADAPTER_MANIFEST_SCHEMA,
-        "version": version,
-        "base_identity": base["digest"],
+        "schema":
+        ADAPTER_MANIFEST_SCHEMA,
+        "version":
+        version,
+        "base_identity":
+        base["digest"],
         "weights": {
             "file": WEIGHTS_FILE,
             "size": os.path.getsize(weights_path),
             "sha256": _sha256(weights_path),
         },
-        "rank": rank,
-        "lora_scale": record.get("lora_scale"),
-        "processing_schema_version": record["processing_schema_version"],
-        "targets": targets,
-        "source_adapter_sha256": record.get("adapter_model_sha256"),
-        "created_utc": datetime.datetime.now(
+        "rank":
+        rank,
+        "lora_scale":
+        record.get("lora_scale"),
+        "processing_schema_version":
+        record["processing_schema_version"],
+        "targets":
+        targets,
+        "source_adapter_sha256":
+        record.get("adapter_model_sha256"),
+        "created_utc":
+        datetime.datetime.now(
             datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     _write_json_atomic(os.path.join(adapter_dir, ADAPTER_MANIFEST_FILE),
@@ -429,25 +452,31 @@ def write_adapter_manifest(adapter_dir: str, engine_dir: str,
 
 def _manifest_fields(manifest, where: str) -> None:
     """Refuse a manifest whose fields have the wrong type or are missing."""
-    if not isinstance(manifest, dict) or manifest.get("schema") != ADAPTER_MANIFEST_SCHEMA:
+    if not isinstance(manifest, dict) or manifest.get(
+            "schema") != ADAPTER_MANIFEST_SCHEMA:
         raise ValueError(f"{where}: unsupported manifest schema")
     weights = manifest.get("weights")
     checks = {
-        "version": isinstance(manifest.get("version"), str)
+        "version":
+        isinstance(manifest.get("version"), str)
         and bool(_VERSION_RE.fullmatch(manifest["version"])),
-        "base_identity": isinstance(manifest.get("base_identity"), str),
-        "weights": isinstance(weights, dict)
-        and isinstance(weights.get("file"), str)
+        "base_identity":
+        isinstance(manifest.get("base_identity"), str),
+        "weights":
+        isinstance(weights, dict) and isinstance(weights.get("file"), str)
         and isinstance(weights.get("size"), int)
         and isinstance(weights.get("sha256"), str),
-        "rank": isinstance(manifest.get("rank"), int)
+        "rank":
+        isinstance(manifest.get("rank"), int)
         and not isinstance(manifest.get("rank"), bool),
-        "targets": isinstance(manifest.get("targets"), list)
+        "targets":
+        isinstance(manifest.get("targets"), list)
         and all(isinstance(t, str) for t in manifest["targets"]),
     }
     bad = sorted(field for field, ok in checks.items() if not ok)
     if bad:
-        raise ValueError(f"{where}: manifest fields missing or malformed: {bad}")
+        raise ValueError(
+            f"{where}: manifest fields missing or malformed: {bad}")
 
 
 def verify_adapter(weights_path: str, base_identity: dict,
@@ -467,14 +496,15 @@ def verify_adapter(weights_path: str, base_identity: dict,
         except ValueError as error:
             raise ValueError(f"{path}: invalid JSON: {error}")
     _manifest_fields(manifest, adapter_dir)
-    if manifest.get("processing_schema_version") not in SUPPORTED_PROCESSING_SCHEMAS:
-        raise ValueError(f"{adapter_dir}: unsupported processing_schema_version "
-                         f"{manifest.get('processing_schema_version')!r}")
-    if manifest["base_identity"] != base_identity["digest"]:
+    if manifest.get(
+            "processing_schema_version") not in SUPPORTED_PROCESSING_SCHEMAS:
         raise ValueError(
-            f"{adapter_dir}: packaged for base "
-            f"{manifest['base_identity'][:12]}, deployed base is "
-            f"{base_identity['digest'][:12]}")
+            f"{adapter_dir}: unsupported processing_schema_version "
+            f"{manifest.get('processing_schema_version')!r}")
+    if manifest["base_identity"] != base_identity["digest"]:
+        raise ValueError(f"{adapter_dir}: packaged for base "
+                         f"{manifest['base_identity'][:12]}, deployed base is "
+                         f"{base_identity['digest'][:12]}")
     weights = manifest["weights"]
     if weights["file"] != os.path.basename(weights_path):
         raise ValueError(
@@ -485,7 +515,8 @@ def verify_adapter(weights_path: str, base_identity: dict,
     if os.path.getsize(weights_path) != weights["size"]:
         raise ValueError(f"{adapter_dir}: weights size differs from manifest")
     if _sha256(weights_path) != weights["sha256"]:
-        raise ValueError(f"{adapter_dir}: weights sha256 differs from manifest")
+        raise ValueError(
+            f"{adapter_dir}: weights sha256 differs from manifest")
     targets, ranks = _adapter_targets(weights_path)
     if targets != manifest["targets"]:
         raise ValueError(f"{adapter_dir}: weights modules differ from the "
@@ -506,8 +537,8 @@ def adapter_dirs(engine_dir: str) -> List[str]:
     if not os.path.isdir(root):
         return []
     return [
-        os.path.join(root, entry) for entry in sorted(os.listdir(root))
-        if not entry.startswith(".") and os.path.isdir(os.path.join(root, entry))
+        os.path.join(root, entry) for entry in sorted(os.listdir(root)) if
+        not entry.startswith(".") and os.path.isdir(os.path.join(root, entry))
     ]
 
 
@@ -516,6 +547,7 @@ def max_lora_rank_of(engine_dir: str) -> Optional[int]:
         path = os.path.join(engine_dir, name)
         if os.path.isfile(path):
             with open(path) as stream:
-                return int(json.load(stream).get("builder_config",
-                                                 {}).get("max_lora_rank", 0))
+                return int(
+                    json.load(stream).get("builder_config",
+                                          {}).get("max_lora_rank", 0))
     return None

@@ -40,8 +40,8 @@ from tensorrt_edgellm.builder.models.gemma4 import \
 from tensorrt_edgellm.builder.models.gemma4 import \
     modeling_gemma4_text as text_module  # noqa: E402
 from tensorrt_edgellm.builder.ops.linear import Linear  # noqa: E402
-from tensorrt_edgellm.builder.ops.module import (BuildContext,  # noqa: E402
-                                             BuildOptions)
+from tensorrt_edgellm.builder.ops.module import BuildContext  # noqa: E402
+from tensorrt_edgellm.builder.ops.module import BuildOptions
 
 _LAYERS = 4
 _FULL_LAYER = 3

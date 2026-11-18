@@ -832,8 +832,8 @@ private:
 
     std::shared_ptr<timer::Timer> mProfilingTimer{std::make_shared<timer::Timer>()};
     RuntimeBenchmarkOptions mBenchmarkOptions{};
-    DeploymentConfig mDeployment{};                    //!< Parsed base+draft configs + consolidated strategy settings
-    std::unique_ptr<EngineExecutor> mBaseExecutor;     //!< Base model TRT wrapper
+    DeploymentConfig mDeployment{};                //!< Parsed base+draft configs + consolidated strategy settings
+    std::unique_ptr<EngineExecutor> mBaseExecutor; //!< Base model TRT wrapper
     //! Non-owning view of the draft executor, which the decoder registry owns for the runtime's lifetime.
     EngineExecutor const* mDraftExecutorView{nullptr};
     std::unique_ptr<SharedResources> mSharedResources; //!< KV caches / RoPE / LoRA / context memory

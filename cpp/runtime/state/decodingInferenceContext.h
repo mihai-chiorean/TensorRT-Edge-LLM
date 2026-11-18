@@ -282,7 +282,7 @@ struct DecodingInferenceContext
     std::string loraWeightsName{""};       //!< LoRA adapter name used by this request
     //! Content identity of the active LoRA adapter; keys every adapter-dependent cache; empty for the base model.
     std::string loraCacheIdentity{""};
-    cudaStream_t stream{};                 //!< CUDA stream
+    cudaStream_t stream{}; //!< CUDA stream
 
     //! @name Per-slot decoding settings
     //! Each sequence's own sampling parameters, seed, generate budget (KV-clamped by the runtime),

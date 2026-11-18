@@ -3478,7 +3478,8 @@ def test_streaming_audio_text_keeps_terminal_spelling_between_deltas(
 def test_tool_output_strips_terminal_tokens_before_parsing(tmp_path):
     from tensorrt_edgellm.server.parsing.terminal_tokens import \
         terminal_special_tokens
-    from tensorrt_edgellm.server.parsing.tool_calling import validate_tool_request
+    from tensorrt_edgellm.server.parsing.tool_calling import \
+        validate_tool_request
     from tensorrt_edgellm.server.runtime.engine import LLM
 
     model_dir = tmp_path / "gemma-4-e4b"

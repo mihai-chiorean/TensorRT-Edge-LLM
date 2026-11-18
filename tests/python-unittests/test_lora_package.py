@@ -122,7 +122,8 @@ def test_manifest_binds_weights_to_the_base(tmp_path):
     assert manifest["version"] == "2026.11.12-1"
     assert manifest["weights"]["size"] == os.path.getsize(
         adapter / lora_package.WEIGHTS_FILE)
-    on_disk = json.loads((adapter / lora_package.ADAPTER_MANIFEST_FILE).read_text())
+    on_disk = json.loads(
+        (adapter / lora_package.ADAPTER_MANIFEST_FILE).read_text())
     assert on_disk == manifest
 
 
@@ -175,13 +176,15 @@ def test_verify_adapter_refuses_changed_weights(tmp_path):
     weights.write_bytes(bytes(data))
 
     with pytest.raises(ValueError, match="sha256"):
-        lora_package.verify_adapter(str(adapter / lora_package.WEIGHTS_FILE), base, 16)
+        lora_package.verify_adapter(str(adapter / lora_package.WEIGHTS_FILE),
+                                    base, 16)
 
 
 def test_verify_adapter_refuses_rank_above_the_engine(tmp_path):
     _, base, adapter = _packaged(tmp_path)
     with pytest.raises(ValueError, match="max_lora_rank"):
-        lora_package.verify_adapter(str(adapter / lora_package.WEIGHTS_FILE), base, 2)
+        lora_package.verify_adapter(str(adapter / lora_package.WEIGHTS_FILE),
+                                    base, 2)
 
 
 def test_cli_packages_and_verifies(tmp_path, capsys):
@@ -253,10 +256,18 @@ def test_truncated_weights_payload_is_refused(tmp_path):
 
 
 @pytest.mark.parametrize("changes", [
-    {"weights": ["bad"]},
-    {"version": None},
-    {"rank": "4"},
-    {"targets": "model.layers.0.mlp.up_proj"},
+    {
+        "weights": ["bad"]
+    },
+    {
+        "version": None
+    },
+    {
+        "rank": "4"
+    },
+    {
+        "targets": "model.layers.0.mlp.up_proj"
+    },
 ])
 def test_malformed_manifest_fields_are_verification_errors(tmp_path, changes):
     _, base, adapter = _packaged(tmp_path)
@@ -288,7 +299,6 @@ def test_symlinked_engine_directory_is_refused(tmp_path):
 
     with pytest.raises(ValueError, match="symlink"):
         lora_package.compute_base_identity(str(tmp_path / "alias"))
-
 
 
 @pytest.fixture
@@ -365,12 +375,11 @@ def test_unwritable_stamp_cache_does_not_fail_verification(tmp_path, _settled):
     blocked = tmp_path / "blocked"
     blocked.write_text("a file where the cache directory should be")
 
-    record = lora_package.read_base_identity(
-        str(llm), stamp_path=str(blocked / "stamps.json"))
+    record = lora_package.read_base_identity(str(llm),
+                                             stamp_path=str(blocked /
+                                                            "stamps.json"))
 
     assert record["verification"]["hashed_files"] == 3
-
-
 
 
 def _int8_weights(path, with_scales=True):
@@ -386,7 +395,8 @@ def _int8_weights(path, with_scales=True):
 
 def test_int8_transport_file_yields_module_targets(tmp_path):
     _int8_weights(tmp_path / "w.safetensors")
-    targets, ranks = lora_package._adapter_targets(str(tmp_path / "w.safetensors"))
+    targets, ranks = lora_package._adapter_targets(
+        str(tmp_path / "w.safetensors"))
     assert targets == sorted(_STEMS)
     assert ranks == {4}
 

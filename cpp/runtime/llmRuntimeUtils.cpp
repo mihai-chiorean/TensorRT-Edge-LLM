@@ -1012,8 +1012,8 @@ EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cud
             format::fmtstr("INT4 embedding_scale must be 2D, got %d dimensions", scalesPtr->getShape().getNumDims()));
         ELLM_CHECK(columns % kInt4EmbeddingGroupSize == 0,
             format::fmtstr("INT4 embedding width %ld must be a multiple of %ld", columns, kInt4EmbeddingGroupSize));
-        ELLM_CHECK(scalesPtr->getShape()[0] == vocabSize
-                && scalesPtr->getShape()[1] == columns / kInt4EmbeddingGroupSize,
+        ELLM_CHECK(
+            scalesPtr->getShape()[0] == vocabSize && scalesPtr->getShape()[1] == columns / kInt4EmbeddingGroupSize,
             format::fmtstr("INT4 embedding_scale must be [%ld, %ld], got [%ld, %ld]", vocabSize,
                 columns / kInt4EmbeddingGroupSize, scalesPtr->getShape()[0], scalesPtr->getShape()[1]));
 

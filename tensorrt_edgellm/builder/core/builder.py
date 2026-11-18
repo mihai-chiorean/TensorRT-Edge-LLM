@@ -751,7 +751,7 @@ def _check_lora_targets(network, args: BuildArgs) -> None:
         network.get_input(index).name.rsplit(".lora_", 1)[0]
         for index in range(network.num_inputs)
         if network.get_input(index).name.endswith((".lora_A.weight",
-                                                    ".lora_B.weight"))
+                                                   ".lora_B.weight"))
     }
     missing = unmatched_targets(stems, targets)
     if missing:

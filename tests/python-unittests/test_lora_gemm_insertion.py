@@ -456,7 +456,8 @@ def test_adapter_names_match_exported_llm_bindings(key):
             "model.layers.0.self_attn.q_proj.lora_A.weight")
 
 
-_THREE_STEMS = ("model.layers.0.self_attn.q_proj", "model.layers.0.mlp.up_proj",
+_THREE_STEMS = ("model.layers.0.self_attn.q_proj",
+                "model.layers.0.mlp.up_proj",
                 "model.layers.0.per_layer_projection")
 
 

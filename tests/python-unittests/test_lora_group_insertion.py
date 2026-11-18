@@ -50,13 +50,13 @@ def _layer_graph():
     post = gs.Variable("post", dtype=np.float16, shape=["tokens", 16])
     act = gs.Variable("act", dtype=np.float16, shape=["tokens", 16])
     nodes, outs = [], {}
-    for stem, inp, n in (("model.layers.0.self_attn.q_proj", hidden, 32),
-                         ("model.layers.0.self_attn.k_proj", hidden, 8),
-                         ("model.layers.0.self_attn.v_proj", hidden, 8),
-                         ("model.layers.0.self_attn.o_proj", attn, 16),
-                         ("model.layers.0.mlp.gate_proj", post, 64),
-                         ("model.layers.0.mlp.up_proj", post, 64),
-                         ("model.layers.0.mlp.down_proj", act, 16),
+    for stem, inp, n in (("model.layers.0.self_attn.q_proj", hidden,
+                          32), ("model.layers.0.self_attn.k_proj", hidden, 8),
+                         ("model.layers.0.self_attn.v_proj", hidden,
+                          8), ("model.layers.0.self_attn.o_proj", attn,
+                               16), ("model.layers.0.mlp.gate_proj", post, 64),
+                         ("model.layers.0.mlp.up_proj", post,
+                          64), ("model.layers.0.mlp.down_proj", act, 16),
                          ("model.layers.0.per_layer_projection", hidden, 16)):
         node, out = _int4(stem, inp, n)
         nodes.append(node)

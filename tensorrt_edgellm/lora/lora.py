@@ -524,8 +524,8 @@ def _check_adapter_config(config: dict) -> Tuple[float, int]:
     unsupported = [
         f"{key} ({reason})"
         for key, reason in _UNSUPPORTED_ADAPTER_FEATURES.items()
-        if (config.get(key) is not None and config.get(key) != []
-            if key in layer_keys else config.get(key))
+        if (config.get(key) is not None and config.get(key) != [] if key in
+            layer_keys else config.get(key))
     ]
     if config.get("bias", "none") != "none":
         unsupported.append(
@@ -818,9 +818,10 @@ def _emit_lora_group_plugins(graph: gs.Graph, members) -> int:
                             "num_targets": np.int32(len(chunk)),
                             "inplace": np.int32(1)
                         },
-                        inputs=[m["output"] for m in chunk] +
-                        [chunk[0]["input"]] + [m["lora_a"] for m in chunk] +
-                        [m["lora_b"] for m in chunk],
+                        inputs=[m["output"]
+                                for m in chunk] + [chunk[0]["input"]] +
+                        [m["lora_a"]
+                         for m in chunk] + [m["lora_b"] for m in chunk],
                         outputs=[m["final_output"] for m in chunk]))
             nodes += 1
             for member in chunk:
@@ -883,9 +884,10 @@ def insert_lora_and_save(onnx_dir: str,
         info for info in eligible
         if stem_matches_targets(_lora_stem(info.name), lora_targets)
     ]
-    logger.info("Inserting %d LoRA branches (%d eligible GEMMs skipped by "
-                "--lora-targets)", len(gemm_infos),
-                len(eligible) - len(gemm_infos))
+    logger.info(
+        "Inserting %d LoRA branches (%d eligible GEMMs skipped by "
+        "--lora-targets)", len(gemm_infos),
+        len(eligible) - len(gemm_infos))
     if not gemm_infos:
         raise ValueError(
             "LoRA insertion found no eligible linear layers in model.onnx; "

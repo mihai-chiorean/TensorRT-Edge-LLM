@@ -471,10 +471,12 @@ def test_int8_transport_writes_codes_and_per_column_scales(tmp_path):
     for name, weight in reference.items():
         codes, scale = tensors[name], tensors[name + "_scale"]
         assert codes.dtype == torch.int8 and codes.shape == weight.shape
-        assert scale.dtype == torch.float16 and scale.shape == (weight.shape[-1], )
+        assert scale.dtype == torch.float16 and scale.shape == (
+            weight.shape[-1], )
         dequant = (codes.float() * scale.float()).half().float()
         # Rounding to the code grid, then the runtime's FP16 rounding.
-        assert torch.all((dequant - weight.float()).abs() <= scale.float() / 2 +
+        assert torch.all((dequant -
+                          weight.float()).abs() <= scale.float() / 2 +
                          weight.float().abs() * 2.0**-10 + 1e-7)
     record = json.loads((tmp_path / "int8" / "config.json").read_text())
     processing = record["edgellm_lora_processing"]

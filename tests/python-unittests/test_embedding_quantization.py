@@ -475,8 +475,7 @@ def _gemma4_model_32():
                            embed_tokens=SimpleNamespace(weight=embedding))
 
 
-def test_runtime_artifact_writer_exports_int4_embedding(
-        tmp_path, monkeypatch):
+def test_runtime_artifact_writer_exports_int4_embedding(tmp_path, monkeypatch):
     checkpoint_utils = _writer_under_test(monkeypatch)
     out_dir = tmp_path / "artifacts"
 

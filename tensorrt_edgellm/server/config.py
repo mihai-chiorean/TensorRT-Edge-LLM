@@ -413,29 +413,51 @@ class ModelConfig:
 
     def llm_kwargs(self) -> Dict[str, Any]:
         return {
-            "model": self.model,
-            "cache_dir": self.cache_dir,
-            "engine_cache_max_size_gb": self.engine_cache_max_size_gb,
-            "clear_engine_cache": self.clear_engine_cache,
-            "max_input_len": self.max_input_len,
-            "max_batch_size": self.max_batch_size,
-            "max_kv_cache_capacity": self.max_kv_cache_capacity,
-            "max_spec_verify_tokens": self.max_spec_verify_tokens,
-            "max_spec_draft_tokens": self.max_spec_draft_tokens,
-            "max_image_tokens": self.max_image_tokens,
-            "max_image_tokens_per_image": self.max_image_tokens_per_image,
-            "draft_top_k": self.draft_top_k,
-            "draft_step": self.draft_step,
-            "proposal_tokens": self.proposal_tokens,
-            "verify_tokens": self.verify_tokens,
-            "speculative_config": self.speculative_config,
-            "context_cache_config": self.context_cache_config,
-            "ple_config": self.ple_config,
-            "enable_in_flight_batching": self.enable_in_flight_batching,
-            "require_cuda_graphs": self.require_cuda_graphs,
+            "model":
+            self.model,
+            "cache_dir":
+            self.cache_dir,
+            "engine_cache_max_size_gb":
+            self.engine_cache_max_size_gb,
+            "clear_engine_cache":
+            self.clear_engine_cache,
+            "max_input_len":
+            self.max_input_len,
+            "max_batch_size":
+            self.max_batch_size,
+            "max_kv_cache_capacity":
+            self.max_kv_cache_capacity,
+            "max_spec_verify_tokens":
+            self.max_spec_verify_tokens,
+            "max_spec_draft_tokens":
+            self.max_spec_draft_tokens,
+            "max_image_tokens":
+            self.max_image_tokens,
+            "max_image_tokens_per_image":
+            self.max_image_tokens_per_image,
+            "draft_top_k":
+            self.draft_top_k,
+            "draft_step":
+            self.draft_step,
+            "proposal_tokens":
+            self.proposal_tokens,
+            "verify_tokens":
+            self.verify_tokens,
+            "speculative_config":
+            self.speculative_config,
+            "context_cache_config":
+            self.context_cache_config,
+            "ple_config":
+            self.ple_config,
+            "enable_in_flight_batching":
+            self.enable_in_flight_batching,
+            "require_cuda_graphs":
+            self.require_cuda_graphs,
             **self.ifb_scheduling_kwargs(),
-            "lora_adapters": list(self.lora_adapters),
-            "lora_verify": self.lora_verify,
+            "lora_adapters":
+            list(self.lora_adapters),
+            "lora_verify":
+            self.lora_verify,
             "allow_unverified_lora_adapters":
             self.allow_unverified_lora_adapters,
         }

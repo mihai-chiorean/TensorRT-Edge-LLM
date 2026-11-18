@@ -130,8 +130,10 @@ async def health(request: Request):
         "context_cache": context_cache,
         "engine": engine,
         "lora": {
-            "adapters": lora_info() if lora_info is not None else [],
-            "max_lora_rank": getattr(client.llm, "max_lora_rank", 0),
+            "adapters":
+            lora_info() if lora_info is not None else [],
+            "max_lora_rank":
+            getattr(client.llm, "max_lora_rank", 0),
             "base_identity": (client.llm.lora_base_verification() if hasattr(
                 client.llm, "lora_base_verification") else None),
         },

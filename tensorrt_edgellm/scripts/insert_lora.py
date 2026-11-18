@@ -61,8 +61,9 @@ def main(argv=None, *, prog="tensorrt-edgellm-insert-lora") -> None:
         "--lora-group-plugin",
         "--lora_group_plugin",
         action="store_true",
-        help=("Emit grouped, in-place LoraGroupPlugin nodes instead of "
-              "MatMul/MatMul/Add branches (needs the matching plugin library)."))
+        help=(
+            "Emit grouped, in-place LoraGroupPlugin nodes instead of "
+            "MatMul/MatMul/Add branches (needs the matching plugin library)."))
 
     args = parser.parse_args(argv)
     from tensorrt_edgellm.lora_targets import parse_lora_targets

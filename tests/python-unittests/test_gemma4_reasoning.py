@@ -21,10 +21,9 @@ import pytest
 from tensorrt_edgellm.server.config import parse_server_config
 from tensorrt_edgellm.server.parsing import tool_calling
 from tensorrt_edgellm.server.parsing.reasoning import (REASONING_PARSERS,
-                                                   Gemma4ReasoningParser)
-from tensorrt_edgellm.server.parsing.tool_calling import (parse_assistant_output,
-                                                      stream_assistant_output,
-                                                      validate_tool_request)
+                                                       Gemma4ReasoningParser)
+from tensorrt_edgellm.server.parsing.tool_calling import (
+    parse_assistant_output, stream_assistant_output, validate_tool_request)
 
 _THOUGHT = "<|channel>thought\nCheck the weather.\nUse the tool.<channel|>"
 _CALL = '<|tool_call>call:weather{location:<|"|>Paris<|"|>}<tool_call|>'

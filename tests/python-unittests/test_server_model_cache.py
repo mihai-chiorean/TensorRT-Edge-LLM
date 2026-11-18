@@ -389,7 +389,9 @@ def test_prepare_model_serves_prebuilt_bundle_without_building(
     def _fail(*_args, **_kwargs):
         raise AssertionError("the builder must not run for a prebuilt bundle")
 
-    monkeypatch.setattr("tensorrt_edgellm.builder.cli.main", _fail, raising=False)
+    monkeypatch.setattr("tensorrt_edgellm.builder.cli.main",
+                        _fail,
+                        raising=False)
     prepared = engine_build.prepare_model(str(bundle), str(tmp_path / "cache"))
     assert prepared.prebuilt
     assert not prepared.built
@@ -721,8 +723,9 @@ def test_llm_loads_prebuilt_engine_tree_without_checkpoint(
     (bundle / "visual").mkdir()
     (bundle / "visual" / "visual.engine").touch()
 
-    monkeypatch.setattr("tensorrt_edgellm.server.runtime.engine._import_runtime",
-                        lambda: _FakeBindings)
+    monkeypatch.setattr(
+        "tensorrt_edgellm.server.runtime.engine._import_runtime",
+        lambda: _FakeBindings)
     llm = LLM(model=str(bundle), cache_dir=str(tmp_path / "cache"))
     assert llm.model_id == "engines"
     assert llm.model_dir == str(bundle / "llm")
@@ -742,8 +745,9 @@ def test_load_model_keeps_prebuilt_tree_root(tmp_path, monkeypatch):
     (bundle / "visual").mkdir()
     (bundle / "visual" / "visual.engine").touch()
 
-    monkeypatch.setattr("tensorrt_edgellm.server.runtime.engine._import_runtime",
-                        lambda: _FakeBindings)
+    monkeypatch.setattr(
+        "tensorrt_edgellm.server.runtime.engine._import_runtime",
+        lambda: _FakeBindings)
     llm = load_model(model=str(bundle), cache_dir=str(tmp_path / "cache"))
     assert llm.bundle_dir == str(bundle)
     assert llm.bundle_layout.visual_dir == str(bundle / "visual")
@@ -818,8 +822,9 @@ def _load_mtp(tmp_path, monkeypatch, **kwargs):
     from tensorrt_edgellm.server.runtime.engine import load_model
 
     bundle = _prebuilt_gemma4_mtp_tree(tmp_path / "engines")
-    monkeypatch.setattr("tensorrt_edgellm.server.runtime.engine._import_runtime",
-                        lambda: _FakeBindings)
+    monkeypatch.setattr(
+        "tensorrt_edgellm.server.runtime.engine._import_runtime",
+        lambda: _FakeBindings)
     return bundle, load_model(model=str(bundle),
                               cache_dir=str(tmp_path / "cache"),
                               **kwargs)
@@ -865,8 +870,9 @@ def test_prebuilt_speculative_bundle_rejects_another_method(
     _write_json(
         base_config,
         json.loads(base_config.read_text()) | {"spec_decode_type": "eagle3"})
-    monkeypatch.setattr("tensorrt_edgellm.server.runtime.engine._import_runtime",
-                        lambda: _FakeBindings)
+    monkeypatch.setattr(
+        "tensorrt_edgellm.server.runtime.engine._import_runtime",
+        lambda: _FakeBindings)
     with pytest.raises(ValueError, match="compiled bundle uses 'eagle3'"):
         load_model(model=str(bundle),
                    cache_dir=str(tmp_path / "cache"),
@@ -878,8 +884,9 @@ def test_prebuilt_vanilla_bundle_rejects_a_speculative_method(
     from tensorrt_edgellm.server.runtime.engine import load_model
 
     bundle = _prebuilt_text_tree(tmp_path / "engines")
-    monkeypatch.setattr("tensorrt_edgellm.server.runtime.engine._import_runtime",
-                        lambda: _FakeBindings)
+    monkeypatch.setattr(
+        "tensorrt_edgellm.server.runtime.engine._import_runtime",
+        lambda: _FakeBindings)
     with pytest.raises(ValueError, match="no spec_base/spec_draft"):
         load_model(model=str(bundle),
                    cache_dir=str(tmp_path / "cache"),
@@ -887,7 +894,8 @@ def test_prebuilt_vanilla_bundle_rejects_a_speculative_method(
 
 
 def test_prebuilt_gemma4_mtp_selects_gemma4_parsers(tmp_path):
-    from tensorrt_edgellm.server.parsing.tool_calling import _parser_name_for_model
+    from tensorrt_edgellm.server.parsing.tool_calling import \
+        _parser_name_for_model
 
     bundle = _prebuilt_gemma4_mtp_tree(tmp_path / "engines")
     assert _parser_name_for_model(str(bundle / "llm")) == "gemma4"
@@ -921,8 +929,9 @@ def test_prebuilt_tree_capabilities_read_the_nested_engine_config(
                 "max_kv_cache_capacity": 16384,
             }
         })
-    monkeypatch.setattr("tensorrt_edgellm.server.runtime.engine._import_runtime",
-                        lambda: _FakeBindings)
+    monkeypatch.setattr(
+        "tensorrt_edgellm.server.runtime.engine._import_runtime",
+        lambda: _FakeBindings)
     llm = LLM(model=str(bundle), cache_dir=str(tmp_path / "cache"))
     capabilities = _capabilities_for(llm)
     assert capabilities.max_input_len == 8192
@@ -957,8 +966,9 @@ def test_prebuilt_paired_bundle_takes_a_model_free_speculative_config(
     _write_json(
         base_config,
         json.loads(base_config.read_text()) | {"spec_decode_type": "eagle3"})
-    monkeypatch.setattr("tensorrt_edgellm.server.runtime.engine._import_runtime",
-                        lambda: _FakeBindings)
+    monkeypatch.setattr(
+        "tensorrt_edgellm.server.runtime.engine._import_runtime",
+        lambda: _FakeBindings)
     llm = load_model(model=str(bundle),
                      cache_dir=str(tmp_path / "cache"),
                      speculative_config={
