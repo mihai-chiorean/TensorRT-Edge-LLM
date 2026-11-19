@@ -590,6 +590,110 @@ TEST_F(MelExtractionTest, StaticTimePaddingPinsTheFrameCountInBothDirections)
     EXPECT_EQ(truncated.getShape()[1], kStaticFrames);
 }
 
+// A caller that already holds a clip's encoder output still has to lay out its
+// placeholder tokens, and asks for the frame count instead of extracting. One
+// frame of disagreement shifts every token after the clip, so the count is
+// checked against extraction around each hop and window boundary.
+//
+// Given every provider's extractor and lengths on both sides of those boundaries
+// When the frame count is asked for and the same audio is extracted
+// Then the two agree
+TEST_F(MelExtractionTest, OutputFramesMatchesWhatExtractionProduces)
+{
+    std::vector<MelExtractor> extractors;
+    extractors.push_back(makeWhisperExtractor());
+    extractors.push_back(makeGemma4AudioExtractor());
+    extractors.push_back(makeParakeetExtractor());
+    extractors.push_back(makeNemotronAsrExtractor());
+
+    for (auto& extractor : extractors)
+    {
+        MelExtractorConfig const& config = extractor.config();
+        int64_t const timeAxis = config.layout == MelLayout::kMelTime ? 1 : 0;
+        std::vector<int32_t> lengths{1, 2, config.hopLength - 1, config.hopLength, config.hopLength + 1,
+            config.winLength - 1, config.winLength, config.winLength + 1, config.winLength + 2, config.nFFT - 1,
+            config.nFFT, config.nFFT + 1, 10 * config.hopLength, 10 * config.hopLength + config.winLength / 2,
+            10 * config.hopLength + config.winLength / 2 + 1, kSampleRate, kSampleRate + 1, 166960};
+        for (int32_t const samples : lengths)
+        {
+            Tensor mel;
+            ASSERT_TRUE(extractor.extract(makeTone(1000.0F, samples), mel)) << config.name << " " << samples;
+            EXPECT_EQ(extractor.outputFrames(samples), mel.getShape()[timeAxis]) << config.name << " " << samples;
+        }
+        EXPECT_EQ(extractor.outputFrames(0), 0) << config.name;
+    }
+}
+
+// The comparison above cannot see an error in the arithmetic that extraction
+// and the frame count share, so Gemma 4's counts are also pinned to values
+// worked out by hand: frames = (samples + 160 - 321) / 160 + 1, with a floor of
+// one. 800 and 801 samples sit on either side of a frame, which is also a step
+// in the encoder's four-fold subsampled token count.
+//
+// Given Gemma 4's extractor and lengths around its first frames and a later step
+// When the frame count is asked for and the same audio is extracted
+// Then both give the hand-derived count
+TEST_F(MelExtractionTest, OutputFramesForGemma4MatchesHandDerivedCounts)
+{
+    MelExtractor extractor = makeGemma4AudioExtractor();
+    std::vector<std::pair<int32_t, int32_t>> const expected{
+        {1, 1}, {160, 1}, {161, 1}, {320, 1}, {321, 2}, {800, 4}, {801, 5}, {960, 5}, {961, 6}, {166960, 1043}};
+
+    for (auto const& [samples, frames] : expected)
+    {
+        Tensor mel;
+        ASSERT_TRUE(extractor.extract(makeTone(1000.0F, samples), mel)) << samples;
+        EXPECT_EQ(mel.getShape()[1], frames) << samples;
+        EXPECT_EQ(extractor.outputFrames(samples), frames) << samples;
+    }
+}
+
+// Left-aligned framing adds no padding before the frames are counted, which no
+// provider's extractor exercises.
+//
+// Given Gemma 4's extractor switched to left-aligned framing
+// When the frame count is asked for and the same audio is extracted
+// Then the two agree, and one second of audio gives (16000 - 320) / 160 + 1 frames
+TEST_F(MelExtractionTest, OutputFramesMatchesExtractionUnderLeftAlignedFraming)
+{
+    MelExtractorConfig config = makeGemma4AudioExtractor().config();
+    config.framePadding = FramePadding::kLeftAlignedZero;
+    MelExtractor extractor{config};
+
+    for (int32_t const samples : {1, config.winLength - 1, config.winLength, config.winLength + config.hopLength - 1,
+             config.winLength + config.hopLength, kSampleRate})
+    {
+        Tensor mel;
+        ASSERT_TRUE(extractor.extract(makeTone(1000.0F, samples), mel)) << samples;
+        EXPECT_EQ(extractor.outputFrames(samples), mel.getShape()[1]) << samples;
+    }
+    EXPECT_EQ(extractor.outputFrames(kSampleRate), 99);
+}
+
+// Static padding fixes the output length whatever the audio length is, so the
+// frame count has to report the padded length rather than the computed one.
+//
+// Given an extractor with a static length and audio shorter and longer than it
+// When the frame count is asked for and the same audio is extracted
+// Then both give the static length
+TEST_F(MelExtractionTest, OutputFramesReportsTheStaticLengthUnderStaticPadding)
+{
+    constexpr int32_t kStaticFrames{150};
+
+    MelExtractorConfig config = makeWhisperExtractor().config();
+    config.timePadding = TimePadding::kStaticPad;
+    config.staticTimeLength = kStaticFrames;
+    MelExtractor extractor{config};
+
+    for (int32_t const hops : {50, 400})
+    {
+        Tensor mel;
+        ASSERT_TRUE(extractor.extract(makeTone(1000.0F, hops * config.hopLength), mel)) << hops;
+        EXPECT_EQ(extractor.outputFrames(hops * config.hopLength), mel.getShape()[1]) << hops;
+        EXPECT_EQ(extractor.outputFrames(hops * config.hopLength), kStaticFrames) << hops;
+    }
+}
+
 // The extractor cannot resample; the caller decodes at the rate it was built
 // for. Extracting anyway would shift every frequency by the rate ratio, which
 // is a plausible-looking spectrogram of the wrong audio.

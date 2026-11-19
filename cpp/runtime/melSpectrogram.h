@@ -230,6 +230,11 @@ public:
     //! \return true on success, false on bad input / config mismatch.
     bool extract(AudioPCM const& pcm, Tensor& out);
 
+    //! Time dimension of the tensor ``extract()`` produces for ``numSamples``
+    //! samples, without extracting. 0 where ``extract()`` fails for the length
+    //! alone (no samples, or ``kStaticPad`` without a static length).
+    int32_t outputFrames(int64_t numSamples) const noexcept;
+
     MelExtractorConfig const& config() const noexcept
     {
         return mConfig;

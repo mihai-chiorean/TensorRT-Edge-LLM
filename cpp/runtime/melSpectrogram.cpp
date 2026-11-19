@@ -301,6 +301,49 @@ std::vector<float> buildMelFilterBank(int32_t sampleRate, int32_t nFFT, int32_t 
     return filter;
 }
 
+//! Samples the framing loop reads once ``cfg.framePadding`` is applied to ``numSamples`` samples.
+int32_t paddedSampleCount(MelExtractorConfig const& cfg, int32_t numSamples) noexcept
+{
+    if (cfg.framePadding == FramePadding::kSemicausalZero)
+    {
+        return numSamples + cfg.winLength / 2;
+    }
+    if (cfg.framePadding == FramePadding::kCenterReflect || cfg.framePadding == FramePadding::kCenterZero)
+    {
+        return numSamples + 2 * (cfg.nFFT / 2);
+    }
+    return numSamples;
+}
+
+//! Frames computed from ``srcLen`` padded samples, before any static time padding.
+//!
+//! The frame count formula depends on the framing convention.
+//!
+//!  - Centred (Whisper / Parakeet): the FFT buffer covers ``nFFT`` source
+//!    samples, so ``nFrames = (srcLen - nFFT) / hop + 1``.
+//!  - Left-aligned (unfold + rfft(n=nFFT)): each frame covers only
+//!    ``winLen`` source samples (the tail of the FFT buffer is zero), so
+//!    ``nFrames = (srcLen - winLen) / hop + 1``.
+int32_t computedFrameCount(MelExtractorConfig const& cfg, int32_t srcLen) noexcept
+{
+    int32_t frameSpanSamples = cfg.windowCentredInFft ? cfg.nFFT : cfg.winLength;
+    if (cfg.framePadding == FramePadding::kSemicausalZero)
+    {
+        // HF Gemma4 unfolds frames of winLength+1 samples (the extra sample
+        // only feeds the preemphasis filter and is dropped before the window).
+        frameSpanSamples = cfg.winLength + 1;
+    }
+    int32_t nFrames = (srcLen >= frameSpanSamples) ? ((srcLen - frameSpanSamples) / cfg.hopLength + 1) : 1;
+    // HF Whisper / Parakeet apply ``stft[..., :-1]`` before mel / log / post-norm.
+    // Drop the trailing frame so post-normalize statistics (max-clamp, per-feature
+    // mean/std) match HF byte-for-byte instead of drifting by O(1e-1) on the edge.
+    if (cfg.dropLastStftFrame && nFrames > 1)
+    {
+        nFrames -= 1;
+    }
+    return nFrames;
+}
+
 } // namespace
 
 struct MelExtractor::Impl
@@ -359,6 +402,19 @@ std::vector<float> const& MelExtractor::window() const noexcept
 {
     static std::vector<float> const kEmpty;
     return mImpl ? mImpl->windowFn : kEmpty;
+}
+
+int32_t MelExtractor::outputFrames(int64_t numSamples) const noexcept
+{
+    if (numSamples <= 0)
+    {
+        return 0;
+    }
+    if (mConfig.timePadding == TimePadding::kStaticPad)
+    {
+        return std::max(mConfig.staticTimeLength, 0);
+    }
+    return computedFrameCount(mConfig, paddedSampleCount(mConfig, static_cast<int32_t>(numSamples)));
 }
 
 bool MelExtractor::extract(AudioPCM const& pcm, Tensor& out)
@@ -447,28 +503,7 @@ bool MelExtractor::extract(AudioPCM const& pcm, Tensor& out)
         srcLen = numSamples + 2 * pad;
     }
 
-    // Frame count formula depends on framing convention.
-    //
-    //  - Centred (Whisper / Parakeet): the FFT buffer covers ``nFFT`` source
-    //    samples, so ``nFrames = (srcLen - nFFT) / hop + 1``.
-    //  - Left-aligned (unfold + rfft(n=nFFT)): each frame covers only
-    //    ``winLen`` source samples (the tail of the FFT buffer is zero), so
-    //    ``nFrames = (srcLen - winLen) / hop + 1``.
-    int32_t frameSpanSamples = mConfig.windowCentredInFft ? nFFT : winLen;
-    if (mConfig.framePadding == FramePadding::kSemicausalZero)
-    {
-        // HF Gemma4 unfolds frames of winLength+1 samples (the extra sample
-        // only feeds the preemphasis filter and is dropped before the window).
-        frameSpanSamples = winLen + 1;
-    }
-    int32_t nFrames = (srcLen >= frameSpanSamples) ? ((srcLen - frameSpanSamples) / hop + 1) : 1;
-    // HF Whisper / Parakeet apply ``stft[..., :-1]`` before mel / log / post-norm.
-    // Drop the trailing frame so post-normalize statistics (max-clamp, per-feature
-    // mean/std) match HF byte-for-byte instead of drifting by O(1e-1) on the edge.
-    if (mConfig.dropLastStftFrame && nFrames > 1)
-    {
-        nFrames -= 1;
-    }
+    int32_t const nFrames = computedFrameCount(mConfig, srcLen);
 
     int32_t outFrames = nFrames;
     if (mConfig.timePadding == TimePadding::kStaticPad)
