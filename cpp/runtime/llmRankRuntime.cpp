@@ -1833,7 +1833,7 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
     DecodingStrategy& decodingStrategy = *generation->strategy;
     bool const enableSpecDecode = decodingStrategy.isSpeculative();
     generation->enableSpecDecode = enableSpecDecode;
-    // DSpark implements the paper-equivalent probabilistic verifier and can keep non-greedy sampling params.
+    // DSpark, DFlash2 and Gemma4 MTP verify sampled requests exactly and keep non-greedy sampling params.
     // Other speculative decoders still run greedy-compatible verification.
     bool const hasNonGreedySampling = shouldUseNonGreedySampling(request.temperature, request.topK, request.topP);
     DecodingStrategyCapabilities const decodingCapabilities = decodingStrategy.capabilities();
@@ -2478,15 +2478,6 @@ bool LLMRankRuntime::validateRequestConfig(LLMGenerationRequest const& request)
         LOG_ERROR(
             "disable_spec_decode is not supported by a Gemma4 MTP verification engine. Use the matched assistant, or "
             "build a standalone target engine for target-only inference.");
-        return false;
-    }
-    bool const gemma4MtpTree = mDeployment.specDecodeMode() == SpecDecodeMode::kGemma4MTP
-        && mDeployment.specConfig.has_value() && mDeployment.specConfig->draftingTopK > 1;
-    if (gemma4MtpTree && shouldUseNonGreedySampling(request.temperature, request.topK, request.topP))
-    {
-        LOG_ERROR(
-            "Gemma4 MTP tree decoding supports greedy requests only. Build a standalone target engine for "
-            "non-greedy sampling.");
         return false;
     }
     if (hasGuidedDecoding(request))
@@ -3551,7 +3542,7 @@ bool LLMRankRuntime::runBaseModelPrefill(
     }
 
     // Sampling from the prefill stage logits follows the same policy as vanilla decoding.
-    // DFlash2 and DSpark keep non-greedy params; other speculative decoders are
+    // DFlash2, DSpark and Gemma4 MTP keep non-greedy params; other speculative decoders are
     // normalized to greedy before decoding.
     check::check(mSamplingIndices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
     if (shouldUseNonGreedySampling(context.temperature, context.topK, context.topP))

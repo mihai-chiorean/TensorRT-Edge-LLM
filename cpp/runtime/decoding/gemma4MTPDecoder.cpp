@@ -34,6 +34,7 @@
 #include "runtime/decoding/decoderUtils.h"
 #include "runtime/decoding/guidedDecoder.h"
 #include "runtime/decoding/logitBias.h"
+#include "runtime/decoding/requestStableRng.h"
 #include "runtime/state/pipelineIO.h"
 #include "sampler/sampling.h"
 
@@ -158,6 +159,15 @@ Gemma4MTPDecoder::Gemma4MTPDecoder(DecodingRuntimeContext& runtime, SpecDecodeDr
         "Gemma4MTP::hostAcceptedTokenIds");
     mArgmaxScratch = Tensor(
         {maxRuntimeBatchSize * maxAcceptDepth}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "Gemma4MTP::argmax");
+    int32_t const maxVerifyRows = maxRuntimeBatchSize * std::max(draftingConfig.verifySize, maxAcceptDepth);
+    mSampledVerifyTokenIds
+        = Tensor({maxVerifyRows, 1}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "Gemma4MTP::sampledVerifyTokenIds");
+    mVerifyUniforms
+        = Tensor({maxVerifyRows}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "Gemma4MTP::verifyUniforms");
+    mVerifyRngInputs
+        = Tensor({2, maxRuntimeBatchSize}, DeviceType::kGPU, nvinfer1::DataType::kINT64, "Gemma4MTP::verifyRngInputs");
+    mHostVerifyRngInputs = Tensor(
+        {2, maxRuntimeBatchSize}, DeviceType::kCPU, nvinfer1::DataType::kINT64, "Gemma4MTP::hostVerifyRngInputs");
     bool const pleHostResident = mRuntime.preprocess.gemma4Ple && mRuntime.preprocess.gemma4Ple->isHostResident();
     if (mRuntime.preprocess.embedding.isHostResident() || pleHostResident)
     {
@@ -203,13 +213,6 @@ DecodingKvHeadroom Gemma4MTPDecoder::requiredKvHeadroom() const
 
 bool Gemma4MTPDecoder::decodeStep(DecodingInferenceContext& context)
 {
-    if (mUseTree && ::trt_edgellm::shouldUseNonGreedySampling(context.temperature, context.topK, context.topP))
-    {
-        LOG_ERROR(
-            "Gemma4MTPDecoder: tree drafting supports greedy decoding only; build a standalone target engine "
-            "for non-greedy sampling.");
-        return false;
-    }
     NVTX_SCOPED_RANGE(nvtx_gemma4_mtp_decode, "Gemma4MTPDecoder::decodeStep", nvtx_colors::GREEN);
     return runDraftProposal(context) && runBaseVerification(context) && acceptAndCommit(context)
         && updateNextSeed(context);
@@ -825,7 +828,27 @@ bool Gemma4MTPDecoder::acceptAndCommit(DecodingInferenceContext& context)
             activeBatchSize, verifySize, context.stream);
     }
 
-    if (mUseTree)
+    // Greedy requests keep the argmax accept below bit-for-bit. Sampled requests draw one target token per
+    // verify row and walk the same deterministic draft against those samples: a draft token survives iff the
+    // target sample at its parent equals it, and the first unmatched sample is emitted. With greedy (tree:
+    // distinct top-k) draft tokens this is exact speculative sampling of the target distribution.
+    bool const sampledVerify
+        = ::trt_edgellm::shouldUseNonGreedySampling(context.temperature, context.topK, context.topP);
+    if (sampledVerify)
+    {
+        sampleVerifyRows(context, verifySize);
+        if (mUseTree)
+        {
+            kernel::eagleAcceptFromRowTokens(mSampledVerifyTokenIds, mTreeTokenIds, mVerifyTreeMask, mAcceptedTokenIds,
+                mAcceptedTokenIndices, mAcceptLength, context.stream);
+        }
+        else
+        {
+            kernel::sequentialAcceptFromRowTokens(mSampledVerifyTokenIds, mVerifyTokenIds, mAcceptedTokenIds,
+                mAcceptLength, activeBatchSize, verifySize, context.stream);
+        }
+    }
+    else if (mUseTree)
     {
         check::check(mRuntime.base.pipelineIO.outputLogits.reshape({activeBatchSize * verifySize, vocabSize}),
             "Tensor reshape failed");
@@ -909,6 +932,65 @@ bool Gemma4MTPDecoder::acceptAndCommit(DecodingInferenceContext& context)
     }
 
     return true;
+}
+
+void Gemma4MTPDecoder::sampleVerifyRows(DecodingInferenceContext& context, int32_t verifySize)
+{
+    int32_t const activeBatchSize = context.activeBatchSize;
+    int32_t const vocabSize = mRuntime.deployment.base.outputVocabSize;
+    int32_t const rows = activeBatchSize * verifySize;
+
+    // Row (b, node) predicts the token at nextPosition(b) + depth(node) and uses the vanilla decoder's
+    // request-stable uniform for that position, so each emitted token consumes a fresh uniform.
+    check::check(mHostVerifyRngInputs.reshape({2, activeBatchSize}), "Tensor reshape failed");
+    check::check(mVerifyRngInputs.reshape({2, activeBatchSize}), "Tensor reshape failed");
+    auto* const hostRng = mHostVerifyRngInputs.dataPointer<int64_t>();
+    for (int32_t batch = 0; batch < activeBatchSize; ++batch)
+    {
+        uint64_t const position = requestStableNextAbsolutePosition(
+            context.rawBatchedInputIds[batch].size(), context.currentGenerateLengths[batch]);
+        hostRng[batch] = static_cast<int64_t>(context.samplingSeeds[batch]);
+        hostRng[activeBatchSize + batch] = static_cast<int64_t>(position);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(mVerifyRngInputs.rawPointer(), hostRng, 2 * activeBatchSize * sizeof(int64_t),
+        cudaMemcpyHostToDevice, context.stream));
+    auto const* const deviceRng = reinterpret_cast<uint64_t const*>(mVerifyRngInputs.dataPointer<int64_t>());
+    check::check(mVerifyUniforms.reshape({rows}), "Tensor reshape failed");
+    kernel::launchGemma4MTPVerifyUniforms(deviceRng, deviceRng + activeBatchSize,
+        mUseTree ? mVerifyTreeMask.dataPointer<int8_t>() : nullptr, mVerifyUniforms.dataPointer<float>(),
+        activeBatchSize, verifySize, context.stream);
+
+    check::check(mRuntime.base.pipelineIO.outputLogits.reshape({rows, vocabSize}), "Tensor reshape failed");
+    check::check(mSampledVerifyTokenIds.reshape({rows, 1}), "Tensor reshape failed");
+    int64_t const topK = std::min<int64_t>(context.topK, vocabSize);
+    if (topK > 0 && topK <= kernel::kGemma4MTPMaxSampleTopK)
+    {
+        // Top-k (+ top-p) requests, the server default: radix-select sampler, same distribution and walk as
+        // the generic top-k sampler at a fraction of its cost on B * verifySize full-vocabulary rows.
+        kernel::launchGemma4MTPSampleTopKRows(mRuntime.base.pipelineIO.outputLogits.dataPointer<float>(), rows,
+            vocabSize, static_cast<int32_t>(topK), context.temperature, context.topP,
+            mVerifyUniforms.dataPointer<float>(), mSampledVerifyTokenIds.dataPointer<int32_t>(), context.stream);
+        return;
+    }
+    SamplingParams const params(rows, vocabSize, context.temperature, static_cast<int32_t>(context.topK), context.topP);
+    size_t const requiredWorkspace = getTopKtopPSamplingWorkspaceSize(rows, vocabSize, params);
+    Tensor* workspace = &mRuntime.sampling.workspace;
+    if (static_cast<size_t>(workspace->getMemoryCapacity()) < requiredWorkspace)
+    {
+        if (static_cast<size_t>(mVerifySamplingWorkspace.getMemoryCapacity()) < requiredWorkspace)
+        {
+            // The previous workspace may still be read by kernels queued on this stream.
+            CUDA_CHECK(cudaStreamSynchronize(context.stream));
+            mVerifySamplingWorkspace = Tensor({static_cast<int64_t>(requiredWorkspace)}, DeviceType::kGPU,
+                nvinfer1::DataType::kINT8, "Gemma4MTP::verifySamplingWorkspace");
+            LOG_INFO(
+                "Gemma4 MTP sampled verification workspace grown to %zu bytes (%d rows).", requiredWorkspace, rows);
+        }
+        workspace = &mVerifySamplingWorkspace;
+    }
+    // The uniforms override the Philox stream, so the seed/offset arguments are unused here.
+    topKtopPSamplingFromLogits(mRuntime.base.pipelineIO.outputLogits, mSampledVerifyTokenIds, params, *workspace,
+        context.stream, /*philoxSeed=*/0, /*philoxOffset=*/0, &mVerifyUniforms);
 }
 
 int32_t const* Gemma4MTPDecoder::tokenIdsForHostTables(

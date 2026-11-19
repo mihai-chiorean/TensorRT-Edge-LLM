@@ -1140,15 +1140,22 @@ def _gemma4_mtp_request_llm(monkeypatch):
 _HELLO = [{"role": "user", "content": "hello"}]
 
 
-def test_gemma4_mtp_serves_sampled_requests_greedily(monkeypatch, caplog):
+def test_gemma4_mtp_serves_sampled_requests_with_their_parameters(
+        monkeypatch, caplog):
     llm = _gemma4_mtp_request_llm(monkeypatch)
     with caplog.at_level("WARNING", logger="edgellm.server"):
-        request = llm._make_generation_request(
+        first = llm._make_generation_request(
             _HELLO, SamplingParams(temperature=0.7, top_p=0.9, top_k=50))
-        llm._make_generation_request(_HELLO, SamplingParams(temperature=0.7))
-    assert (request.temperature, request.top_p, request.top_k) == (0.0, 1.0, 1)
-    assert sum("verifies greedily" in record.message
-               for record in caplog.records) == 1
+        second = llm._make_generation_request(
+            _HELLO, SamplingParams(temperature=0.7, top_p=0.9, top_k=50))
+        seeded = llm._make_generation_request(
+            _HELLO, SamplingParams(temperature=0.7, seed=1234))
+    assert (first.temperature, first.top_p, first.top_k) == (0.7, 0.9, 50)
+    assert not caplog.records
+    first_seed = first.requests[0].sampling_seed
+    assert first_seed is not None
+    assert first_seed != second.requests[0].sampling_seed
+    assert seeded.requests[0].sampling_seed == 1234
 
 
 def test_gemma4_mtp_keeps_greedy_and_invalid_temperatures(monkeypatch):
@@ -1156,6 +1163,7 @@ def test_gemma4_mtp_keeps_greedy_and_invalid_temperatures(monkeypatch):
     greedy = llm._make_generation_request(_HELLO,
                                           SamplingParams(temperature=0.0))
     assert (greedy.temperature, greedy.top_k) == (0.0, 1)
+    assert greedy.requests[0].sampling_seed is None
     negative = llm._make_generation_request(_HELLO,
                                             SamplingParams(temperature=-1.0))
     assert negative.temperature == -1.0

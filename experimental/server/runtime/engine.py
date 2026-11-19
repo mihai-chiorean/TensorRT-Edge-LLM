@@ -40,6 +40,7 @@ import json
 import logging
 import math
 import os
+import secrets
 import sys
 import threading
 import time
@@ -1791,10 +1792,12 @@ class LLM:
                                          params: SamplingParams) -> None:
         """Hold a request to what a Gemma 4 MTP verification engine serves.
 
-        The base engine cannot decode without its draft, and verification is
-        argmax-only: the linear decoder silently decodes greedily and the tree
-        decoder refuses sampled requests. Sampled requests are therefore
-        served greedily on both shapes, with one warning per process.
+        The base engine cannot decode without its draft, so target-only
+        decoding is refused. Sampled requests keep their parameters: the
+        verifier samples each verify row and walks the draft against those
+        samples. Its randomness is a pure function of the request seed and
+        token position, so a sampled request without a seed gets a fresh
+        random one; otherwise every such request would replay the same draw.
         """
         if params.disable_spec_decode:
             raise ValueError(
@@ -1805,15 +1808,9 @@ class LLM:
         if (params.temperature < GREEDY_TEMPERATURE_EPSILON
                 or params.top_k == GREEDY_TOP_K):
             return
-        if not getattr(self, "_warned_spec_greedy", False):
-            self._warned_spec_greedy = True
-            logger.warning(
-                "Gemma 4 MTP verifies greedily: sampled requests "
-                "(temperature=%g, top_p=%g, top_k=%d) are served with greedy "
-                "decoding", params.temperature, params.top_p, params.top_k)
-        request.temperature = 0.0
-        request.top_p = GREEDY_TOP_P
-        request.top_k = GREEDY_TOP_K
+        for row in request.requests:
+            if getattr(row, "sampling_seed", None) is None:
+                row.sampling_seed = secrets.randbits(63)
 
     def _count_prepared_prompt_tokens(self, request) -> Optional[int]:
         """Count tokens only for an explicit token-count API request."""

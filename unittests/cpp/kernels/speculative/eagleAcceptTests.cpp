@@ -18,14 +18,17 @@
 #include "common/checkMacros.h"
 #include "kernels/speculative/eagleAcceptKernels.h"
 #include "references.h"
+#include "sampler/sampling.h"
 #include "testUtils.h"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cuda_runtime.h>
 #include <functional>
 #include <gtest/gtest.h>
 #include <iomanip>
 #include <iostream>
+#include <random>
 #include <set>
 #include <vector>
 
@@ -958,4 +961,174 @@ TEST_F(EagleAcceptTest, VocabularyReductionLargeTokenIds)
             EXPECT_EQ(acceptedTokenIds[2], 32000) << "Token 2: reduced 0 -> full 32000";
         },
         vocabMappingTable);
+}
+
+// Sampled verification: one target sample per tree node, then the same tree walk. With deterministic
+// draft tokens the emitted tokens must follow the target distribution exactly. Every batch row is an
+// independent trial of the same tree and logits with its own uniforms.
+TEST_F(EagleAcceptTest, SampledTreeWalkEmitsTargetDistribution)
+{
+    constexpr int32_t trials = 4096;
+    constexpr int32_t numTokens = 4;
+    constexpr int32_t vocabSize = 6;
+    constexpr int32_t maxDepth = 3;
+    constexpr float temperature = 0.8F;
+
+    // Tree: root(node0, token 5) -> {node1 token 1, node2 token 2}; node1 -> node3 token 3.
+    std::vector<int32_t> const treeTokens{5, 1, 2, 3};
+    std::vector<int8_t> const treeMask{
+        1,
+        0,
+        0,
+        0, //
+        1,
+        1,
+        0,
+        0, //
+        1,
+        0,
+        1,
+        0, //
+        1,
+        1,
+        0,
+        1, //
+    };
+    std::vector<std::vector<float>> const rowLogits{
+        {0.0F, 1.0F, 0.6F, 0.2F, -0.5F, -1.0F}, // root: emits 1 (descend), 2 (descend) or a leaf token
+        {0.3F, -0.2F, 0.1F, 1.2F, 0.0F, -0.4F}, // node1: emits 3 (descend) or other
+        {0.5F, 0.5F, 0.0F, 0.0F, 0.0F, 0.0F},   // node2: leaf, bonus sample
+        {0.0F, 0.0F, 0.0F, 0.0F, 0.9F, 0.0F},   // node3: leaf, bonus sample
+    };
+
+    std::vector<int32_t> tokenIds;
+    std::vector<int8_t> mask;
+    std::vector<float> logits;
+    for (int32_t t = 0; t < trials; ++t)
+    {
+        tokenIds.insert(tokenIds.end(), treeTokens.begin(), treeTokens.end());
+        mask.insert(mask.end(), treeMask.begin(), treeMask.end());
+        for (auto const& row : rowLogits)
+        {
+            logits.insert(logits.end(), row.begin(), row.end());
+        }
+    }
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> uniform(0.0F, 1.0F);
+    std::vector<float> uniforms(trials * numTokens);
+    for (auto& u : uniforms)
+    {
+        u = uniform(rng);
+    }
+
+    int32_t const rows = trials * numTokens;
+    rt::Tensor logitsTensor({rows, vocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "logits");
+    rt::Tensor uniformsTensor({rows}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "uniforms");
+    rt::Tensor sampledTensor({rows, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "sampled");
+    rt::Tensor tokenIdsTensor({trials, numTokens}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "tokenIds");
+    rt::Tensor maskTensor({trials, numTokens, numTokens}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8, "mask");
+    rt::Tensor acceptedTokenIds({trials, maxDepth}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "accepted");
+    rt::Tensor acceptedIndices({trials, maxDepth}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "indices");
+    rt::Tensor acceptLength({trials}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "acceptLength");
+    copyHostToDevice(logitsTensor, logits);
+    copyHostToDevice(uniformsTensor, uniforms);
+    copyHostToDevice(tokenIdsTensor, tokenIds);
+    copyHostToDevice(maskTensor, mask);
+
+    SamplingParams const params(rows, vocabSize, temperature, /*topK=*/vocabSize, /*topP=*/1.0F);
+    rt::Tensor workspace({static_cast<int64_t>(getTopKtopPSamplingWorkspaceSize(rows, vocabSize, params))},
+        rt::DeviceType::kGPU, nvinfer1::DataType::kINT8, "workspace");
+    topKtopPSamplingFromLogits(logitsTensor, sampledTensor, params, workspace, stream, 0, 0, &uniformsTensor);
+    kernel::eagleAcceptFromRowTokens(
+        sampledTensor, tokenIdsTensor, maskTensor, acceptedTokenIds, acceptedIndices, acceptLength, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    auto const hostTokens = copyDeviceToHost<int32_t>(acceptedTokenIds);
+    auto const hostLengths = copyDeviceToHost<int32_t>(acceptLength);
+
+    auto softmax = [&](std::vector<float> const& row) {
+        std::vector<double> p(row.size());
+        double sum = 0.0;
+        for (size_t i = 0; i < row.size(); ++i)
+        {
+            p[i] = std::exp(static_cast<double>(row[i]) / temperature);
+            sum += p[i];
+        }
+        for (auto& v : p)
+        {
+            v /= sum;
+        }
+        return p;
+    };
+    auto const pRoot = softmax(rowLogits[0]);
+    auto const pNode1 = softmax(rowLogits[1]);
+
+    // First emitted token follows the root distribution; after emitting 1 the next follows node1's.
+    std::vector<int32_t> firstCounts(vocabSize, 0);
+    std::vector<int32_t> secondAfterOne(vocabSize, 0);
+    int32_t afterOne = 0;
+    for (int32_t t = 0; t < trials; ++t)
+    {
+        int32_t const first = hostTokens[t * maxDepth];
+        ++firstCounts[first];
+        bool const descends = first == 1 || first == 2;
+        EXPECT_EQ(hostLengths[t] >= 2, descends) << "trial " << t;
+        if (first == 1)
+        {
+            ++afterOne;
+            ++secondAfterOne[hostTokens[t * maxDepth + 1]];
+            EXPECT_EQ(hostLengths[t] == 3, hostTokens[t * maxDepth + 1] == 3) << "trial " << t;
+        }
+    }
+    for (int32_t v = 0; v < vocabSize; ++v)
+    {
+        double const expected = pRoot[v] * trials;
+        double const sigma = std::sqrt(trials * pRoot[v] * (1.0 - pRoot[v]));
+        EXPECT_NEAR(firstCounts[v], expected, 5.0 * sigma + 1.0) << "first token " << v;
+        double const expectedSecond = pNode1[v] * afterOne;
+        double const sigmaSecond = std::sqrt(afterOne * pNode1[v] * (1.0 - pNode1[v]));
+        EXPECT_NEAR(secondAfterOne[v], expectedSecond, 5.0 * sigmaSecond + 1.0) << "second token " << v;
+    }
+}
+
+// With per-row tokens equal to the rowwise argmax, the row-token walks reproduce the greedy accept.
+TEST_F(EagleAcceptTest, RowTokenWalksMatchGreedyAcceptOnArgmaxTokens)
+{
+    constexpr int32_t batchSize = 2;
+    constexpr int32_t verifyLen = 4;
+    constexpr int32_t vocabSize = 8;
+    std::vector<int32_t> const draft{7, 2, 3, 4, /**/ 7, 5, 1, 1};
+    std::vector<float> logits(batchSize * verifyLen * vocabSize, 0.0F);
+    std::vector<int32_t> const argmaxTokens{2, 3, 6, 0, /**/ 5, 4, 2, 3};
+    for (int32_t r = 0; r < batchSize * verifyLen; ++r)
+    {
+        logits[r * vocabSize + argmaxTokens[r]] = 3.0F;
+    }
+
+    rt::Tensor logitsTensor(
+        {batchSize * verifyLen, vocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "logits");
+    rt::Tensor draftTensor({batchSize, verifyLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "draft");
+    rt::Tensor rowTokens({batchSize * verifyLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "rowTokens");
+    rt::Tensor argmaxScratch({batchSize * verifyLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "scratch");
+    rt::Tensor greedyAccepted({batchSize, verifyLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "g");
+    rt::Tensor greedyLength({batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "gl");
+    rt::Tensor rowAccepted({batchSize, verifyLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "r");
+    rt::Tensor rowLength({batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "rl");
+    copyHostToDevice(logitsTensor, logits);
+    copyHostToDevice(draftTensor, draft);
+    copyHostToDevice(rowTokens, argmaxTokens);
+    CUDA_CHECK(cudaMemset(greedyAccepted.rawPointer(), 0, greedyAccepted.getMemoryCapacity()));
+    CUDA_CHECK(cudaMemset(rowAccepted.rawPointer(), 0, rowAccepted.getMemoryCapacity()));
+
+    kernel::sequentialAccept(logitsTensor, draftTensor, greedyAccepted, greedyLength, argmaxScratch, batchSize,
+        verifyLen, vocabSize, stream);
+    kernel::sequentialAcceptFromRowTokens(rowTokens, draftTensor, rowAccepted, rowLength, batchSize, verifyLen, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    auto const gl = copyDeviceToHost<int32_t>(greedyLength);
+    auto const rl = copyDeviceToHost<int32_t>(rowLength);
+    auto const ga = copyDeviceToHost<int32_t>(greedyAccepted);
+    auto const ra = copyDeviceToHost<int32_t>(rowAccepted);
+    EXPECT_EQ(gl, rl);
+    EXPECT_EQ(ga, ra);
+    EXPECT_EQ(gl[0], 3); // 2,3 match the draft; 6 mismatches 4 and is emitted.
+    EXPECT_EQ(gl[1], 2); // 5 matches; 4 mismatches 1 and is emitted.
 }

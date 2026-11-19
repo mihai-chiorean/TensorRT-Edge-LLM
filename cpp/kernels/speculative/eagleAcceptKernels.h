@@ -106,5 +106,38 @@ void sequentialAccept(rt::Tensor const& logits, rt::Tensor const& draftTokenIds,
     rt::Tensor& acceptLength, rt::Tensor& argmaxScratch, int32_t batchSize, int32_t verifyLen, int32_t vocabSize,
     cudaStream_t stream);
 
+/**
+ * @brief Linear-chain accept walk over target tokens the caller already selected per verify row.
+ *
+ * Same walk as sequentialAccept, with the rowwise argmax replaced by `rowTokens`. When the rows hold
+ * tokens sampled from the target distribution and the draft chain is deterministic, the walk is exact
+ * speculative sampling: a draft token is kept iff the target sample at its parent equals it, and the
+ * first mismatching (or the last) sample is emitted as the correction/bonus token.
+ *
+ * @param rowTokens Target token per verify row [batchSize * verifyLen] (INT32, GPU)
+ * @param draftTokenIds Draft/verify token IDs [batchSize, verifyLen] (INT32, GPU)
+ * @param acceptedTokenIds Output accepted token IDs [batchSize, verifyLen] (INT32, GPU)
+ * @param acceptLength Output accept length per batch [batchSize] (INT32, GPU)
+ */
+void sequentialAcceptFromRowTokens(rt::Tensor const& rowTokens, rt::Tensor const& draftTokenIds,
+    rt::Tensor& acceptedTokenIds, rt::Tensor& acceptLength, int32_t batchSize, int32_t verifyLen, cudaStream_t stream);
+
+/**
+ * @brief Tree accept walk over target tokens the caller already selected per tree node.
+ *
+ * Same walk as eagleAccept, with the rowwise top-1 replaced by `rowTokens`. Siblings in the draft tree
+ * carry distinct tokens, so a node's sample matches at most one child; with deterministic draft tokens
+ * the walk is exact speculative sampling.
+ *
+ * @param rowTokens Target token per tree node [batchSize * numTokens] (INT32, GPU, full vocabulary ids)
+ * @param tokenIds Draft tree token IDs [batchSize, numTokens] (INT32, GPU)
+ * @param attentionMask Tree attention mask [batchSize, numTokens, numTokens] (INT8, GPU)
+ * @param acceptedTokenIds Output accepted token IDs [batchSize, maxDepth] (INT32, GPU)
+ * @param acceptedLogitsIndices Output tree node index of each accepted token [batchSize, maxDepth] (INT32, GPU)
+ * @param acceptLength Output accept length per batch [batchSize] (INT32, GPU)
+ */
+void eagleAcceptFromRowTokens(rt::Tensor const& rowTokens, rt::Tensor const& tokenIds, rt::Tensor const& attentionMask,
+    rt::Tensor& acceptedTokenIds, rt::Tensor& acceptedLogitsIndices, rt::Tensor& acceptLength, cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm

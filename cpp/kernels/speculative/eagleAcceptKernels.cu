@@ -426,6 +426,56 @@ void sequentialAccept(rt::Tensor const& logits, rt::Tensor const& draftTokenIds,
     CUDA_CHECK(cudaGetLastError());
 }
 
+void sequentialAcceptFromRowTokens(rt::Tensor const& rowTokens, rt::Tensor const& draftTokenIds,
+    rt::Tensor& acceptedTokenIds, rt::Tensor& acceptLength, int32_t batchSize, int32_t verifyLen, cudaStream_t stream)
+{
+    check::check(rowTokens.getDeviceType() == rt::DeviceType::kGPU
+            && rowTokens.getDataType() == nvinfer1::DataType::kINT32
+            && rowTokens.getShape().volume() >= static_cast<int64_t>(batchSize) * verifyLen,
+        "rowTokens must be a GPU INT32 tensor with at least batchSize * verifyLen elements");
+    sequentialAcceptWalkKernel<<<batchSize, 1, 0, stream>>>(rowTokens.dataPointer<int32_t>(),
+        static_cast<int32_t const*>(draftTokenIds.rawPointer()), static_cast<int32_t*>(acceptedTokenIds.rawPointer()),
+        static_cast<int32_t*>(acceptLength.rawPointer()), verifyLen);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void eagleAcceptFromRowTokens(rt::Tensor const& rowTokens, rt::Tensor const& tokenIds, rt::Tensor const& attentionMask,
+    rt::Tensor& acceptedTokenIds, rt::Tensor& acceptedLogitsIndices, rt::Tensor& acceptLength, cudaStream_t stream)
+{
+    auto const tokenIdsShape = tokenIds.getShape();
+    auto const maskShape = attentionMask.getShape();
+    auto const acceptedTokenIdsShape = acceptedTokenIds.getShape();
+    check::check(tokenIdsShape.getNumDims() == 2 && maskShape.getNumDims() == 3
+            && acceptedTokenIdsShape.getNumDims() == 2 && acceptedLogitsIndices.getShape() == acceptedTokenIdsShape
+            && acceptLength.getShape().getNumDims() == 1,
+        "eagleAcceptFromRowTokens: invalid tensor ranks");
+    int32_t const batchSize = tokenIdsShape[0];
+    int32_t const numTokens = tokenIdsShape[1];
+    int32_t const maxDepth = acceptedTokenIdsShape[1];
+    check::check(maskShape[0] == batchSize && maskShape[1] == numTokens && maskShape[2] == numTokens
+            && acceptedTokenIdsShape[0] == batchSize && acceptLength.getShape()[0] == batchSize && maxDepth > 0
+            && maxDepth <= numTokens,
+        "eagleAcceptFromRowTokens: tensor shapes do not match");
+    check::check(rowTokens.getDeviceType() == rt::DeviceType::kGPU
+            && rowTokens.getDataType() == nvinfer1::DataType::kINT32
+            && rowTokens.getShape().volume() >= static_cast<int64_t>(batchSize) * numTokens,
+        "rowTokens must be a GPU INT32 tensor with at least batchSize * numTokens elements");
+    check::check(tokenIds.getDataType() == nvinfer1::DataType::kINT32
+            && attentionMask.getDataType() == nvinfer1::DataType::kINT8
+            && acceptedTokenIds.getDataType() == nvinfer1::DataType::kINT32
+            && acceptedLogitsIndices.getDataType() == nvinfer1::DataType::kINT32
+            && acceptLength.getDataType() == nvinfer1::DataType::kINT32,
+        "eagleAcceptFromRowTokens: invalid tensor data types");
+
+    constexpr int32_t kBlockSize = 256;
+    size_t const sharedMemSize = alignSharedMem(numTokens * sizeof(int32_t));
+    eagleAcceptKernel<<<batchSize, kBlockSize, sharedMemSize, stream>>>(rowTokens.dataPointer<int32_t>(),
+        tokenIds.dataPointer<int32_t>(), attentionMask.dataPointer<int8_t>(), acceptedTokenIds.dataPointer<int32_t>(),
+        acceptedLogitsIndices.dataPointer<int32_t>(), acceptLength.dataPointer<int32_t>(), batchSize, numTokens,
+        maxDepth);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void eagleAccept(rt::Tensor const& logits, rt::Tensor const& tokenIds, rt::Tensor const& attentionMask,
     rt::Tensor& acceptedTokenIds, rt::Tensor& acceptedLogitsIndices, rt::Tensor& acceptLength,
     rt::OptionalInputTensor const& vocabMappingTable, void* workspace, size_t workspaceSize, cudaStream_t stream)

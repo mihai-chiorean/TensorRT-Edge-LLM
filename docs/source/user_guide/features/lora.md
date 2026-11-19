@@ -95,10 +95,9 @@ code; the function names below are where each one is enforced.
   runtime refuses an over-rank adapter at load, before any graph capture.
 - **The speculative draft.** With Gemma 4 MTP the draft (assistant) engine has
   no LoRA inputs. It still reads the adapted target's hidden states and shared
-  KV cache, but its own weights are unadapted. Gemma 4 MTP decoding is greedy
-  (the server turns sampled requests into greedy ones), and every draft token
-  is verified against the adapted target, so output is unchanged; acceptance
-  can drop. Measured on the AGX on 2026-11-12 with the tool adapter: 65 to 71
+  KV cache, but its own weights are unadapted. Every draft token is verified
+  against the adapted target (greedy requests by argmax, sampled requests by
+  exact speculative sampling), so output is unchanged; acceptance can drop. Measured on the AGX on 2026-11-12 with the tool adapter: 65 to 71
   verify rounds for a 129-token story, about 5% slower on long replies.
 
 ### Training settings

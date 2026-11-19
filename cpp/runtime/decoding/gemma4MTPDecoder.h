@@ -59,7 +59,9 @@ public:
     DecodingStrategyCapabilities capabilities() const noexcept override
     {
         // The paired speculative base is not a standalone target engine, so VanillaDecoder fallback is invalid.
-        return {/*.ownsBaseVerificationCudaGraphs=*/false, /*.supportsLosslessSampling=*/false,
+        // Sampled requests keep their parameters: verification samples each verify row from the target
+        // distribution and walks the deterministic draft against those samples (exact speculative sampling).
+        return {/*.ownsBaseVerificationCudaGraphs=*/false, /*.supportsLosslessSampling=*/true,
             /*.maxSamplingSupport=*/0, /*.fallbackToVanillaForNonGreedySampling=*/false};
     }
 
@@ -90,6 +92,8 @@ private:
     bool buildTreeVerifyInputs(int32_t activeBatchSize, cudaStream_t stream);
     bool runBaseVerification(DecodingInferenceContext& context);
     bool acceptAndCommit(DecodingInferenceContext& context);
+    //! Sample one target token per verify row into mSampledVerifyTokenIds with request-stable uniforms.
+    void sampleVerifyRows(DecodingInferenceContext& context, int32_t verifySize);
     bool updateNextSeed(DecodingInferenceContext& context);
 
     //! Copies `count` device token ids into `hostIds` and waits for them, when a host-mapped table needs them;
@@ -119,6 +123,13 @@ private:
     Tensor mHostDraftStepTokenIds;
     Tensor mHostVerifyTokenIds;
     RaggedExecutionBatch mRaggedMetadataScratch;
+
+    // Sampled (non-greedy) verification.
+    Tensor mSampledVerifyTokenIds;   //!< [B * verifySize, 1] INT32 target sample per verify row.
+    Tensor mVerifyUniforms;          //!< [B * verifySize] FP32 request-stable uniform per verify row.
+    Tensor mVerifyRngInputs;         //!< [2, B] INT64 (bit-cast uint64) request seeds, then next absolute positions.
+    Tensor mHostVerifyRngInputs;     //!< [2, B] INT64 host staging for mVerifyRngInputs.
+    Tensor mVerifySamplingWorkspace; //!< Grown on demand when the shared sampling workspace is too small.
 
     bool mUseTree{false};
     Tensor mStackedDraftLogits; //!< [B, specDraftStep + 1, draftVocab] per-depth proposal logits.
