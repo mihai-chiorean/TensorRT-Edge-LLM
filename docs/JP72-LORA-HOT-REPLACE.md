@@ -3,7 +3,8 @@
 Status: draft for review, 2026-11-12. Fork `main` c090e173. Priority: low. A service restart already serves a
 new adapter in about 13 s end to end (AGX, 2026-11-12), so this ranks behind the binding cache (MIT-2102), the
 adapter discovery fix (MIT-2103), target selection (MIT-2097), content-keyed caches (MIT-2098), the manifest
-(MIT-2100) and the graph gate (MIT-2099). Implementation is split into issues only after those have merged.
+(MIT-2100) and the graph gate (MIT-2099). Those have merged (#65 to #70); the implementation is not split into
+issues yet. The code facts in section 2 were rechecked against `main` e80683e3 on 2026-11-19.
 
 ## 1. Problem
 
@@ -20,7 +21,7 @@ exist is replacing or adding an adapter **without restarting the server**, with 
 A restart costs about 13 s (measured end to end on the AGX) and drops the warm context cache. Hot replacement avoids both. It is worth building only if the swap window is short and the failure
 behaviour is at least as safe as a restart, which is the bar this design sets.
 
-## 2. What the code does today (verified on c090e173)
+## 2. What the code does today (verified on c090e173, rechecked on e80683e3)
 
 | Fact | Where |
 |---|---|
@@ -29,9 +30,9 @@ behaviour is at least as safe as a restart, which is the bar this design sets.
 | Decode graphs are captured once at server start, one per registered adapter plus base, per capture shape. | `LLMRankRuntime::captureBaseGraphWithLoraFanout`, called through `BaseEngineResources` by the decoders' `captureCudaGraphs` |
 | Capturing mutates shared runtime state: it resets the KV cache manager's sequence lengths, rewrites pipeline IO tensors and re-prepares the base executor. It cannot run alongside inference. | `Gemma4MTPDecoder::captureCudaGraphs` (the `stateGuard` teardown) |
 | The executor's graph cache is keyed by a hash of every binding address and shape; there is no per-adapter eviction. Graphs live until the executor is destroyed. | `TrtEngineExecutor::execute` / `captureGraph`, `mGraphs` |
-| Adapter-dependent KV caches are keyed by adapter name today; MIT-2098 keys them by adapter content. | `makeContextCacheSequenceAdmission`, `keySystemPromptWithLoraWeights` |
+| Adapter-dependent KV caches are keyed by adapter content (MIT-2098, #68), not by adapter name. | `makeContextCacheSequenceAdmission` (`loraCacheIdentity`), `cpp/runtime/contextCacheRequest.cpp` |
 | The Python server serializes every call into the native runtime with one lock. | `LLM._infer_guard` / `_infer_lock`, `experimental/server/runtime/engine.py` |
-| Adapter requests are refused under in-flight batching. | `LLM._build_request` |
+| Adapter requests are refused under in-flight batching. | `LLM._make_generation_request` |
 
 ## 3. Approach
 
@@ -172,7 +173,7 @@ an acceptance criterion to be measured, not an estimate to rely on.
 | Health probe fails | Refuse (step 5). |
 | Crash or power loss before step 7 | `ACTIVE` still names the old version; restart loads it. |
 | Crash between writing `PREVIOUS` and `ACTIVE` | `ACTIVE` still old; `PREVIOUS` may already equal it; harmless. |
-| `ACTIVE` version fails verification at startup | Load `PREVIOUS` instead, report `degraded: ["lora_active_rejected"]`; refuse to start only if both fail and `--require-lora-adapters` is set. |
+| `ACTIVE` version fails verification at startup | Load `PREVIOUS` instead, report `degraded: ["lora_active_rejected"]`; refuse to start only if both fail and `--require-lora-adapters` (a new flag) is set. |
 | Client disconnects mid-activation | The transaction runs to completion; the result is in `/lora/status`. |
 | Request arrives during the window | Waits on the inference lock, like behind a long generation. |
 
@@ -191,11 +192,11 @@ the runtime is a two-way door.
 
 ## 8. Prerequisites and sequencing
 
-Must be merged first:
+Merged prerequisites:
 
-1. MIT-2098: adapter content identity in every cache key.
-2. MIT-2099: graph capture gate and graph counters (step 4 and 5 rely on them).
-3. MIT-2100: adapter manifest and base identity.
+1. MIT-2098 (#68): adapter content identity in every cache key.
+2. MIT-2099 (#70): graph capture gate and graph counters (step 4 and 5 rely on them).
+3. MIT-2100 (#69): adapter manifest and base identity.
 
 Then, as separate issues, in order:
 
