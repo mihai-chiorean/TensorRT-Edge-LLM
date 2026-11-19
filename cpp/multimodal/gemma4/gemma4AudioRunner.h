@@ -86,6 +86,11 @@ private:
     //! \brief Extract mel-spectrogram from raw PCM and upload to GPU as FP16 [1, T, mel_bins].
     bool extractMelFromPcm(rt::audio::AudioPCM const& pcm, rt::Tensor& melGpu, cudaStream_t stream);
 
+    //! \brief Size mAudioEmbedding and report per-clip token counts from the PCM lengths alone, for a request whose
+    //! embeddings the caller copies in. False when a clip's count is only known from its mel (precomputed mel file)
+    //! or the feature extractor would reject the clip.
+    bool layoutClipsFromPcmLength(rt::LLMGenerationRequest const& request, std::vector<int64_t>& audioTokenLengths);
+
     //! \brief Encode all audio clips in the request batch into mAudioEmbedding.
     bool encodeAllClips(
         rt::LLMGenerationRequest const& request, std::vector<int64_t>& audioTokenLengths, cudaStream_t stream);

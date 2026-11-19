@@ -319,6 +319,38 @@ bool Gemma4AudioRunner::encodeSingleClip(
     return true;
 }
 
+bool Gemma4AudioRunner::layoutClipsFromPcmLength(
+    rt::LLMGenerationRequest const& request, std::vector<int64_t>& audioTokenLengths)
+{
+    std::vector<int64_t> lengths;
+    int64_t totalEncodedRows = 0;
+    for (auto const& req : request.requests)
+    {
+        for (auto const& audio : req.audioBuffers)
+        {
+            if (!audio.melSpectrogramPath.empty() || !audio.pcm
+                || audio.pcm->sampleRate != mMelExtractor.config().sampleRate)
+            {
+                return false;
+            }
+            int64_t const melFrames = mMelExtractor.outputFrames(audio.pcm->numSamples());
+            if (melFrames <= 0)
+            {
+                return false;
+            }
+            int64_t const encodedSeqLen = alignUp(melFrames, mConfig.subsamplingFactor) / mConfig.subsamplingFactor;
+            totalEncodedRows += encodedSeqLen;
+            lengths.push_back(encodedSeqLen);
+        }
+    }
+    if (lengths.empty() || !resizeEmbeddingForRows(totalEncodedRows))
+    {
+        return false;
+    }
+    audioTokenLengths = std::move(lengths);
+    return true;
+}
+
 bool Gemma4AudioRunner::encodeAllClips(
     rt::LLMGenerationRequest const& request, std::vector<int64_t>& audioTokenLengths, cudaStream_t stream)
 {
@@ -468,14 +500,15 @@ void Gemma4AudioRunner::textPreprocess(rt::LLMGenerationRequest const& request,
 bool Gemma4AudioRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
     [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, [[maybe_unused]] bool imageOnly,
-    [[maybe_unused]] bool skipEncoderWork)
+    bool skipEncoderWork)
 {
     std::vector<int64_t> audioTokenLengths;
 
     try
     {
         TIME_STAGE(metrics::StageNames::kMULTIMODAL_PROCESSING, stream);
-        if (!encodeAllClips(request, audioTokenLengths, stream))
+        bool const laidOut = skipEncoderWork && layoutClipsFromPcmLength(request, audioTokenLengths);
+        if (!laidOut && !encodeAllClips(request, audioTokenLengths, stream))
         {
             return false;
         }
