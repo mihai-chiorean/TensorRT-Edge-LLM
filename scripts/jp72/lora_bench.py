@@ -15,12 +15,20 @@
 # limitations under the License.
 """LoRA/MTP engine bench: load memory, decode tok/s, verify acceptance, TTFT, greedy outputs.
 
-Ported from the lab-jetson probe_mtp.py so the bench lives in the repo. The
-probe's null ``tokens_per_verify_step`` is fixed here: the runtime only records
-``SpecDecodeGenerationMetrics`` (cpp/profiling/metrics.h) when the thread-local
-profiling flag is on, so a separate metrics pass per prompt and adapter runs
-with profiling enabled and the flag is restored afterwards; timed decode runs
-always execute with profiling off.
+One ``LLMRuntime`` is constructed per run and every variant (base + each
+adapter) is measured on it. Decode is measured as the runtime serves it:
+decoding CUDA graphs are captured once after construction (the run fails if
+capture fails), each variant gets one untimed warm-up decode, and the reported
+``decode_tok_s`` is the median over ``--decode-reps`` timed runs of the same
+prompt, counted from the decode phase only — wall time minus the prefill wall
+time that the runtime's prefill metrics record for that request (prefill
+counters only advance while profiling is on, so the pass that reads them runs
+with profiling enabled and restores the flag afterwards).
+
+``SpecDecodeGenerationMetrics`` (cpp/profiling/metrics.h) only accumulates
+while the thread-local profiling flag is on and its counters are cumulative
+for the lifetime of the runtime, so each variant's metrics pass reads the
+counters before and after its profiled run and reports the deltas.
 
 Usage
 -----
@@ -58,13 +66,30 @@ Record schema (one JSON line per record in ``--out``; see ``--out`` docs):
                             across records)
     prompt_tokens           measured prompt token count (see --ttft-lengths)
     ttft_ms_tool            TTFT of the original tool-prompt request
-    ttft_sweep              list of {"target_tokens", "prompt_tokens", "ttft_ms"}
-    decode_*                decode prompt results (see RECORD_FIELDS)
-    tokens_per_verify_step  generated / iterations from the metrics pass
-    verify_steps            total_iterations from the metrics pass
-    accepted_draft_tokens   total_accepted_draft_tokens (when exposed)
-    proposed_draft_tokens   total_proposed_draft_tokens (when exposed)
-    greedy_match            fraction of 9 prompts matching the base output
+    ttft_sweep              list of {"target_tokens", "prompt_tokens",
+                            "ttft_ms", "cached_tokens"}; cached_tokens is the
+                            context-cache tokens reused by that row (-1 when
+                            the binding does not expose it)
+    decode_*                median of --decode-reps timed decode runs of
+                            DECODE_PROMPTS[0] (one untimed warm-up first):
+                            decode_tok_s counts decode-phase wall time only
+                            (wall minus prefill); decode_seconds is the
+                            median run's wall time, decode_prefill_seconds
+                            the measured prefill wall time subtracted from
+                            it, and decode_generated/prompt_tokens are that
+                            run's token counts
+    tokens_per_verify_step  verify-step metrics from the profiled pass:
+                            generated / iterations, both taken as the delta
+                            of the runtime's cumulative counters across the
+                            pass, so each variant reports only its own run
+    verify_steps            speculative verification iterations in that pass
+                            (delta of total_iterations)
+    accepted_draft_tokens   delta of total_accepted_draft_tokens (when exposed)
+    proposed_draft_tokens   delta of total_proposed_draft_tokens (when exposed)
+    matches_base            fraction of the 9 greedy prompts whose output
+                            token ids equal the base variant's output; this
+                            measures how much an adapter changes the output,
+                            not correctness
 
 For the Orin NX measurement harness see scripts/jp72/lora_nx_measure.sh.
 """
@@ -137,6 +162,10 @@ DEFAULT_TTFT_LENGTHS = "20,100,400,800,1600"
 DEFAULT_REPS = 5
 TTFT_MAX_TOKENS = 1
 DECODE_MAX_TOKENS = 256
+# Timed decode runs per variant after one untimed warm-up; the record reports
+# the median over these.
+DEFAULT_DECODE_REPS = 5
+MIN_DECODE_REPS = 3
 GREEDY_MAX_TOKENS = 64
 
 # MTP drafting shape the engines are built and benchmarked with (draft top-2,
@@ -151,18 +180,20 @@ RECORD_FIELDS = [
     "engine",
     "adapter",
     "peak_host_rss_mb",
+    "cuda_graphs",
     "prompt_tokens",
     "ttft_ms_tool",
     "ttft_sweep",
     "decode_prompt_tokens",
     "decode_generated",
     "decode_seconds",
+    "decode_prefill_seconds",
     "decode_tok_s",
     "tokens_per_verify_step",
     "verify_steps",
     "accepted_draft_tokens",
     "proposed_draft_tokens",
-    "greedy_match",
+    "matches_base",
 ]
 
 
@@ -207,6 +238,13 @@ def parse_args(argv=None):
         default=DEFAULT_REPS,
         help="Repetitions per TTFT sweep point (default: %(default)s).")
     parser.add_argument(
+        "--decode-reps",
+        type=int,
+        default=DEFAULT_DECODE_REPS,
+        help="Timed decode runs per variant after one untimed warm-up; the "
+        f"record reports the median (default: %(default)s, minimum "
+        f"{MIN_DECODE_REPS}).")
+    parser.add_argument(
         "--no-reuse",
         action="store_true",
         help="Construct the runtime with the context cache disabled; unique "
@@ -249,6 +287,10 @@ def parse_args(argv=None):
         parser.error("--build-dir is required (or set $B)")
     if args.reps < 1:
         parser.error("--reps must be >= 1")
+    if args.decode_reps < MIN_DECODE_REPS:
+        parser.error(
+            f"--decode-reps must be >= {MIN_DECODE_REPS} so the median is "
+            "not a single un-warmed run")
     for pair in args.adapter:
         if "=" not in pair:
             parser.error(f"--adapter must be NAME=PATH, got {pair!r}")
@@ -323,8 +365,7 @@ def build_ttft_prompt(target_tokens, tokenizer=None, paragraph=TTFT_PARAGRAPH):
     # character cut point of the final partial paragraph.
     para_len = len(paragraph)
     para_tokens = max(1, len(tokenizer.encode(paragraph).ids))
-    whole_reps, remainder_target = divmod(max(target_tokens - 10, 1),
-                                          para_tokens)
+    whole_reps = max(target_tokens - 10, 1) // para_tokens
     if whole_reps == 0:
         lo, hi = 1, para_len
         best_small = unique + paragraph
@@ -354,9 +395,9 @@ def build_ttft_prompt(target_tokens, tokenizer=None, paragraph=TTFT_PARAGRAPH):
         err = abs(base_n - target_tokens) / target_tokens
         if err <= 0.05:
             return base, base_n
-        best, best_err = base, base_n
+        best, best_err = base, err
     # Refine the partial paragraph by characters: binary-search the cut point
-    # so the last (partial) paragraph contributes ~remainder_target tokens.
+    # so the last (partial) paragraph lands closest to the target.
     lo, hi = 1, para_len
     for _ in range(20):
         mid = (lo + hi) // 2
@@ -366,14 +407,16 @@ def build_ttft_prompt(target_tokens, tokenizer=None, paragraph=TTFT_PARAGRAPH):
             continue
         err = abs(measured - target_tokens) / target_tokens
         if best_err is None or err < best_err:
-            best, best_err = candidate, measured
+            best, best_err = candidate, err
         if err <= 0.05:
             return candidate, measured
         if measured > target_tokens:
             hi = mid - 1
         else:
             lo = mid + 1
-    return best, best_err
+    if best is None:
+        return base, base_n
+    return best, count_tokens(tokenizer, best)
 
 
 def make_tool_request(rt, prompt, lora=""):
@@ -433,11 +476,68 @@ def run_decode(rt, runtime, prompt, max_tokens=DECODE_MAX_TOKENS, lora=""):
     return prompt_tokens, len(out_ids), seconds, out_ids
 
 
+def read_prefill_wall_seconds(runtime):
+    """Delta of the runtime's cumulative prefill wall time, in seconds.
+
+    The pybind module does not expose the runtime's stage timer, so prefill
+    wall time is derived from ``LLMPrefillMetrics``: with profiling enabled
+    the runtime records ``prefill_seconds`` per request (and the counters are
+    cumulative), so the caller snapshots before and after a run and
+    subtracts. None when the binding does not expose the metrics.
+    """
+    getter = getattr(runtime, "get_prefill_metrics", None)
+    if getter is None:
+        return None
+    try:
+        metrics = getter()
+    except (AttributeError, RuntimeError):
+        return None
+    seconds = getattr(metrics, "prefill_seconds", None)
+    if seconds is None:
+        return None
+    return float(seconds)
+
+
+def read_context_cache_metrics(runtime):
+    """Snapshot the context-cache token counters; None when unavailable."""
+    getter = getattr(runtime, "get_context_cache_metrics", None)
+    if getter is None:
+        return None
+    try:
+        metrics = getter()
+    except (AttributeError, RuntimeError):
+        return None
+    if metrics is None:
+        return None
+    return {
+        "matched_tokens": int(getattr(metrics, "matched_tokens", 0)),
+        "reused_tokens": int(getattr(metrics, "reused_tokens", 0)),
+    }
+
+
 def verify_step_math(total_generated, total_iterations):
     """tokens_per_verify_step = generated / iterations; None if iterations <= 0."""
     if total_iterations is None or total_iterations <= 0:
         return None
     return total_generated / total_iterations
+
+
+def spec_metrics_delta(before, after):
+    """Per-run spec-decode counters: after - before for all four fields.
+
+    ``SpecDecodeGenerationMetrics::recordRun`` (cpp/profiling/metrics.h) adds
+    to totals for the lifetime of the runtime, so a variant's own numbers are
+    the deltas of two snapshots around its profiled run.
+    """
+    if after is None:
+        return None
+    if before is None:
+        before = {key: 0 for key in after}
+    return {
+        key: after.get(key, 0) - before.get(key, 0)
+        for key in ("total_iterations", "total_generated_tokens",
+                    "accepted_draft_tokens", "proposed_draft_tokens")
+    }
 
 
 def assemble_record(tag,
@@ -449,8 +549,14 @@ def assemble_record(tag,
                     ttft_sweep,
                     decode,
                     spec_metrics,
-                    greedy_match=None):
-    """Assemble one output record dict; pure (no runtime)."""
+                    matches_base=None):
+    """Assemble one output record dict; pure (no runtime).
+
+    ``decode`` carries the median run's seconds, the mean prefill wall time
+    across the timed runs and the per-run prompt/generated token counts;
+    ``decode_tok_s`` divides the median run's generated tokens by its
+    decode-phase time (wall time minus prefill).
+    """
     record = {
         "tag":
         tag,
@@ -462,6 +568,8 @@ def assemble_record(tag,
         adapter_path,
         "peak_host_rss_mb":
         peak_rss_mb,
+        "cuda_graphs":
+        decode["cuda_graphs"],
         "prompt_tokens":
         decode["prompt_tokens"],
         "ttft_ms_tool":
@@ -474,9 +582,11 @@ def assemble_record(tag,
         decode["generated"],
         "decode_seconds":
         round(decode["seconds"], 4),
+        "decode_prefill_seconds":
+        round(decode["prefill_seconds"], 4)
+        if decode["prefill_seconds"] is not None else None,
         "decode_tok_s":
-        round(decode["generated"] /
-              decode["seconds"], 2) if decode["seconds"] > 0 else None,
+        decode["tok_s"],
     }
     if spec_metrics is None:
         record["tokens_per_verify_step"] = None
@@ -486,13 +596,9 @@ def assemble_record(tag,
                                spec_metrics["total_iterations"])
         record["tokens_per_verify_step"] = tps
         record["verify_steps"] = spec_metrics["total_iterations"]
-        if "accepted_draft_tokens" in spec_metrics:
-            record["accepted_draft_tokens"] = spec_metrics[
-                "accepted_draft_tokens"]
-        if "proposed_draft_tokens" in spec_metrics:
-            record["proposed_draft_tokens"] = spec_metrics[
-                "proposed_draft_tokens"]
-    record["greedy_match"] = greedy_match
+        record["accepted_draft_tokens"] = spec_metrics["accepted_draft_tokens"]
+        record["proposed_draft_tokens"] = spec_metrics["proposed_draft_tokens"]
+    record["matches_base"] = matches_base
     return record
 
 
@@ -501,12 +607,16 @@ def run_ttft_sweep(rt, runtime, lengths, reps, tokenizer, lora=""):
 
     Each rep gets its own time_ns-prefixed prompt, so engine context reuse
     never hits; ``prompt_tokens`` is the engine's measured count from the
-    engine tokenizer.
+    engine tokenizer. ``cached_tokens`` is the delta of the runtime's
+    context-cache reused_tokens across the point's requests (-1 when the
+    binding does not expose it), so a row served from the cache is visible
+    instead of silently trusted as uncached.
     """
     sweep = []
     for target in lengths:
         ttfts = []
         prompt_tokens = None
+        cc_before = read_context_cache_metrics(runtime)
         for _ in range(reps):
             prompt, measured = build_ttft_prompt(target, tokenizer)
             req = make_tool_request(rt, prompt, lora=lora)
@@ -516,10 +626,17 @@ def run_ttft_sweep(rt, runtime, lengths, reps, tokenizer, lora=""):
             if prompt_tokens is None:
                 prompt_tokens = int(resp.prompt_token_counts[0]
                                     ) if resp.prompt_token_counts else measured
+        cc_after = read_context_cache_metrics(runtime)
+        if cc_before is None or cc_after is None:
+            cached_tokens = -1
+        else:
+            cached_tokens = cc_after["reused_tokens"] - cc_before[
+                "reused_tokens"]
         sweep.append({
             "target_tokens": target,
             "prompt_tokens": prompt_tokens,
             "ttft_ms": round(median(ttfts), 3),
+            "cached_tokens": cached_tokens,
         })
     return sweep
 
@@ -576,7 +693,12 @@ def load_runtime(rt, args, lora_map):
 
 
 def run_greedy_check(rt, runtime, base_outputs=None, lora=""):
-    """Run the 9 greedy prompts; returns (token_id lists, match_fraction_vs_base)."""
+    """Run the 9 greedy prompts; returns (token_id lists, fraction matching base).
+
+    The fraction compares each adapter's output token ids with the base
+    variant's: it measures how much an adapter changes the output, not
+    correctness (it is reported as ``matches_base`` in the record).
+    """
     outputs = []
     for prompt in GREEDY_PROMPTS:
         _, _, _, out_ids = run_decode(rt,
@@ -618,12 +740,14 @@ def measure_variant(rt,
                     tokenizer,
                     tag,
                     adapter_path,
-                    base_outputs=None):
+                    base_outputs=None,
+                    cuda_graphs=True):
     """Measure one variant (base or one adapter) on the shared runtime.
 
     Every request carries ``lora_weights_name`` — empty for base, the adapter
     name otherwise — so the runtime switches adapters per request, exactly as
-    the original probe did.
+    the original probe did. ``cuda_graphs`` is the capture result recorded in
+    every record of this run.
     """
     lora = tag if adapter_path else ""
 
@@ -642,12 +766,40 @@ def measure_variant(rt,
     runtime.handle_request(req)
     ttft_tool_ms = (time.perf_counter() - t0) * 1000.0
 
-    # --- decode ---------------------------------------------------------
+    # --- decode: one untimed warm-up, then timed runs -------------------
+    # The warm-up absorbs first-run costs (adapter switch, allocator growth)
+    # so the timed runs measure steady-state decode.
     decode_prompt = DECODE_PROMPTS[0]
-    prompt_tokens, generated, seconds, _ = run_decode(rt,
-                                                      runtime,
-                                                      decode_prompt,
-                                                      lora=lora)
+    run_decode(rt, runtime, decode_prompt, lora=lora)
+    runs = []
+    for _ in range(args.decode_reps):
+        runs.append(run_decode(rt, runtime, decode_prompt, lora=lora))
+    # Median run by wall time; its token counts back the record fields.
+    runs.sort(key=lambda run: run[2])
+    prompt_tokens, generated, seconds, _ = runs[len(runs) // 2]
+
+    # --- decode-phase tok/s: subtract the prefill wall time -------------
+    # The binding exposes no stage timer, so prefill wall time comes from the
+    # runtime's cumulative prefill counters, which only advance while
+    # profiling is on: run the same prompt once with profiling enabled, read
+    # LLMPrefillMetrics around it, and take the delta as that request's
+    # prefill wall time.
+    rt.set_profiling_enabled(True)
+    try:
+        prefill_before = read_prefill_wall_seconds(runtime)
+        run_decode(rt, runtime, decode_prompt, lora=lora)
+        prefill_after = read_prefill_wall_seconds(runtime)
+    finally:
+        rt.set_profiling_enabled(False)
+    if prefill_before is None or prefill_after is None:
+        prefill_seconds = None
+        decode_seconds = None
+        decode_tok_s = None
+    else:
+        prefill_seconds = max(0.0, prefill_after - prefill_before)
+        decode_seconds = max(0.0, seconds - prefill_seconds)
+        decode_tok_s = (round(generated / decode_seconds, 2)
+                        if decode_seconds > 0 else None)
 
     # --- TTFT sweep -----------------------------------------------------
     sweep = run_ttft_sweep(rt,
@@ -666,11 +818,12 @@ def measure_variant(rt,
     if args.mtp:
         rt.set_profiling_enabled(True)
         try:
-            _, metrics_generated, _, _ = run_decode(rt,
-                                                    runtime,
-                                                    decode_prompt,
-                                                    lora=lora)
-            spec_metrics = read_spec_metrics(runtime)
+            # Counters accumulate for the lifetime of the runtime, so
+            # snapshot before the profiled run and report the delta.
+            spec_before = read_spec_metrics(runtime)
+            run_decode(rt, runtime, decode_prompt, lora=lora)
+            spec_metrics = spec_metrics_delta(spec_before,
+                                              read_spec_metrics(runtime))
         finally:
             rt.set_profiling_enabled(False)
         if spec_metrics is None or spec_metrics["total_iterations"] <= 0:
@@ -680,11 +833,6 @@ def measure_variant(rt,
                 "cannot compute tokens_per_verify_step",
                 file=sys.stderr)
             return None
-        # Counters accumulate across every handle_request on this
-        # runtime; the timed runs ran with profiling off, so the deltas
-        # belong to this pass alone.
-        if metrics_generated > 0:
-            spec_metrics["total_generated_tokens"] = metrics_generated
 
     # --- greedy check ---------------------------------------------------
     outputs, match = run_greedy_check(rt,
@@ -696,6 +844,10 @@ def measure_variant(rt,
         "prompt_tokens": prompt_tokens,
         "generated": generated,
         "seconds": seconds,
+        "prefill_seconds": prefill_seconds,
+        "decode_seconds": decode_seconds,
+        "tok_s": decode_tok_s,
+        "cuda_graphs": cuda_graphs,
     }
     record = assemble_record(tag=tag,
                              mtp=args.mtp,
@@ -706,7 +858,7 @@ def measure_variant(rt,
                              ttft_sweep=sweep,
                              decode=decode,
                              spec_metrics=spec_metrics,
-                             greedy_match=match)
+                             matches_base=match)
     # --skip-outputs keeps generated texts out of the record; only the
     # per-prompt token counts are retained for the greedy comparison.
     record["outputs"] = None if args.skip_outputs else [
@@ -719,6 +871,23 @@ def measure_variant(rt,
         f"tpv={record['tokens_per_verify_step']}",
         flush=True)
     return record, outputs
+
+
+def capture_decode_cuda_graphs(runtime):
+    """Capture the decoding CUDA graphs the serving configuration uses.
+
+    The server captures at startup (experimental/server/runtime/engine.py);
+    without capture the decode numbers would describe eager execution instead
+    of what the runtime actually serves with. Returns True when capture
+    succeeded or the method is unavailable on the loaded binding.
+    """
+    capture = getattr(runtime, "capture_decoding_cuda_graph", None)
+    if capture is None:
+        return True
+    try:
+        return bool(capture())
+    except (AttributeError, RuntimeError):
+        return False
 
 
 def main(argv=None):
@@ -747,6 +916,15 @@ def main(argv=None):
     lora_map = dict(adapters)
     runtime = load_runtime(rt, args, lora_map)
 
+    # Decode must run as the server runs it: graphs captured at startup.
+    cuda_graphs = capture_decode_cuda_graphs(runtime)
+    if not cuda_graphs:
+        print(
+            "ERROR: decoding CUDA graph capture failed; the decode numbers "
+            "would not describe the serving configuration",
+            file=sys.stderr)
+        return 3
+
     # Tag ordering: base first, then adapters in the order given.
     variants = [("base", None)]
     for name, path in adapters:
@@ -762,7 +940,8 @@ def main(argv=None):
                                  tokenizer,
                                  tag,
                                  adapter_path,
-                                 base_outputs=base_outputs)
+                                 base_outputs=base_outputs,
+                                 cuda_graphs=cuda_graphs)
         if result is None:
             return 2
         record, outputs = result
