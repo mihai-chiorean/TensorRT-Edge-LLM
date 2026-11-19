@@ -1,11 +1,11 @@
 # LoRA fused into the W4A16 GEMM/GEMV epilogue: design and measurements
 
-Status: revised after implementation and AGX validation, 2026-11-13. Fork `main` 5a56baaa. This
-is step 4 of the LoRA decode speed-up plan. It builds on the grouped LoRA
-plugin branches, stacked on `main` in this order: `lora-group-plugin` (2ed53e5
-`LoraGroupPlugin`, then b95e8b4 for 8-SM GPUs), `lora-group-insert` (55b3358,
-`insert-lora --lora-group-plugin`) and `lora-inactive-rank` (74f7de7,
-engine-recorded `lora_inactive_rank`). On INT4 engines it replaces that plugin.
+Status: revised after implementation and AGX validation (2026-11-13) and the
+Orin NX measurements (2026-11-14). Fork `main` e80683e3. This is step 4 of the
+LoRA decode speed-up plan. It builds on `LoraGroupPlugin` (#78),
+`insert-lora --lora-group-plugin` (#79) and the engine-recorded
+`lora_inactive_rank` (#80), all on `main`. On INT4 engines it replaces that
+plugin.
 
 The first version of this document proposed computing the shrink inside the
 INT4 kernel and projected 97 to 98% of rank-0 decode throughput. That design
@@ -208,7 +208,8 @@ M = 8); q -1.1 to +1.9 µs (within the bench's noise); o +1.7 µs; down
 
 ### 3.6 INT8 factors (step 3)
 
-Not implemented yet. The split makes the INT8 path simpler than the first
+Not implemented for the fused path. #83 (not merged) implements INT8-resident
+factors for `LoraGroupPlugin` only. The split makes the INT8 path simpler than the first
 design assumed:
 - A is read only by the shrink kernel, which dequantizes
   `fp16(float(code) * float(scale))` as it loads.
@@ -253,9 +254,10 @@ All on the AGX, same harness or same engine profile as the final design.
 
 - **Verify (base engine).** Verify runs the base engine at M = verify width:
   up to 12 with the runtime's current draft settings (engine built with
-  `--max-verify-tree-size 16`). M <= 8 uses the decode shrink tree and the
-  GEMV variants; M = 9 to 16 uses the tensor-core shrink with short K chunks
-  (3.2) and the GEMM variants. A verify step costs the same LoRA launches as a
+  `--max-verify-tree-size 16`). M <= 8 uses the decode shrink tree; its expand
+  runs in the GEMV variants for N <= 512 (k and v, sliding) and in the GEMM
+  variants otherwise (section 2). M = 9 to 16 uses the tensor-core shrink with
+  short K chunks (3.2) and the GEMM variants. A verify step costs the same LoRA launches as a
   plain decode step.
 - **Draft.** The assistant draft engine has no LoRA inputs (#75 designs draft
   adapters separately). Use AGX-built drafts; NX-built MTP drafts are
@@ -310,20 +312,22 @@ optimum rank.
 - `insert-lora --lora-fused-int4` groups the selected
   `Int4GroupwiseGemmPluginV2` nodes by their unsmoothed activation (up to 4 per
   group), emits one `LoraShrinkPlugin` per group, rewrites each node to
-  `Int4GroupwiseGemmLoraPlugin` and appends `t_i` and `lora_B`. Non-INT4
-  targets keep MatMul branches. Graph input names, dtypes and the dynamic
+  `Int4GroupwiseGemmLoraPlugin` and appends `t_i` and `lora_B`. Targets that
+  are not `Int4GroupwiseGemmPluginV2` keep the branch `--lora-group-plugin`
+  selects: `LoraGroupPlugin` with it, MatMul without. Graph input names, dtypes and the dynamic
   `<stem>.rank` dimension do not change.
 - The builder allows `lora_inactive_rank = 0` when every LoRA-reading layer is
   a group, fused or shrink plugin, and enables aliased plugin I/O only when a
   group plugin is present.
-- Builds need `-DENABLE_CUTE_DSL=ALL` for the LoRA variants.
+- Builds need the `int4_fp16_gemm` CuTe DSL group and an artifact generated
+  with the LoRA variants (for example `-DENABLE_CUTE_DSL=ALL`).
 
 ### 5.3 Adapter manifest and base identity (#69, #72)
 
 Unchanged from the first revision: processed FP16 adapter files are
 byte-identical for the fused engine; the engine file changes, so the base
 identity changes and manifests are re-issued against it; INT8-resident engines
-accept only `int8_per_channel_v1` files.
+(#83, not merged) accept only `int8_per_channel_v1` files.
 
 ## 6. Equality strategy
 
@@ -556,7 +560,8 @@ Measured 2026-11-14 on the robot's Orin NX 16 GB:
 
 The implementation is split into three stacked PRs on #80: the shrink
 plugin, the INT4 expand epilogue and its plugin form, then insertion and the
-builder (#85, #86, #87, draft).
+builder (#85, #86, #87, draft). #80 has merged; the three are not yet rebased
+onto `main`.
 
 ## 11. Risks
 
