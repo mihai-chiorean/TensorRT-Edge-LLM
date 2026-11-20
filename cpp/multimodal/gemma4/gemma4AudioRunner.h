@@ -109,7 +109,10 @@ private:
     rt::Tensor mInputFeatures{};     //!< [1, paddedSeqLen, mel_bins] encoder input
     rt::Tensor mInputFeaturesMask{}; //!< [1, paddedSeqLen] valid mel-frame mask
     rt::Tensor mAudioEmbedding{};    //!< [totalEncodedRows, hidden_dim] flat output
-    int64_t mMaxSeqLen{0};           //!< Max mel-spectrogram time steps from engine profile
+    //! Encoder output of a clip shorter than the profile minimum: [minSeqLen / subsamplingFactor, hidden_dim].
+    rt::Tensor mShortClipEmbedding{};
+    int64_t mMinSeqLen{0}; //!< Min mel-spectrogram time steps from engine profile
+    int64_t mMaxSeqLen{0}; //!< Max mel-spectrogram time steps from engine profile
 
     //! Mel extractor for PCM→mel fallback (Whisper-style, 16kHz, 128 bins).
     rt::audio::MelExtractor mMelExtractor;

@@ -85,6 +85,10 @@ void makeFftTwiddleHost(int32_t nFft, std::vector<float>& twoChan);
 //! FFT); the caller ensures ``window.size() <= nFft``.
 void makeCentredWindowHost(std::vector<float> const& window, int32_t nFft, std::vector<float>& out);
 
+//! Mel frames an encoder is run on for a clip of ``rawFrames``: at least the engine profile minimum, aligned up to
+//! the subsampling factor. Frames past ``rawFrames`` are padding that the caller masks out.
+int64_t encoderInputFrames(int64_t rawFrames, int64_t subsamplingFactor, int64_t profileMinFrames);
+
 //! Compute CNN output length after ``numConvStages`` stride-2 2D convolutions.
 int64_t computeFeatExtractOutputLength(int64_t inputLength, int32_t nWindow, int32_t numConvStages = 3);
 

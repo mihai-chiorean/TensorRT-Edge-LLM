@@ -135,6 +135,12 @@ void makeCentredWindowHost(std::vector<float> const& window, int32_t nFft, std::
     }
 }
 
+int64_t encoderInputFrames(int64_t rawFrames, int64_t subsamplingFactor, int64_t profileMinFrames)
+{
+    int64_t const frames = std::max(rawFrames, profileMinFrames);
+    return (frames + subsamplingFactor - 1) / subsamplingFactor * subsamplingFactor;
+}
+
 int64_t computeFeatExtractOutputLength(int64_t inputLength, int32_t nWindow, int32_t numConvStages)
 {
     check::check(numConvStages >= 1, "numConvStages must be >= 1, got: " + std::to_string(numConvStages));
