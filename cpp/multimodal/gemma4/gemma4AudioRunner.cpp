@@ -20,6 +20,7 @@
 #include "common/mmapReader.h"
 #include "common/safetensorsUtils.h"
 #include "common/trtInterop.h"
+#include "multimodal/common/audioUtils.h"
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
 #include <cstdint>
@@ -140,7 +141,10 @@ bool Gemma4AudioRunner::validateAndFillConfig(std::string const& engineDir)
         }
     }
 
-    // Get max sequence length from engine profile
+    // Get the sequence length range from the engine profile
+    nvinfer1::Dims const inputShapeMin
+        = mAudioEngine->getProfileShape("input_features", 0, nvinfer1::OptProfileSelector::kMIN);
+    mMinSeqLen = inputShapeMin.d[1];
     nvinfer1::Dims const inputShapeMax
         = mAudioEngine->getProfileShape("input_features", 0, nvinfer1::OptProfileSelector::kMAX);
     mMaxSeqLen = inputShapeMax.d[1];
@@ -174,6 +178,11 @@ bool Gemma4AudioRunner::allocateBuffer([[maybe_unused]] cudaStream_t stream)
     int64_t const maxTotalRows = maxDownSeqLen * static_cast<int64_t>(mConfig.maxAudioClipsPerRequest);
     mAudioEmbedding = rt::Tensor({maxTotalRows, static_cast<int64_t>(mConfig.audioFeatureDim)}, rt::DeviceType::kGPU,
         trt_edgellm::DataType::kHALF, "Gemma4AudioRunner::mAudioEmbedding");
+
+    int64_t const minDownSeqLen
+        = audioUtils::encoderInputFrames(1, mConfig.subsamplingFactor, mMinSeqLen) / mConfig.subsamplingFactor;
+    mShortClipEmbedding = rt::Tensor({minDownSeqLen, static_cast<int64_t>(mConfig.audioFeatureDim)},
+        rt::DeviceType::kGPU, trt_edgellm::DataType::kHALF, "Gemma4AudioRunner::mShortClipEmbedding");
 
     if (!status)
     {
@@ -271,8 +280,11 @@ bool Gemma4AudioRunner::encodeSingleClip(
     // Mel shape: [1, rawSeqLen, mel_bins].
     // Gemma4 uses 2x stride-2 conv → output seq_len = rawSeqLen / 4
     int64_t const rawSeqLen = mel.getShape()[1];
-    int64_t const paddedSeqLen = alignUp(rawSeqLen, mConfig.subsamplingFactor);
-    int64_t const encodedSeqLen = paddedSeqLen / mConfig.subsamplingFactor;
+    int64_t const encodedSeqLen = alignUp(rawSeqLen, mConfig.subsamplingFactor) / mConfig.subsamplingFactor;
+    // A clip shorter than the engine profile minimum is padded up to it with masked frames. The encoder then emits
+    // more rows than the clip owns, so its output goes to a side buffer and only the clip's rows are kept.
+    int64_t const paddedSeqLen = audioUtils::encoderInputFrames(rawSeqLen, mConfig.subsamplingFactor, mMinSeqLen);
+    bool const hasPaddingRows = paddedSeqLen / mConfig.subsamplingFactor > encodedSeqLen;
 
     // Set up input features (zero-padded)
     check::check(
@@ -299,7 +311,8 @@ bool Gemma4AudioRunner::encodeSingleClip(
     bool status{true};
     status &= mAudioContext->setInputShape("input_features", toTrtDims(mInputFeatures.getShape()));
     status &= mAudioContext->setInputShape("input_features_mask", toTrtDims(mInputFeaturesMask.getShape()));
-    status &= mAudioContext->setTensorAddress("last_hidden_state", embeddingBase + destByteOffset);
+    status &= mAudioContext->setTensorAddress(
+        "last_hidden_state", hasPaddingRows ? mShortClipEmbedding.rawPointer() : embeddingBase + destByteOffset);
     if (!status)
     {
         LOG_ERROR("Gemma4AudioRunner::encodeSingleClip: Failed to set encoder bindings");
@@ -311,10 +324,17 @@ bool Gemma4AudioRunner::encodeSingleClip(
         LOG_ERROR("Gemma4AudioRunner::encodeSingleClip: Failed to enqueue encoder");
         return false;
     }
+    if (hasPaddingRows)
+    {
+        size_t const clipBytes
+            = static_cast<size_t>(encodedSeqLen) * static_cast<size_t>(mConfig.audioFeatureDim) * sizeof(__half);
+        CUDA_CHECK(cudaMemcpyAsync(embeddingBase + destByteOffset, mShortClipEmbedding.rawPointer(), clipBytes,
+            cudaMemcpyDeviceToDevice, stream));
+    }
 
     mMultimodalMetrics.recordRun(1, encodedSeqLen);
     // Return valid (non-padding) positions so downstream token expansion matches
-    // the actual encoded content. The encoder's valid mask zeroes padding outputs.
+    // the actual encoded content.
     encodedRowsOut = encodedSeqLen;
     return true;
 }
