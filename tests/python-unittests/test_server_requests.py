@@ -547,6 +547,40 @@ def test_engine_client_releases_single_runtime_slot(tmp_path):
     asyncio.run(exercise())
 
 
+def test_stream_logs_request_metrics(tmp_path, caplog):
+    """A streamed request asks the runtime for its metrics and logs them."""
+    from tensorrt_edgellm.server.runtime.engine import (GenerationMetrics,
+                                                        SamplingParams)
+    from tensorrt_edgellm.server.runtime.engine_client import EngineClient
+
+    llm = _FakeLLM(tmp_path)
+
+    def stream_with_metrics(*_args, on_metrics=None, **_kwargs):
+        yield StreamDelta(text="hi",
+                          token_ids=[1],
+                          finished=True,
+                          finish_reason="stop")
+        on_metrics(
+            GenerationMetrics(prompt_tokens=7,
+                              processed_prompt_tokens=3,
+                              generated_tokens=1,
+                              total_time=0.25))
+
+    llm.generate_stream = stream_with_metrics
+
+    async def exercise():
+        client = EngineClient(llm, ApiConfig())
+        messages = [{"role": "user", "content": "hi"}]
+        return [
+            delta.text
+            async for delta in client.stream(messages, SamplingParams())
+        ]
+
+    with caplog.at_level("INFO", logger="edgellm.server"):
+        assert asyncio.run(exercise()) == ["hi"]
+    assert "[request] prompt_tokens=7 processed_prompt_tokens=3 " in caplog.text
+
+
 def test_stream_lease_is_held_until_iterator_cleanup_finishes(tmp_path):
     import threading
 

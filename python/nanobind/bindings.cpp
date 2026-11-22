@@ -1496,7 +1496,9 @@ NB_MODULE(_edgellm_runtime, m)
         .def_rw("logprobs", &LLMGenerationResponse::logprobs)
         .def_ro("finish_reasons", &LLMGenerationResponse::finishReasons)
         .def_ro("prompt_token_counts", &LLMGenerationResponse::inputTokenCounts)
-        .def_ro("reused_prompt_token_counts", &LLMGenerationResponse::reusedInputTokenCounts);
+        .def_ro("reused_prompt_token_counts", &LLMGenerationResponse::reusedInputTokenCounts)
+        .def_ro("spec_verify_counts", &LLMGenerationResponse::specVerifyCounts)
+        .def_ro("spec_acceptance_lengths", &LLMGenerationResponse::specAcceptanceLengths);
 
     // ========================================================================
     // Runtime: unified (vanilla + Eagle speculative decoding)

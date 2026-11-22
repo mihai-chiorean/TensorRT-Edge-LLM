@@ -1378,6 +1378,35 @@ def test_handle_request_logs_draft_acceptance(caplog):
     assert "[spec-decode]" not in caplog.text
 
 
+def test_log_request_metrics_reports_counts_and_timings(caplog):
+    """A streamed request logs its token counts and timings on one line; a
+    stream that never started logs nothing."""
+    metrics = engine.GenerationMetrics(prompt_tokens=5245,
+                                       processed_prompt_tokens=637,
+                                       prompt_time=0.5,
+                                       generated_tokens=121,
+                                       time_to_first_token=0.52,
+                                       generation_time=4.0,
+                                       total_time=4.6,
+                                       decoded_tokens=120)
+    with caplog.at_level("INFO", logger="edgellm.server"):
+        engine.log_request_metrics(metrics)
+    assert ("[request] prompt_tokens=5245 processed_prompt_tokens=637 "
+            "prompt_s=0.500 ttft_s=0.520 generated_tokens=121 "
+            "decoded_tokens=120 decode_s=4.000 decode_tok_s=30.00 "
+            "total_s=4.600") in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("INFO", logger="edgellm.server"):
+        engine.log_request_metrics(engine.GenerationMetrics(prompt_tokens=7))
+    assert "processed_prompt_tokens=na prompt_s=0.000 ttft_s=na" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("INFO", logger="edgellm.server"):
+        engine.log_request_metrics(engine.GenerationMetrics())
+    assert "[request]" not in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # In-flight batching: the engine-backed request paths
 # ---------------------------------------------------------------------------
