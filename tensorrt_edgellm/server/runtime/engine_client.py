@@ -36,7 +36,7 @@ from ..config import ApiConfig
 from ..media.video_sampling import VisualProfileCapacityError
 from ..parsing.tool_calling import ToolConfig, validate_tool_request
 from .engine import (LLM, TTS, AudioParams, CompletionOutput, SamplingParams,
-                     StreamDelta)
+                     StreamDelta, log_request_metrics)
 
 logger = logging.getLogger("edgellm.server")
 
@@ -707,6 +707,7 @@ class EngineClient:
                 tools=tools,
                 tool_choice=tool_choice,
                 prebuilt_request=owned.request,
+                on_metrics=log_request_metrics,
             )
             async for item in _iterate_sync(iterator, self._executor):
                 yield item

@@ -669,6 +669,28 @@ def _log_spec_decode_metrics(response) -> None:
                 ",".join(f"{length:.2f}" for length in acceptance))
 
 
+def log_request_metrics(metrics: GenerationMetrics) -> None:
+    """Log one streamed request's token counts and timings.
+
+    A stream cancelled before it started reports empty metrics and logs nothing.
+    """
+    if metrics.prompt_tokens is None:
+        return
+
+    def _optional(value, fmt: str) -> str:
+        return "na" if value is None else fmt % value
+
+    logger.info(
+        "[request] prompt_tokens=%d processed_prompt_tokens=%s prompt_s=%.3f "
+        "ttft_s=%s generated_tokens=%d decoded_tokens=%d decode_s=%.3f "
+        "decode_tok_s=%.2f total_s=%.3f", metrics.prompt_tokens,
+        _optional(metrics.processed_prompt_tokens, "%d"), metrics.prompt_time,
+        _optional(metrics.time_to_first_token,
+                  "%.3f"), metrics.generated_tokens, metrics.decoded_tokens,
+        metrics.generation_time, metrics.decode_tokens_per_second,
+        metrics.total_time)
+
+
 def _prebuilt_spec_method(layout: BundleLayout, requested: str) -> str:
     """Return the speculative method a pre-built bundle was compiled for.
 
